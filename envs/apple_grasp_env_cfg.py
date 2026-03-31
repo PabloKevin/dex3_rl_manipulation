@@ -56,10 +56,12 @@ from . import mdp as task_mdp  # our custom mdp functions
 # TODO(A): Set this to your preferred G1+Dex3 USD path.
 # Example: "/path/to/unitree_sim_isaaclab/usd/g1_29dof_dex3/g1.usd"
 # Use the URDF that has NO hand cameras but full body + Dex3.
-G1_DEX3_USD_PATH = os.environ.get(
-    "G1_DEX3_USD_PATH",
-    "/path/to/your/g1_29dof_dex3.usd",  # ← CHANGE THIS
-)
+#G1_DEX3_USD_PATH = os.environ.get(
+#    "G1_DEX3_USD_PATH",
+#    "unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd",  # ← CHANGE THIS
+#)
+
+G1_DEX3_USD_PATH = "/home/pablo_kevin/unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd"  # ← CHANGE THIS
 
 # TODO: Set the head camera link name as it appears in YOUR urdf/usd.
 # Run scripts/run_env.py --debug_links to print all link names.
@@ -84,7 +86,7 @@ APPLE_ANCHOR_POS = (APPLE_INIT_POS[0], APPLE_INIT_POS[1], APPLE_INIT_POS[2] + 0.
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
-ROBOT_ROOT_HEIGHT = 0.0  # root fixed at ground level; URDF has pelvis at ~0.79m
+ROBOT_ROOT_HEIGHT = 0.793  # root fixed at ground level; URDF has pelvis at ~0.79m
 
 
 # ─────────────────────────────────────────────
@@ -288,6 +290,7 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
     # Common patterns to try:
     #   "{ENV_REGEX_NS}/Robot/.*right.*finger.*tip"
     #   "{ENV_REGEX_NS}/Robot/right_hand.*"
+    """
     contact_forces: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*right.*finger.*",  # ← verify
         history_length=3,
@@ -295,13 +298,14 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
         track_air_time=True,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Apple"],  # only apple contacts
     )
+    """
 
     # ── Head camera (128×128, RGB+Depth) ─────────────────────────────────
     # Disabled by default in Phase 1 (too slow to train).
     # Enable by using AppleGraspCameraEnvCfg below.
     # TODO: set correct prim_path using your head link name (HEAD_CAMERA_LINK).
     head_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{HEAD_CAMERA_LINK}/camera",
+        prim_path=f"{{ENV_REGEX_NS}}/Robot/head_link/camera",
         offset=TiledCameraCfg.OffsetCfg(
             pos=(0.08, 0.0, 0.0),     # slightly forward from head link origin
             rot=(0.5, -0.5, 0.5, -0.5),  # ROS convention: x-forward, z-up
@@ -409,10 +413,12 @@ class ObservationsCfg:
         )
 
         # Contact forces (right fingertips × apple)
+        """
         fingertip_contacts = ObsTerm(
             func=task_mdp.fingertip_contact_forces,
             params={"sensor_cfg": SceneEntityCfg("contact_forces")},
         )
+        """
 
         # Apple position in world frame
         apple_pos_world = ObsTerm(
@@ -453,6 +459,7 @@ class RewardsCfg:
     )
 
     # ── Contact: reward having fingertips touch the apple ─────────────────
+    """
     contact = RewTerm(
         func=task_mdp.reward_fingertip_contact,
         weight=2.0,
@@ -461,6 +468,7 @@ class RewardsCfg:
             "threshold": 0.1,  # N
         },
     )
+    """
 
     # ── Lift: reward apple height above initial position ──────────────────
     lift = RewTerm(

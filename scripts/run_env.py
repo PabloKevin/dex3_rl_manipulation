@@ -39,7 +39,7 @@ parser.add_argument("--num_envs",      type=int,  default=1,     help="Number of
 parser.add_argument("--debug_links",   action="store_true",       help="Print all robot link (body) names and exit")
 parser.add_argument("--debug_joints",  action="store_true",       help="Print all robot joint names and exit")
 parser.add_argument("--random_actions",action="store_true",       help="Send random actions instead of zeros")
-parser.add_argument("--headless",      action="store_true",       help="Run without GUI")
+#parser.add_argument("--headless",      action="store_true",       help="Run without GUI")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -146,7 +146,11 @@ def main():
 
 
 if __name__ == "__main__":
+    import traceback
     try:
         main()
+    except Exception as e:
+        traceback.print_exc()
+        print(f"\n>>> CRASH: {e}")
     finally:
         simulation_app.close()
