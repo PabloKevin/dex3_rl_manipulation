@@ -56,12 +56,10 @@ from . import mdp as task_mdp  # our custom mdp functions
 # TODO(A): Set this to your preferred G1+Dex3 USD path.
 # Example: "/path/to/unitree_sim_isaaclab/usd/g1_29dof_dex3/g1.usd"
 # Use the URDF that has NO hand cameras but full body + Dex3.
-#G1_DEX3_USD_PATH = os.environ.get(
-#    "G1_DEX3_USD_PATH",
-#    "unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd",  # ← CHANGE THIS
-#)
-
-G1_DEX3_USD_PATH = "/home/pablo_kevin/unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd"  # ← CHANGE THIS
+G1_DEX3_USD_PATH = os.environ.get(
+    "G1_DEX3_USD_PATH",
+    "/home/pablo_kevin/unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd",
+)
 
 # TODO: Set the head camera link name as it appears in YOUR urdf/usd.
 # Run scripts/run_env.py --debug_links to print all link names.
@@ -86,7 +84,7 @@ APPLE_ANCHOR_POS = (APPLE_INIT_POS[0], APPLE_INIT_POS[1], APPLE_INIT_POS[2] + 0.
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
-ROBOT_ROOT_HEIGHT = 0.793  # root fixed at ground level; URDF has pelvis at ~0.79m
+ROBOT_ROOT_HEIGHT = 0.793  # G1 pelvis height in standing pose (metres)
 
 
 # ─────────────────────────────────────────────
@@ -144,10 +142,7 @@ G1_DEX3_CFG = ArticulationCfg(
             "right_wrist_pitch_joint":    0.0,
             "right_wrist_yaw_joint":      0.0,
             # ── right Dex3 hand (open) ────────────────────────────────
-            # TODO(B): Replace these with your URDF's actual Dex3 joint names.
-            # Run python scripts/run_env.py --debug_links to list them.
-            # Common patterns: "right_hand_motor_*", "right.*finger.*"
-            ".*right.*hand.*":  0.0,
+            "right_hand.*":  0.0,
         },
         joint_vel={".*": 0.0},
     ),
@@ -174,7 +169,7 @@ G1_DEX3_CFG = ArticulationCfg(
         # We use a moderate value; tune after first visual check.
         # TODO: replace regex with your actual Dex3 joint name pattern.
         "right_hand": ImplicitActuatorCfg(
-            joint_names_expr=[".*right.*hand.*"],   # ← verify this
+            joint_names_expr=["right_hand.*"],
             effort_limit=2.0,
             velocity_limit=3.14,
             stiffness=1.0,
@@ -197,7 +192,7 @@ G1_DEX3_CFG = ArticulationCfg(
             damping=1.0,
         ),
         "left_hand": ImplicitActuatorCfg(
-            joint_names_expr=[".*left.*hand.*"],   # ← verify
+            joint_names_expr=["left_hand.*"],
             effort_limit=2.0,
             velocity_limit=3.14,
             stiffness=1.0,
@@ -254,6 +249,27 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot"
     )
 
+    # ── Branch (simple cylinder above the apple) ─────────────────────────
+    # A static visual-only cylinder acting as the branch the apple hangs from.
+    # Not a rigid body — just a visual prim, so it has zero physics cost.
+    branch: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Branch",
+        spawn=sim_utils.CylinderCfg(
+            radius=0.025,           # 2.5 cm radius branch
+            height=0.40,            # 40 cm long
+            axis="Y",               # horizontal branch
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.35, 0.20, 0.08),   # brown bark colour
+                roughness=0.9,
+                metallic=0.0,
+            ),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            # Centred above the apple, branch runs left-right (Y axis)
+            pos=(APPLE_INIT_POS[0], APPLE_INIT_POS[1], APPLE_INIT_POS[2] + 0.18),
+        ),
+    )
+
     # ── Apple (red sphere rigid body) ────────────────────────────────────
     apple: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Apple",
@@ -265,7 +281,7 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
                 max_angular_velocity=50.0,
                 max_linear_velocity=20.0,
                 enable_gyroscopic_forces=True,
-                disable_gravity=False,
+                disable_gravity=True,   # apple floats in place; gravity re-enabled on grasp in Phase 2
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=APPLE_MASS),
             collision_props=sim_utils.CollisionPropertiesCfg(
@@ -290,22 +306,20 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
     # Common patterns to try:
     #   "{ENV_REGEX_NS}/Robot/.*right.*finger.*tip"
     #   "{ENV_REGEX_NS}/Robot/right_hand.*"
-    """
     contact_forces: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*right.*finger.*",  # ← verify
+        prim_path="{ENV_REGEX_NS}/Robot/right_hand.*_link",
         history_length=3,
-        update_period=0.0,   # update every physics step
+        update_period=0.0,
         track_air_time=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Apple"],  # only apple contacts
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Apple"],
     )
-    """
 
     # ── Head camera (128×128, RGB+Depth) ─────────────────────────────────
     # Disabled by default in Phase 1 (too slow to train).
     # Enable by using AppleGraspCameraEnvCfg below.
     # TODO: set correct prim_path using your head link name (HEAD_CAMERA_LINK).
     head_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/head_link/camera",
+        prim_path=f"{{ENV_REGEX_NS}}/Robot/{HEAD_CAMERA_LINK}/camera",
         offset=TiledCameraCfg.OffsetCfg(
             pos=(0.08, 0.0, 0.0),     # slightly forward from head link origin
             rot=(0.5, -0.5, 0.5, -0.5),  # ROS convention: x-forward, z-up
@@ -346,7 +360,7 @@ class ActionsCfg:
     )
     right_hand: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
         asset_name="robot",
-        joint_names=[".*right.*hand.*"],   # TODO: match your Dex3 joint names
+        joint_names=["right_hand.*"],
         scale=0.3,
         use_default_offset=True,
     )
@@ -402,23 +416,21 @@ class ObservationsCfg:
         right_hand_pos = ObsTerm(
             func=task_mdp.joint_pos_selected,
             params={"asset_cfg": SceneEntityCfg(
-                "robot", joint_names=[".*right.*hand.*"]
+                "robot", joint_names=["right_hand.*"]
             )},
         )
         right_hand_vel = ObsTerm(
             func=task_mdp.joint_vel_selected,
             params={"asset_cfg": SceneEntityCfg(
-                "robot", joint_names=[".*right.*hand.*"]
+                "robot", joint_names=["right_hand.*"]
             )},
         )
 
         # Contact forces (right fingertips × apple)
-        """
         fingertip_contacts = ObsTerm(
             func=task_mdp.fingertip_contact_forces,
             params={"sensor_cfg": SceneEntityCfg("contact_forces")},
         )
-        """
 
         # Apple position in world frame
         apple_pos_world = ObsTerm(
@@ -432,7 +444,7 @@ class ObservationsCfg:
             params={
                 "object_cfg": SceneEntityCfg("apple"),
                 "robot_cfg": SceneEntityCfg(
-                    "robot", body_names=["right_wrist_yaw_joint"]  # TODO: use actual wrist link name
+                    "robot", body_names=["right_wrist_yaw_link"]
                 ),
             },
         )
@@ -452,14 +464,13 @@ class RewardsCfg:
         func=task_mdp.reward_reaching,
         weight=1.0,
         params={
-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_wrist_yaw_joint"]),
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_wrist_yaw_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "std": 0.15,    # gaussian shaping width
+            "std": 0.15,
         },
     )
 
     # ── Contact: reward having fingertips touch the apple ─────────────────
-    """
     contact = RewTerm(
         func=task_mdp.reward_fingertip_contact,
         weight=2.0,
@@ -468,7 +479,6 @@ class RewardsCfg:
             "threshold": 0.1,  # N
         },
     )
-    """
 
     # ── Lift: reward apple height above initial position ──────────────────
     lift = RewTerm(

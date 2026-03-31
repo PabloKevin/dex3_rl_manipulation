@@ -116,7 +116,10 @@ def main():
 
     step = 0
     apple: RigidObject  = env.scene["apple"]
-    sensor: ContactSensor = env.scene.get("contact_forces", None)
+    try:
+        sensor: ContactSensor = env.scene["contact_forces"]
+    except Exception:
+        sensor = None
 
     while simulation_app.is_running():
         with torch.inference_mode():
