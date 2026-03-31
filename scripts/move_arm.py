@@ -40,8 +40,8 @@ import math
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Scripted Reach + Grasp")
-parser.add_argument("--slow",    action="store_true", help="Half-speed for easier observation")
-parser.add_argument("--verbose", action="store_true", help="Print contact forces each step")
+parser.add_argument("--slow",         action="store_true", help="Half-speed for easier observation")
+parser.add_argument("--show_contacts", action="store_true", help="Print contact forces each step")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 app_launcher   = AppLauncher(args_cli)
@@ -155,7 +155,7 @@ def main():
                     apple_z   = apple_pos[2].item()
                     print(f"  step={step:5d}  apple_z={apple_z:.4f} m", end="")
 
-                    if sensor is not None and args_cli.verbose:
+                    if sensor is not None and args_cli.show_contacts:
                         forces = sensor.data.net_forces_w[0]              # [F, 3]
                         norms  = forces.norm(dim=-1)                       # [F]
                         print(f"  contacts={norms.tolist()}", end="")

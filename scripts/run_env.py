@@ -71,6 +71,10 @@ def main():
     env = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
     obs, _ = env.reset()
 
+    # Create breakable stem joints (apple held to branch tip, breaks on strong pull)
+    from envs.mdp.tree_utils import create_stem_joints, check_stem_broken
+    stem_joints = create_stem_joints(env)
+
     # ── Debug: print link and joint names then exit ───────────────────────
     robot: Articulation = env.scene["robot"]
 
@@ -133,6 +137,10 @@ def main():
             obs, reward, terminated, truncated, info = env.step(actions)
             step += 1
 
+            # Recreate stem joint when episode resets
+            if terminated.any() or truncated.any():
+                stem_joints = create_stem_joints(env)
+
             # Print status every 100 steps
             if step % 100 == 0:
                 apple_z  = apple.data.root_pos_w[0, 2].item()
@@ -142,6 +150,10 @@ def main():
                 if sensor is not None:
                     total_force = sensor.data.net_forces_w[0].norm(dim=-1).sum().item()
                     print(f"  total_contact_N={total_force:.3f}", end="")
+
+                broken = check_stem_broken(env, stem_joints)
+                if broken.any():
+                    print(f"  STEM BROKEN 🍎", end="")
 
                 print()
 

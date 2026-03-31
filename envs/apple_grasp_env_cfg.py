@@ -72,15 +72,24 @@ HEAD_CAMERA_LINK = "head_link"   # ← verify with your URDF
 APPLE_RADIUS = 0.04          # 4 cm radius sphere
 APPLE_MASS   = 0.15          # kg — roughly a real apple
 
-# Position of the apple in world frame (relative to robot root at origin).
-# Right arm reach: roughly (0.5, -0.25) forward-right at shoulder height.
-# Adjust after visually checking in the viewer.
-APPLE_INIT_POS = (0.55, -0.25, 1.05)   # (x, y, z) in metres
+# Tree geometry
+# Tree trunk is placed to the LEFT of the robot (negative Y), slightly forward.
+# Branch extends along +X from trunk top toward the robot's right arm.
+TREE_POS      = (0.55, 0.35, 0.0)    # trunk base (x, y) in world frame
+TREE_HEIGHT   = 1.35                  # trunk height — branch ends above wrist
+BRANCH_LENGTH = 0.50                  # how far branch extends toward robot
 
-# Invisible anchor for the "hanging" apple (same x,y, 20cm above apple).
-# In Phase 1 we do NOT add a rope/spring joint — apple is free rigid body.
-# Phase 2 will add a D6 joint / distance constraint for the string effect.
-APPLE_ANCHOR_POS = (APPLE_INIT_POS[0], APPLE_INIT_POS[1], APPLE_INIT_POS[2] + 0.20)
+# Apple hangs below the branch tip
+# Branch tip X = TREE_POS[0] + BRANCH_LENGTH = 0.55 + 0.50 = 1.05
+# But we want apple at ~0.55 in front of robot, so set TREE_POS[0] = 0.05
+# and BRANCH_LENGTH = 0.50  →  branch tip at 0.55, apple directly below.
+APPLE_INIT_POS = (0.55, 0.00, TREE_HEIGHT - 0.15)  # 15 cm below branch
+
+# Break force for the apple stem joint (Newtons).
+# The robot must apply at least this force downward to detach the apple.
+# ~2 N is roughly the weight of a real apple × a small safety factor.
+APPLE_STEM_BREAK_FORCE  = 2.5   # N  (linear break)
+APPLE_STEM_BREAK_TORQUE = 0.5   # N·m (angular break)
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
@@ -249,28 +258,69 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot"
     )
 
-    # ── Branch (simple cylinder above the apple) ─────────────────────────
-    # A static visual-only cylinder acting as the branch the apple hangs from.
-    # Not a rigid body — just a visual prim, so it has zero physics cost.
-    branch: AssetBaseCfg = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Branch",
-        spawn=sim_utils.CylinderCfg(
-            radius=0.025,           # 2.5 cm radius branch
-            height=0.40,            # 40 cm long
-            axis="Y",               # horizontal branch
+    # ── Tree: base ───────────────────────────────────────────────────────
+    # Flat box base anchoring the trunk to the ground.
+    tree_base: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/TreeBase",
+        spawn=sim_utils.CuboidCfg(
+            size=(0.30, 0.30, 0.06),
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.35, 0.20, 0.08),   # brown bark colour
-                roughness=0.9,
-                metallic=0.0,
+                diffuse_color=(0.25, 0.14, 0.05),
+                roughness=1.0,
             ),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            # Centred above the apple, branch runs left-right (Y axis)
-            pos=(APPLE_INIT_POS[0], APPLE_INIT_POS[1], APPLE_INIT_POS[2] + 0.18),
+            pos=(TREE_POS[0], TREE_POS[1], 0.03),   # sit on ground
         ),
     )
 
-    # ── Apple (red sphere rigid body) ────────────────────────────────────
+    # ── Tree: vertical trunk ─────────────────────────────────────────────
+    tree_trunk: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/TreeTrunk",
+        spawn=sim_utils.CylinderCfg(
+            radius=0.06,
+            height=TREE_HEIGHT,
+            axis="Z",
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.35, 0.20, 0.08),   # brown bark
+                roughness=1.0,
+            ),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=(TREE_POS[0], TREE_POS[1], TREE_HEIGHT / 2.0),
+        ),
+    )
+
+    # ── Tree: horizontal branch (green) ──────────────────────────────────
+    # Extends from trunk top toward the apple position along X axis.
+    tree_branch: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/TreeBranch",
+        spawn=sim_utils.CylinderCfg(
+            radius=0.04,
+            height=BRANCH_LENGTH,
+            axis="X",               # extends along X toward the robot
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.13, 0.42, 0.08),   # green branch
+                roughness=0.9,
+            ),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            # Centre of branch: halfway between trunk top and apple X position
+            pos=(
+                TREE_POS[0] + BRANCH_LENGTH / 2.0,
+                TREE_POS[1],
+                TREE_HEIGHT,
+            ),
+        ),
+    )
+
+    # ── Apple (red sphere, gravity enabled, held by breakable stem joint) ─
+    # The apple hangs below the branch tip via a thin stem RigidObject.
+    # A PhysX D6 joint with break force connects stem → apple.
+    # When the robot applies enough downward force the joint breaks and
+    # the apple falls free (gravity takes over). This is created at runtime
+    # in the post_reset hook in scripts/run_env.py using the helper function
+    # create_apple_stem_joint() defined in envs/mdp/tree_utils.py.
     apple: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Apple",
         spawn=sim_utils.SphereCfg(
@@ -281,31 +331,26 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
                 max_angular_velocity=50.0,
                 max_linear_velocity=20.0,
                 enable_gyroscopic_forces=True,
-                disable_gravity=True,   # apple floats in place; gravity re-enabled on grasp in Phase 2
+                disable_gravity=False,   # gravity on — stem joint holds apple up
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=APPLE_MASS),
             collision_props=sim_utils.CollisionPropertiesCfg(
-                contact_offset=0.001,
+                contact_offset=0.002,
                 rest_offset=0.0,
             ),
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.82, 0.06, 0.06),  # apple red
+                diffuse_color=(0.82, 0.06, 0.06),
                 roughness=0.5,
                 metallic=0.0,
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=APPLE_INIT_POS,
-            rot=(1.0, 0.0, 0.0, 0.0),  # no rotation
+            rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
 
     # ── Contact sensors on right Dex3 fingertips ─────────────────────────
-    # TODO: replace the prim_path regex with the actual finger link names
-    # from your URDF. Run: python scripts/run_env.py --debug_links
-    # Common patterns to try:
-    #   "{ENV_REGEX_NS}/Robot/.*right.*finger.*tip"
-    #   "{ENV_REGEX_NS}/Robot/right_hand.*"
     contact_forces: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/right_hand.*_link",
         history_length=3,
