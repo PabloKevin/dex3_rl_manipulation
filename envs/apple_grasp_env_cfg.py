@@ -407,13 +407,13 @@ class ActionsCfg:
             "right_wrist_pitch_joint",
             "right_wrist_yaw_joint",
         ],
-        scale=0.5,              # scale actions; range [-1,1] → [-0.5, 0.5] rad delta
+        scale=1.0,              # scale actions; range [-1,1] → [-0.5, 0.5] rad delta
         use_default_offset=True,
     )
     right_hand: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["right_hand.*"],
-        scale=0.3,
+        scale=1.0,
         use_default_offset=True,
     )
 

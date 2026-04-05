@@ -35,7 +35,8 @@ TODO: After running, check the printed "apple_z" during LIFT stage.
 import argparse
 import sys
 import os
-import math
+#import math
+import numpy as np
 
 from isaaclab.app import AppLauncher
 
@@ -70,7 +71,7 @@ from envs.apple_grasp_env_cfg import AppleGraspEnvCfg_PLAY
 #   [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
 #    wrist_roll, wrist_pitch, wrist_yaw]
 ARM_HOME    = [0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0]   # neutral
-ARM_REACH   = [0.6, -0.3,  0.1,  0.9,  0.0,  0.2,  0.1]   # reaching forward-down
+ARM_REACH   = [-np.pi/2, -0.3,  0.1,  0.9,  0.0,  0.2,  0.1]   # reaching forward-down
 ARM_LIFT    = [0.4, -0.3,  0.1,  0.7,  0.0,  0.0,  0.1]   # lifted 10 cm higher
 
 # Right Dex3 hand: 7 joints
@@ -78,7 +79,7 @@ ARM_LIFT    = [0.4, -0.3,  0.1,  0.7,  0.0,  0.0,  0.1]   # lifted 10 cm higher
 # From g1_dex3_example.cpp, mid-range = (max+min)/2 which varies per joint.
 # Start with all-zeros (open) → all-ones-normalised (close) and iterate.
 HAND_OPEN   = [0.0] * 7   # fully open
-HAND_CLOSE  = [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]  # ← tune per finger
+HAND_CLOSE  = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]  # ← tune per finger
 
 
 def slerp(a: list, b: list, t: float) -> torch.Tensor:
@@ -99,19 +100,24 @@ def build_action(arm_targets: list, hand_targets: list, device) -> torch.Tensor:
 
 def main():
     cfg = AppleGraspEnvCfg_PLAY()
-    # Slow mode: 2× longer transitions
     speed = 0.5 if args_cli.slow else 1.0
 
-    env  = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
+    env = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
     env.reset()
+
+    # Hold apple to branch with breakable stem joint
+    from envs.mdp.tree_utils import create_stem_joints, check_stem_broken
+    stem_joints = create_stem_joints(env)
 
     robot:  Articulation  = env.scene["robot"]
     apple:  RigidObject   = env.scene["apple"]
-    sensor: ContactSensor = env.scene.get("contact_forces", None)
+    try:
+        sensor: ContactSensor = env.scene["contact_forces"]
+    except Exception:
+        sensor = None
     dev = env.device
 
-    # ── Compute steps per stage ───────────────────────────────────────────
-    ctrl_hz  = 1.0 / (cfg.sim.dt * cfg.decimation)   # e.g. 50 Hz
+    ctrl_hz = 1.0 / (cfg.sim.dt * cfg.decimation)
     def secs(t): return int(t * ctrl_hz * speed)
 
     stages = [
@@ -132,58 +138,75 @@ def main():
         print(f"  {name:<8}  {n} steps  ({n/ctrl_hz:.1f} s)")
     print("="*60 + "\n")
 
-    step = 0
+    # ── State machine variables ───────────────────────────────────────────
+    # We step ONE action per render loop iteration so the renderer never blocks.
+    stage_idx   = 0
+    stage_step  = 0          # step within current stage
+    global_step = 0
+    prev_arm    = list(ARM_HOME)
+    prev_hand   = list(HAND_OPEN)
+    done        = False
+
+    stage_name, n_steps, arm_target, hand_target = stages[stage_idx]
+    print(f"── Stage: {stage_name} ──────────────")
+
     with torch.inference_mode():
-        # Run through all stages
-        prev_arm  = list(ARM_HOME)
-        prev_hand = list(HAND_OPEN)
+        while simulation_app.is_running() and not done:
 
-        for stage_name, n_steps, arm_target, hand_target in stages:
-            print(f"── Stage: {stage_name} ──────────────")
-            for i in range(n_steps):
-                t = (i + 1) / n_steps  # progress in [0, 1]
-                arm  = slerp(prev_arm,  arm_target,  t)
-                hand = slerp(prev_hand, hand_target, t)
-                actions = build_action(arm, hand, dev)
+            # ── Compute interpolated action for this step ─────────────────
+            t       = (stage_step + 1) / n_steps
+            arm     = slerp(prev_arm,  arm_target,  t)
+            hand    = slerp(prev_hand, hand_target, t)
+            actions = build_action(arm, hand, dev)
 
-                _, _, terminated, truncated, _ = env.step(actions)
-                step += 1
+            # ── Step the environment (physics + render) ───────────────────
+            _, _, terminated, truncated, _ = env.step(actions)
+            global_step += 1
+            stage_step  += 1
 
-                # Print every 25 steps
-                if step % 25 == 0 or i == n_steps - 1:
-                    apple_pos = apple.data.root_pos_w[0]
-                    apple_z   = apple_pos[2].item()
-                    print(f"  step={step:5d}  apple_z={apple_z:.4f} m", end="")
+            # ── Periodic print ────────────────────────────────────────────
+            if global_step % 25 == 0:
+                apple_z = apple.data.root_pos_w[0, 2].item()
+                print(f"  [{stage_name}] step={global_step:5d}  apple_z={apple_z:.4f} m", end="")
+                if sensor is not None and args_cli.show_contacts:
+                    norms = sensor.data.net_forces_w[0].norm(dim=-1)
+                    print(f"  contacts={norms.tolist()}", end="")
+                print()
 
-                    if sensor is not None and args_cli.show_contacts:
-                        forces = sensor.data.net_forces_w[0]              # [F, 3]
-                        norms  = forces.norm(dim=-1)                       # [F]
-                        print(f"  contacts={norms.tolist()}", end="")
+            # ── Unexpected episode end ────────────────────────────────────
+            if terminated.any() or truncated.any():
+                print(f"\n  ⚠  Episode ended at step {global_step}!")
+                done = True
+                continue
 
-                    # Check if episode ended unexpectedly
-                    if terminated.any() or truncated.any():
-                        print(f"\n  ⚠  Episode ended at step {step}!")
-                        break
+            # ── Advance to next stage when current one finishes ───────────
+            if stage_step >= n_steps:
+                prev_arm  = arm_target
+                prev_hand = hand_target
+                stage_idx += 1
 
-                    print()
-
-            # Move previous targets forward
-            prev_arm  = arm_target
-            prev_hand = hand_target
-            print()
-
-    print("="*60)
-    print("Scripted motion complete.")
-    print("Check the viewer: did the apple lift during LIFT stage?")
-    print("  YES → grasp config is working, move to Phase 2 (RL).")
-    print("  NO  → tune HAND_CLOSE targets or Dex3 stiffness in env cfg.")
-    print("="*60)
+                if stage_idx >= len(stages):
+                    done = True
+                    print("\n" + "="*60)
+                    print("Scripted motion complete.")
+                    print("Check the viewer: did the apple lift during LIFT stage?")
+                    print("  YES → grasp config is working, move to Phase 2 (RL).")
+                    print("  NO  → tune HAND_CLOSE targets or Dex3 stiffness in env cfg.")
+                    print("="*60)
+                else:
+                    stage_name, n_steps, arm_target, hand_target = stages[stage_idx]
+                    stage_step = 0
+                    print(f"── Stage: {stage_name} ──────────────")
 
     env.close()
 
 
 if __name__ == "__main__":
+    import traceback
     try:
         main()
+    except Exception as e:
+        traceback.print_exc()
+        print(f"\n>>> CRASH: {e}")
     finally:
         simulation_app.close()
