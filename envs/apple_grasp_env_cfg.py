@@ -80,7 +80,7 @@ TREE_HEIGHT   = 1.35                  # trunk height — branch ends above wrist
 BRANCH_LENGTH = 0.50                  # how far branch extends toward robot
 BRANCH_RADIUS = 0.04                  # radius of the branch
 
-BRANCH_ROTATION = -90 # degrees
+BRANCH_ROTATION = -110 # degrees
 # Branch pivot calculations — rotates around trunk junction
 branch_mid_x = TREE_POS[0] + (BRANCH_LENGTH / 2.0) * math.cos(math.radians(BRANCH_ROTATION))
 branch_mid_y = TREE_POS[1] + (BRANCH_LENGTH / 2.0) * math.sin(math.radians(BRANCH_ROTATION))
