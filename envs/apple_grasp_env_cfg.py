@@ -78,12 +78,22 @@ APPLE_MASS   = 0.15          # kg — roughly a real apple
 TREE_POS      = (0.55, 0.35, 0.0)    # trunk base (x, y) in world frame
 TREE_HEIGHT   = 1.35                  # trunk height — branch ends above wrist
 BRANCH_LENGTH = 0.50                  # how far branch extends toward robot
+BRANCH_RADIUS = 0.04                  # radius of the branch
+
+BRANCH_ROTATION = -90 # degrees
+# Branch pivot calculations — rotates around trunk junction
+branch_mid_x = TREE_POS[0] + (BRANCH_LENGTH / 2.0) * math.cos(math.radians(BRANCH_ROTATION))
+branch_mid_y = TREE_POS[1] + (BRANCH_LENGTH / 2.0) * math.sin(math.radians(BRANCH_ROTATION))
 
 # Apple hangs below the branch tip
 # Branch tip X = TREE_POS[0] + BRANCH_LENGTH = 0.55 + 0.50 = 1.05
 # But we want apple at ~0.55 in front of robot, so set TREE_POS[0] = 0.05
 # and BRANCH_LENGTH = 0.50  →  branch tip at 0.55, apple directly below.
-APPLE_INIT_POS = (0.55, 0.00, TREE_HEIGHT - 0.15)  # 15 cm below branch
+#APPLE_INIT_POS = (0.55, 0.00, TREE_HEIGHT - 0.15)  # 15 cm below branch
+
+branch_tip_x = TREE_POS[0] + BRANCH_LENGTH * math.cos(math.radians(BRANCH_ROTATION))
+branch_tip_y = TREE_POS[1] + BRANCH_LENGTH * math.sin(math.radians(BRANCH_ROTATION))
+APPLE_INIT_POS = (branch_tip_x, branch_tip_y, TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS)
 
 # Break force for the apple stem joint (Newtons).
 # The robot must apply at least this force downward to detach the apple.
@@ -296,7 +306,7 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
     tree_branch: AssetBaseCfg = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/TreeBranch",
         spawn=sim_utils.CylinderCfg(
-            radius=0.04,
+            radius=BRANCH_RADIUS,
             height=BRANCH_LENGTH,
             axis="X",               # extends along X toward the robot
             visual_material=sim_utils.PreviewSurfaceCfg(
@@ -306,11 +316,8 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
             # Centre of branch: halfway between trunk top and apple X position
-            pos=(
-                TREE_POS[0] + BRANCH_LENGTH / 2.0,
-                TREE_POS[1],
-                TREE_HEIGHT,
-            ),
+            pos=(branch_mid_x, branch_mid_y, TREE_HEIGHT),
+            rot=(math.cos(math.radians(BRANCH_ROTATION)/2), 0.0, 0.0, math.sin(math.radians(BRANCH_ROTATION)/2)),  # rotation around Z axis (quaternion)
         ),
     )
 

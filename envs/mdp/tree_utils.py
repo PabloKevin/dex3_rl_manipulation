@@ -23,6 +23,7 @@ Usage in scripts/run_env.py:
 
 from __future__ import annotations
 import torch
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -57,8 +58,6 @@ def create_stem_joints(env: ManagerBasedRLEnv) -> list:
         APPLE_INIT_POS,
         APPLE_STEM_BREAK_FORCE,
         APPLE_STEM_BREAK_TORQUE,
-        TREE_POS,
-        TREE_HEIGHT,
     )
 
     stage = omni.usd.get_context().get_stage()
@@ -84,13 +83,7 @@ def create_stem_joints(env: ManagerBasedRLEnv) -> list:
         # Local pose on body1 (apple): joint anchor at apple centre
         joint_prim.GetLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
 
-        # World-space anchor = apple initial position (branch tip)
-        branch_tip_x = TREE_POS[0] + 0.50   # BRANCH_LENGTH = 0.50
-        anchor_pos = Gf.Vec3f(
-            branch_tip_x,
-            TREE_POS[1],
-            TREE_HEIGHT - 0.10,   # 10 cm below branch (top of stem)
-        )
+        anchor_pos = Gf.Vec3f(*APPLE_INIT_POS)
         joint_prim.GetLocalPos0Attr().Set(anchor_pos)
 
         # ── Break force and torque ──────────────────────────────────────
