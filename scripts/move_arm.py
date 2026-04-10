@@ -58,6 +58,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor
 
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg_PLAY
+from envs.mdp.tree_utils import StemManager
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,15 +72,15 @@ from envs.apple_grasp_env_cfg import AppleGraspEnvCfg_PLAY
 #   [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
 #    wrist_roll, wrist_pitch, wrist_yaw]
 ARM_HOME    = [0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0]   # neutral
-ARM_REACH   = [-np.pi/2, -0.3,  0.1,  0.9,  0.0,  0.2,  0.1]   # reaching forward-down
-ARM_LIFT    = [0.4, -0.3,  0.1,  0.7,  0.0,  0.0,  0.1]   # lifted 10 cm higher
+ARM_REACH  = [-1.8, 0.1, 0.0, -0.8, 0.5, -0.4, -0.8]   # reaching forward-down
+ARM_LIFT    = [-0.5, 0.1, 0.0, -0.8, 0.5, -0.4, -0.8]   # lifted 10 cm higher
 
 # Right Dex3 hand: 7 joints
 # TODO: Replace with values that fully close YOUR hand URDF.
 # From g1_dex3_example.cpp, mid-range = (max+min)/2 which varies per joint.
 # Start with all-zeros (open) → all-ones-normalised (close) and iterate.
 HAND_OPEN   = [0.0] * 7   # fully open
-HAND_CLOSE  = [1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5]  # ← tune per finger
+HAND_CLOSE  = [0.3, 0.4, 0.0, 1.57, 1.5, 0.1, -0.8]  # ← tune per finger
 
 
 def slerp(a: list, b: list, t: float) -> torch.Tensor:
@@ -104,10 +105,7 @@ def main():
 
     env = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
     env.reset()
-
-    # Hold apple to branch with breakable stem joint
-    from envs.mdp.tree_utils import create_stem_joints, check_stem_broken
-    stem_joints = create_stem_joints(env)
+    stem = StemManager(env)  # ← Add this line
 
     robot:  Articulation  = env.scene["robot"]
     apple:  RigidObject   = env.scene["apple"]
@@ -161,6 +159,7 @@ def main():
 
             # ── Step the environment (physics + render) ───────────────────
             _, _, terminated, truncated, _ = env.step(actions)
+            stem.update(env)  # ← Add this line
             global_step += 1
             stage_step  += 1
 

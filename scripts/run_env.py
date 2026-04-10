@@ -106,8 +106,8 @@ def main():
     env      = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
     obs, _   = env.reset()
 
-    from envs.mdp.tree_utils import create_stem_joints, check_stem_broken
-    stem_joints = create_stem_joints(env)
+    from envs.mdp.tree_utils import StemManager
+    stem = StemManager(env)
 
     robot: Articulation = env.scene["robot"]
 
@@ -158,10 +158,11 @@ def main():
                 actions = _get_actions(env.device, env.action_space.shape)
 
             obs, reward, terminated, truncated, info = env.step(actions)
+            stem.update(env)
             step += 1
 
             if terminated.any() or truncated.any():
-                stem_joints = create_stem_joints(env)
+                stem.reset(env)
 
             if step % 100 == 0:
                 apple_z = apple.data.root_pos_w[0, 2].item()
@@ -170,8 +171,7 @@ def main():
                 if sensor is not None:
                     total_f = sensor.data.net_forces_w[0].norm(dim=-1).sum().item()
                     print(f"  contact_N={total_f:.3f}", end="")
-                broken = check_stem_broken(env, stem_joints)
-                if broken.any():
+                if any(stem.is_broken()):
                     print("  STEM BROKEN 🍎", end="")
                 print()
 

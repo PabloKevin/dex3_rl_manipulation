@@ -23,6 +23,7 @@ Requires: unitree_sdk2py  (pip install unitree_sdk2py)
 
 import curses
 import json
+import os
 import time
 import sys
 
@@ -61,7 +62,7 @@ HAND_JOINTS = [
     ("hand_j3",   0.0,   1.57, 0.0),
     ("hand_j4",   0.0,   1.75, 0.0),
     ("hand_j5",   0.0,   1.57, 0.0),
-    ("hand_j6",   0.0,   1.75, 0.0),
+    ("hand_j6",   -1.75,   0.0, 0.0),
 ]
 
 ALL_JOINTS = ARM_JOINTS + HAND_JOINTS   # 14 total
@@ -213,16 +214,26 @@ def main(stdscr):
             publish(values[:7], values[7:])
 
         elif key == ord('p'):
-            # Print to a file so it doesn't mess up the curses UI
             arm_str  = [round(v, 3) for v in values[:7]]
             hand_str = [round(v, 3) for v in values[7:]]
-            with open("/tmp/arm_targets.txt", "w") as f:
+            with open("joint_targets/index.txt", "r") as f:
+                index = f.read()
+                f.close()
+            with open("joint_targets/index.txt", "w") as f:
+                f.write(str(int(index) + 1))
+                f.close()
+            save_path = f"joint_targets/arm_targets_{index}.txt"
+            with open(save_path, "w") as f:
                 f.write(f"ARM_REACH  = {arm_str}\n")
                 f.write(f"HAND_CLOSE = {hand_str}\n")
-            # Show a brief confirmation in the UI
-            stdscr.addstr(23, 2, "  Saved to /tmp/arm_targets.txt  ", curses.color_pair(2))
+            import sys as _sys
+            print(f"\nARM_REACH  = {arm_str}\nHAND_CLOSE = {hand_str}",
+                  file=_sys.stderr)
+            stdscr.addstr(23, 2,
+                f"  Saved to {save_path}  ",
+                curses.color_pair(2))
             stdscr.refresh()
-            time.sleep(1.0)
+            time.sleep(1.5)
 
         elif key in (ord('q'), 27):   # q or Escape
             break
