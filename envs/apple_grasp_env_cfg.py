@@ -58,7 +58,7 @@ from . import mdp as task_mdp  # our custom mdp functions
 # Use the URDF that has NO hand cameras but full body + Dex3.
 G1_DEX3_USD_PATH = os.environ.get(
     "G1_DEX3_USD_PATH",
-    "/home/pablo_kevin/unitree_sim_isaaclab/assets/robots/g1-29dof-dex3-base-fix-usd/g1_29dof_with_dex3_base_fix.usd",
+    "/home/pablo_kevin/dex3_rl_manipulation/envs/assets/robots/g1_29dof_with_hand_rev_1_0.usd",
 )
 
 # TODO: Set the head camera link name as it appears in YOUR urdf/usd.
