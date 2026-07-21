@@ -14,9 +14,10 @@ from omni.isaac.core.utils.types import ArticulationAction
 # 2. cuRobo Imports
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
-from curobo.geom.types import WorldConfig
+from curobo.geom.types import WorldConfig, Cuboid
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
+from curobo.types.state import JointState
 from curobo.util_file import get_robot_configs_path, join_path
 
 
@@ -83,9 +84,24 @@ def main():
     # --- cuRobo Initialization ---
     tensor_args = TensorDeviceType()
 
+    # cuRobo's primitive collision checker errors out on a truly empty world
+    # ("Primitive Collision has no obstacles"), so give it at least a ground
+    # plane. Pose format is [x, y, z, qw, qx, qy, qz]. This slab sits just
+    # under z=0 (the Isaac Sim ground plane), well below the robot's fixed
+    # base at z=0.8, so it won't interfere with arm planning.
+    world_cfg = WorldConfig(
+        cuboid=[
+            Cuboid(
+                name="ground",
+                pose=[0.0, 0.0, -0.05, 1.0, 0.0, 0.0, 0.0],
+                dims=[5.0, 5.0, 0.1],
+            )
+        ]
+    )
+
     motion_gen_config = MotionGenConfig.load_from_robot_config(
         robot_cfg_path,
-        world_model=WorldConfig(),  # Add obstacle config here if needed later
+        world_model=world_cfg,  # Add more obstacles here later (e.g. the tree/branch)
         tensor_args=tensor_args,
         ee_link_name=ee_link_name,
     )
@@ -125,10 +141,14 @@ def main():
     print(f"  Current right-arm joints ({right_arm_joint_names}): {current_arm_positions}")
 
     plan_config = MotionGenPlanConfig(enable_graph=True)
-    result = motion_gen.plan_single(
-        start_state=torch.tensor(
+    start_state = JointState.from_position(
+        torch.tensor(
             current_arm_positions, device=tensor_args.device, dtype=torch.float32
         ).unsqueeze(0),
+        joint_names=right_arm_joint_names,
+    )
+    result = motion_gen.plan_single(
+        start_state=start_state,
         goal_pose=goal_pose,
         plan_config=plan_config,
     )

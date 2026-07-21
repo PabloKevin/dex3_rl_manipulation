@@ -3531,14 +3531,6 @@ robot_cfg:
       - 1.0
       - 1.0
       - 1.0
-      default_joint_position:
-      - -0.20940005779266357
-      - -0.3316499590873718
-      - 0.0
-      - 0.5235999822616577
-      - 0.0
-      - 0.0
-      - 0.0
       velocity_scale:
       - 1.0
       - 1.0
@@ -3968,7 +3960,7 @@ robot_cfg:
       - right_shoulder_pitch_link
       - right_shoulder_roll_link
       - right_shoulder_yaw_link
-    urdf_path: robot/g1/g1_29dof_with_hand_rev_1_0.urdf
+    urdf_path: robot/g1_dex3/g1_29dof_with_hand_rev_1_0.urdf
     use_external_assets: false
     use_global_cumul: true
     lock_joints:
