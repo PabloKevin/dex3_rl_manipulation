@@ -3540,6 +3540,14 @@ robot_cfg:
       - 1.0
       - 1.0
       position_limit_clip: 0.0
+      retract_config:
+      - 0.3
+      - -0.2
+      - 0.0
+      - 0.8
+      - 0.0
+      - 0.0
+      - 0.0
     debug: null
     external_asset_path: null
     external_robot_configs_path: null
@@ -3828,6 +3836,7 @@ robot_cfg:
       - right_hand_thumb_1_link
       - right_hand_middle_1_link
       - right_hand_index_1_link
+      - right_hand_thumb_2_link
       right_hand_thumb_0_link:
       - right_hand_palm_link
       - right_hand_thumb_1_link
@@ -3841,6 +3850,9 @@ robot_cfg:
       - right_hand_thumb_2_link
       right_hand_thumb_2_link:
       - right_hand_thumb_1_link
+      - right_hand_palm_link
+      - right_wrist_pitch_link
+      - right_wrist_roll_link
       right_hip_pitch_link:
       - pelvis
       - right_hip_roll_link
@@ -3900,6 +3912,7 @@ robot_cfg:
       - right_hand_middle_1_link
       - right_hand_index_0_link
       - right_hand_index_1_link
+      - right_hand_thumb_2_link
       right_wrist_roll_link:
       - right_elbow_link
       - right_wrist_pitch_link
@@ -3910,6 +3923,7 @@ robot_cfg:
       - right_hand_middle_1_link
       - right_hand_index_0_link
       - right_hand_index_1_link
+      - right_hand_thumb_2_link
       right_wrist_yaw_link:
       - right_wrist_pitch_link
       - right_hand_palm_link
@@ -3956,40 +3970,40 @@ robot_cfg:
     use_external_assets: false
     use_global_cumul: true
     lock_joints:
-      left_hip_pitch_joint: 0.0
+      left_hip_pitch_joint: -0.1
       left_hip_roll_joint: 0.0
       left_hip_yaw_joint: 0.0
-      left_knee_joint: 0.0
-      left_ankle_pitch_joint: 0.0
+      left_knee_joint: 0.3
+      left_ankle_pitch_joint: -0.2
       left_ankle_roll_joint: 0.0
-      right_hip_pitch_joint: 0.0
+      right_hip_pitch_joint: -0.1
       right_hip_roll_joint: 0.0
       right_hip_yaw_joint: 0.0
-      right_knee_joint: 0.0
-      right_ankle_pitch_joint: 0.0
+      right_knee_joint: 0.3
+      right_ankle_pitch_joint: -0.2
       right_ankle_roll_joint: 0.0
       waist_yaw_joint: 0.0
       waist_roll_joint: 0.0
-      waist_pitch_joint: 0.0
-      left_shoulder_pitch_joint: -0.20940005779266357
-      left_shoulder_roll_joint: 0.3316499590873718
+      waist_pitch_joint: 0.1
+      left_shoulder_pitch_joint: 0.3
+      left_shoulder_roll_joint: 0.2
       left_shoulder_yaw_joint: 0.0
-      left_elbow_joint: 0.5235999822616577
+      left_elbow_joint: 0.8
       left_wrist_roll_joint: 0.0
       left_wrist_pitch_joint: 0.0
       left_wrist_yaw_joint: 0.0
       left_hand_thumb_0_joint: 0.0
-      left_hand_thumb_1_joint: 0.16144296526908875
-      left_hand_thumb_2_joint: 0.8726646304130554
-      left_hand_middle_0_joint: -0.7853981852531433
-      left_hand_middle_1_joint: -0.8726646304130554
-      left_hand_index_0_joint: -0.7853981852531433
-      left_hand_index_1_joint: -0.8726646304130554
+      left_hand_thumb_1_joint: 0.0
+      left_hand_thumb_2_joint: 0.0
+      left_hand_middle_0_joint: 0.0
+      left_hand_middle_1_joint: 0.0
+      left_hand_index_0_joint: 0.0
+      left_hand_index_1_joint: 0.0
       right_hand_thumb_0_joint: 0.0
-      right_hand_thumb_1_joint: -0.16144296526908875
-      right_hand_thumb_2_joint: -0.8726646304130554
-      right_hand_middle_0_joint: 0.7853981852531433
-      right_hand_middle_1_joint: 0.8726646304130554
-      right_hand_index_0_joint: 0.7853981852531433
-      right_hand_index_1_joint: 0.8726646304130554
+      right_hand_thumb_1_joint: 0.0
+      right_hand_thumb_2_joint: 0.0
+      right_hand_middle_0_joint: 0.0
+      right_hand_middle_1_joint: 0.0
+      right_hand_index_0_joint: 0.0
+      right_hand_index_1_joint: 0.0
     ee_link: right_hand_palm_link
