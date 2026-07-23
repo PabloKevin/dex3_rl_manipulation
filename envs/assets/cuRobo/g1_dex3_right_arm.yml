@@ -3515,7 +3515,7 @@ robot_cfg:
     external_robot_configs_path: null
     extra_collision_spheres: null
     load_meshes: false
-    mesh_link_names: *id001
+    mesh_link_names: []
     self_collision_buffer:
       head_link: 0.0
       left_ankle_pitch_link: 0.0
@@ -3932,40 +3932,7 @@ robot_cfg:
     use_external_assets: false
     use_global_cumul: true
     lock_joints:
-      left_hip_pitch_joint: -0.1
-      left_hip_roll_joint: 0.0
-      left_hip_yaw_joint: 0.0
-      left_knee_joint: 0.3
-      left_ankle_pitch_joint: -0.2
-      left_ankle_roll_joint: 0.0
-      right_hip_pitch_joint: -0.1
-      right_hip_roll_joint: 0.0
-      right_hip_yaw_joint: 0.0
-      right_knee_joint: 0.3
-      right_ankle_pitch_joint: -0.2
-      right_ankle_roll_joint: 0.0
       waist_yaw_joint: 0.0
       waist_roll_joint: 0.0
       waist_pitch_joint: 0.1
-      left_shoulder_pitch_joint: 0.3
-      left_shoulder_roll_joint: 0.2
-      left_shoulder_yaw_joint: 0.0
-      left_elbow_joint: 0.8
-      left_wrist_roll_joint: 0.0
-      left_wrist_pitch_joint: 0.0
-      left_wrist_yaw_joint: 0.0
-      left_hand_thumb_0_joint: 0.0
-      left_hand_thumb_1_joint: 0.0
-      left_hand_thumb_2_joint: 0.0
-      left_hand_middle_0_joint: 0.0
-      left_hand_middle_1_joint: 0.0
-      left_hand_index_0_joint: 0.0
-      left_hand_index_1_joint: 0.0
-      right_hand_thumb_0_joint: 0.0
-      right_hand_thumb_1_joint: 0.0
-      right_hand_thumb_2_joint: 0.0
-      right_hand_middle_0_joint: 0.0
-      right_hand_middle_1_joint: 0.0
-      right_hand_index_0_joint: 0.0
-      right_hand_index_1_joint: 0.0
     ee_link: right_hand_palm_link

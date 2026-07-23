@@ -4,11 +4,11 @@
 Phase 1 — View the Apple Grasp environment.
 
 Usage:
-    # Basic viewer (holds sim, listens for targets from tune_arm.py):
+    # Basic viewer (holds sim, listens for targets, publishes state):
     ~/IsaacLab/isaaclab.sh -p scripts/run_env.py
 
     # While sim is running, in a second terminal:
-    python3 scripts/tune_arm.py
+    python3 scripts/reach_apple_curobo.py
 
     # Multiple envs:
     ~/IsaacLab/isaaclab.sh -p scripts/run_env.py --num_envs 4
@@ -18,6 +18,18 @@ Usage:
 
     # Print robot joint names:
     ~/IsaacLab/isaaclab.sh -p scripts/run_env.py --debug_joints
+
+DDS topics:
+    rt/arm_tune/targets  (subscribe)  {"arm": [7 floats], "hand": [7 floats]}
+                                       RAW pre-scale actions — Isaac Lab applies
+                                       target = default_joint_pos + scale * raw_action
+    rt/arm_tune/state    (publish)    {"torso_pos": [x,y,z], "torso_quat": [w,x,y,z],
+                                        "arm_joint_pos": [7 floats] (absolute radians),
+                                        "apple_pos": [x,y,z]}
+                                       All positions are WORLD frame, env-origin already
+                                       subtracted (irrelevant for single-env but kept for
+                                       correctness if you scale to --num_envs > 1 later —
+                                       note state is only ever published for env 0).
 """
 
 import argparse
@@ -51,22 +63,32 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY
 
-# ── DDS subscriber for live arm targets from tune_arm.py ─────────────────────
-# Receives JSON: {"arm": [7 floats], "hand": [7 floats]}
-# Published by tune_arm.py on channel rt/arm_tune/targets
+# Must match ActionsCfg.right_arm.joint_names order in apple_grasp_env_cfg.py
+RIGHT_ARM_JOINT_NAMES = [
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
+TORSO_LINK_NAME = "torso_link"
+
+# ── DDS: subscriber for targets, publisher for state ─────────────────────────
 _targets_lock = threading.Lock()
 _arm_targets  = None   # None = hold default pose (zero actions)
 _hand_targets = None
 
-def _start_dds_subscriber():
-    """Start DDS subscriber in a background thread. Non-fatal if unavailable."""
+_dds_ok = False
+_state_publisher = None
+
+
+def _start_dds():
+    """Start DDS subscriber (targets) + publisher (state). Non-fatal if unavailable."""
+    global _dds_ok, _state_publisher
     try:
         from unitree_sdk2py.core.channel import (
-            ChannelSubscriber, ChannelFactoryInitialize
+            ChannelSubscriber, ChannelPublisher, ChannelFactoryInitialize
         )
         from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
-        ChannelFactoryInitialize(1)   # channel 1 — same as tune_arm.py
+        ChannelFactoryInitialize(1)   # channel 1 — same as reach_apple_curobo.py
 
         def _callback(msg: String_):
             global _arm_targets, _hand_targets
@@ -76,13 +98,20 @@ def _start_dds_subscriber():
                     _arm_targets  = data.get("arm",  None)
                     _hand_targets = data.get("hand", None)
             except Exception as e:
-                print(f"[DDS] parse error: {e}")
+                print(f"[DDS] target parse error: {e}")
 
         sub = ChannelSubscriber("rt/arm_tune/targets", String_)
         sub.Init(_callback, 1)
-        print("[DDS] Subscribed to rt/arm_tune/targets — tune_arm.py can now connect.")
+
+        _state_publisher = ChannelPublisher("rt/arm_tune/state", String_)
+        _state_publisher.Init()
+
+        _dds_ok = True
+        print("[DDS] Subscribed to rt/arm_tune/targets, publishing rt/arm_tune/state — "
+              "reach_apple_curobo.py can now connect.")
     except Exception as e:
-        print(f"[DDS] Subscriber unavailable ({e}). Running with zero actions only.")
+        print(f"[DDS] Unavailable ({e}). Running with zero actions only, no state published.")
+        _dds_ok = False
 
 
 def _get_actions(device, action_shape):
@@ -94,8 +123,31 @@ def _get_actions(device, action_shape):
     return torch.tensor([combined], dtype=torch.float32, device=device)
 
 
+def _publish_state(robot: Articulation, apple: RigidObject, torso_idx: int, arm_joint_idx: list):
+    """Publish current torso pose (world), right-arm joint angles, and apple position (world)."""
+    if not _dds_ok or _state_publisher is None:
+        return
+    try:
+        from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
+
+        torso_pos  = robot.data.body_pos_w[0, torso_idx, :].tolist()
+        torso_quat = robot.data.body_quat_w[0, torso_idx, :].tolist()  # (w, x, y, z)
+        arm_pos    = robot.data.joint_pos[0, arm_joint_idx].tolist()
+        apple_pos  = apple.data.root_pos_w[0, :].tolist()
+
+        payload = {
+            "torso_pos": torso_pos,
+            "torso_quat": torso_quat,
+            "arm_joint_pos": arm_pos,
+            "apple_pos": apple_pos,
+        }
+        _state_publisher.Write(String_(data=json.dumps(payload)))
+    except Exception as e:
+        print(f"[DDS] state publish error: {e}")
+
+
 def main():
-    _start_dds_subscriber()
+    _start_dds()
 
     if args_cli.num_envs == 1:
         cfg = AppleGraspEnvCfg_PLAY()
@@ -131,6 +183,10 @@ def main():
         env.close()
         return
 
+    # Resolve indices once, up front — used every step for state publishing.
+    torso_idx     = robot.data.body_names.index(TORSO_LINK_NAME)
+    arm_joint_idx = [robot.data.joint_names.index(n) for n in RIGHT_ARM_JOINT_NAMES]
+
     print("\n" + "="*60)
     print("APPLE GRASP VIEWER")
     print(f"  Physics dt : {cfg.sim.dt*1000:.1f} ms  ({1/cfg.sim.dt:.0f} Hz)")
@@ -138,8 +194,8 @@ def main():
     print(f"  Action dim : {env.action_space.shape}")
     print(f"  Obs dim    : {obs['policy'].shape}")
     print("="*60)
-    print("  Run  python3 scripts/tune_arm.py  in a second terminal to control joints.")
-    print("  Without tune_arm.py the robot holds its default pose.")
+    print("  Run  python3 scripts/reach_apple_curobo.py  in a second terminal to control joints.")
+    print("  Without it the robot holds its default pose.")
     print("="*60 + "\n")
 
     step  = 0
@@ -159,6 +215,7 @@ def main():
 
             obs, reward, terminated, truncated, info = env.step(actions)
             stem.update(env)
+            _publish_state(robot, apple, torso_idx, arm_joint_idx)
             step += 1
 
             if terminated.any() or truncated.any():
