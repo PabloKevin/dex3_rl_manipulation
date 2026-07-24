@@ -29,8 +29,45 @@ Key changes from the previous version:
 """
 import json
 import time
+import math
 import threading
 import torch
+
+
+def quat_from_axis_angle(axis: torch.Tensor, angle_rad: torch.Tensor) -> torch.Tensor:
+    """Unit quaternion (w, x, y, z) for a rotation of angle_rad about axis."""
+    axis = axis / torch.norm(axis)
+    half = angle_rad / 2.0
+    w = torch.cos(half)
+    xyz = axis * torch.sin(half)
+    return torch.cat([w.unsqueeze(0), xyz])
+
+
+def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Hamilton product q1 * q2, both (w, x, y, z)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ])
+
+
+def euler_xyz_deg_to_quat(roll_deg: float, pitch_deg: float, yaw_deg: float, device) -> torch.Tensor:
+    """Degrees -> quaternion (w, x, y, z). Equivalent to
+    scipy.Rotation.from_euler('xyz', [roll, pitch, yaw], degrees=True) —
+    intrinsic rotations: about X, then the NEW Y, then the NEWEST Z.
+    Composition order matches: q = qx * qy * qz.
+    """
+    rx = torch.tensor(math.radians(roll_deg), device=device)
+    ry = torch.tensor(math.radians(pitch_deg), device=device)
+    rz = torch.tensor(math.radians(yaw_deg), device=device)
+    qx = quat_from_axis_angle(torch.tensor([1.0, 0.0, 0.0], device=device), rx)
+    qy = quat_from_axis_angle(torch.tensor([0.0, 1.0, 0.0], device=device), ry)
+    qz = quat_from_axis_angle(torch.tensor([0.0, 0.0, 1.0], device=device), rz)
+    return quat_mul(quat_mul(qx, qy), qz)
 
 # ── 1. DDS Setup ─────────────────────────────────────────────────────────────
 try:
@@ -118,7 +155,19 @@ ARM_DEFAULT_POSE = [0.3, -0.2, 0.0, 0.8, 0.0, 0.0, 0.0]
 ARM_SCALE = 0.5
 
 APPLE_RADIUS = 0.04
-APPROACH_Z_OFFSET = -APPLE_RADIUS * 1.5  # target sits this far ABOVE the apple center (world +z)
+APPLE_COLLISION_RADIUS = APPLE_RADIUS + 0.02  # small buffer so planned poses don't skim/push the apple surface
+APPROACH_Z_OFFSET = -APPLE_RADIUS * 3.0  # target sits BELOW the apple center (world -z), cupping from underneath
+
+# Palm orientation in the TORSO frame, tuned by eye — see orient_tune.py for a
+# fast (no-motion-planning) way to iterate on these three numbers.
+ROLL_DEG, PITCH_DEG, YAW_DEG = 90.0, 0.0, 0.0
+
+# Orientation tolerance in radians. Kept tight on purpose: a loose threshold
+# (e.g. 0.25 rad / ~14°) lets cuRobo accept a completely different arm
+# configuration as long as the palm ends up "close enough" to the target —
+# that's what causes the "keeps rotating into arm-over-head" behavior, since
+# a wildly different elbow/shoulder branch can also satisfy a loose window.
+ROTATION_THRESHOLD = 0.08  # ~4.6 degrees
 
 # Hand stays open during the reach — raw action values, copied verbatim from
 # harvest_apple.py's HOME/REACH stage (confirmed working over this same DDS link).
@@ -226,7 +275,7 @@ def main():
         sphere=[Sphere(
             name="apple",
             pose=[apple_local[0].item(), apple_local[1].item(), apple_local[2].item(), 1.0, 0.0, 0.0, 0.0],
-            radius=APPLE_RADIUS,
+            radius=APPLE_COLLISION_RADIUS,
         )],
     )
 
@@ -236,6 +285,7 @@ def main():
         tensor_args=tensor_args,
         ee_link_name=EE_LINK_NAME,
         use_cuda_graph=False,
+        rotation_threshold=ROTATION_THRESHOLD,
     )
 
     motion_gen = MotionGen(motion_gen_config)
@@ -248,12 +298,8 @@ def main():
         joint_names=RIGHT_ARM_JOINT_NAMES,
     )
 
-    # Orientation kept as identity in the torso frame for now — tune separately
-    # once positional reach is confirmed to work.
-    goal_pose = Pose(
-        position=goal_local,
-        quaternion=torch.tensor([1.0, 0.0, 0.0, 0.0], device=tensor_args.device),
-    )
+    goal_quat = euler_xyz_deg_to_quat(ROLL_DEG, PITCH_DEG, YAW_DEG, tensor_args.device)
+    goal_pose = Pose(position=goal_local, quaternion=goal_quat)
 
     print("Planning trajectory...")
     result = motion_gen.plan_single(

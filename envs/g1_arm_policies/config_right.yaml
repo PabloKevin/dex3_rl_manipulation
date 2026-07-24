@@ -1,0 +1,110 @@
+urdf:
+  path: /home/pablo_kevin/dex3_rl_manipulation/envs/assets/cuRobo/g1_29dof_with_hand_rev_1_0.urdf
+  arm_joint_names: [right_shoulder_pitch_joint, right_shoulder_roll_joint, right_shoulder_yaw_joint,
+    right_elbow_joint, right_wrist_roll_joint, right_wrist_pitch_joint, right_wrist_yaw_joint]
+  ee_frame: right_hand_palm_center
+  n_active: 7
+joint_limits:
+  lower: [-3.0892, -2.2515, -2.618, -1.0472, -1.9722, -1.6144, -1.6144]
+  upper: [2.6704, 1.5882, 2.618, 2.0944, 1.9722, 1.6144, 1.6144]
+  max_velocity: 2.5
+episode: {max_steps: 400, dt: 0.01}
+hold: {time: 0.5, pos_tolerance: 0.04, ori_tolerance: 0.15}
+goal: {pos_tolerance: 0.04, ori_tolerance: 0.15}
+reward:
+  constellation_radius: 0.12
+  constellation_points: 4
+  w_con: 40.0
+  delta_con: 5.0
+  beta_residual: 0.1
+  step_cost: 0.001
+  lambda_smooth: 0.001
+  lambda_tau: 5e-5
+  R_hold_step: 14.0
+  max_delta_dq: 0.5
+  lambda_dq: 0.0003
+  lambda_jerk: 0.001
+  lambda_brake: 0.005
+  brake_dist: 0.15
+  acc_weights: [1.0, 1.0, 3.0, 3.0, 5.0, 8.0, 12.0]
+  jerk_weights: [1.0, 1.0, 5.0, 5.0, 8.0, 12.0, 15.0]
+  R_success: 700.0
+  lambda_excursion: 0.001
+  excursion_weights: [1.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0]
+  lambda_ori: 2.0
+  alpha: 0.0
+  beta: 0.0
+  gamma: 0.0
+  delta: 0.0
+  eta: 0.0
+  joint_limit_penalty: 0.0
+  terminal_failure_penalty: 0.0
+  regenerative_reward: 0.0
+  lambda_elec: 0.0
+  tau_limits: [55.0, 55.0, 45.0, 45.0, 25.0, 25.0, 20.0]
+  lambda_tau_limit: 0.001
+  lambda_ee_vel: 0.0
+  lambda_align: 0.1
+  align_dist_threshold: 0.04
+control: {kp: 400.0, kd: 12.0}
+mujoco: {scene: assets/mujoco/g1_29dof_with_hand.xml, pd_kp: 400.0, pd_kd: 12.0, train_pd_kp: 150.0,
+  train_pd_kd: 3.0}
+target_sampling:
+  enabled: false
+  p_workspace: 0.85
+  margin: 0.1
+  frame_offset: [0.0, 0.0, 0.0]
+  max_tries: 50
+  workspace_bbox:
+    x: [0.04, 0.45]
+    y: [-0.4, 0.4]
+    z: [-0.2, 0.55]
+tol_curriculum: {enabled: false, start_tol: 0.03, end_tol: 0.01, start_ori_tol: 0.15,
+  end_ori_tol: 0.1, warmup_fraction: 0.5}
+ik_pool: {enabled: true, path: data/ik_pool_workspace_right.npz, mix: 1.0}
+hardcase_pool: {enabled: false, path: data/ik_pool_hardcases.npz, mix: 0.3}
+energy_model:
+  a: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  b: [0.4184, 0.35633, 0.27994, 0.39421, 0.0, 0.37675, 0.0]
+  c: [0.0, 1.27673, 0.0, 0.03236, 0.0, 0.34644, 0.0]
+  d: [0.64665, 0.0, 0.27493, 0.0, 1.02819, 1.20036, 1.78478]
+  e: [0.0, 0.0, 0.90903, 0.0, 0.0, 0.43646, 0.0, 1.10527, 0.10388, 0.10336, 0.51112,
+    0.40535, 0.05536, 0.00496, 0.86133, 0.0, 0.0, 0.05907, 0.34165, 0.0, 0.29364]
+sac:
+  learning_rate: 1.5e-05
+  batch_size: 256
+  buffer_size: 1000000
+  learning_starts: 25000
+  tau: 0.005
+  gamma: 0.99
+  train_freq: 1
+  gradient_steps: 8
+  ent_coef: auto
+  net_arch: [256, 256]
+td3:
+  learning_rate: 0.001
+  batch_size: 256
+  buffer_size: 1000000
+  learning_starts: 10000
+  tau: 0.005
+  gamma: 0.999
+  policy_delay: 2
+  target_policy_noise: 0.2
+  target_noise_clip: 0.5
+  net_arch: [256, 256]
+training:
+  algorithm: SAC
+  total_timesteps: 5000000
+  n_envs: 8
+  use_mujoco: true
+  eval_freq: 50000
+  n_eval_episodes: 30
+  checkpoint_dir: checkpoints_right
+  tensorboard_dir: logs/tb
+  verbose: 1
+  seed: 42
+  use_her: false
+  target_curriculum: {enabled: true, start_scale: 1.0, end_scale: 1.0, warmup_fraction: 0.4}
+  save_best_success_model: true
+evaluation: {n_targets: 1000, checkpoint: checkpoints/best_model, render: true, seed: 123,
+  fig_dir: results/figures}
