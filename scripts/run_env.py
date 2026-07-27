@@ -72,6 +72,25 @@ TORSO_LINK_NAME = "torso_link"
 EE_LINK_NAME    = "right_hand_palm_link"
 
 
+# ── Terminal Reset Listener ──────────────────────────────────────────────────
+_reset_requested = False
+_reset_lock = threading.Lock()
+
+def _listen_terminal_reset():
+    """Thread function to listen for 'r' input in the terminal without blocking sim."""
+    global _reset_requested
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            if line.strip().lower() == "r":
+                with _reset_lock:
+                    _reset_requested = True
+        except Exception:
+            break
+
+
 # ── IK State Extractor ───────────────────────────────────────────────────────
 class IKStateExtractor:
     """
@@ -241,6 +260,10 @@ def _publish_state(robot: Articulation, apple: RigidObject,
 def main():
     _start_dds()
 
+    # Iniciar el hilo escuchador para el reset por terminal
+    reset_thread = threading.Thread(target=_listen_terminal_reset, daemon=True)
+    reset_thread.start()
+
     if args_cli.num_envs == 1:
         cfg = AppleGraspEnvCfg_PLAY()
     else:
@@ -294,6 +317,7 @@ def main():
     print("   or  python3 scripts/reach_apple_ik.py       (Jacobian IK)")
     print("  in a second terminal to control joints.")
     print("  Without it the robot holds its default pose.")
+    print("  Press 'r' + Enter in this terminal at any time to RESET.")
     print("="*60 + "\n")
 
     step  = 0
@@ -303,7 +327,49 @@ def main():
     except Exception:
         sensor = None
 
+    global _reset_requested
+
     while simulation_app.is_running():
+        # Verificar si el usuario solicitó reset por terminal
+        with _reset_lock:
+            if _reset_requested:
+                _reset_requested = False
+                
+                # 1. Vaciar objetivos DDS
+                with _targets_lock:
+                    _arm_targets = None
+                    _hand_targets = None
+
+                # 2. Reset de Gymnasium y tallo
+                obs, _ = env.reset()
+                stem.reset(env)
+
+                # 3. Forzar posiciones y velocidades a CERO en el motor físico (PhysX)
+                try:
+                    robot.write_joint_state_to_sim(
+                        robot.data.default_joint_pos,
+                        torch.zeros_like(robot.data.default_joint_vel)
+                    )
+                    robot.write_root_pose_to_sim(robot.data.default_root_state[:, :7])
+                    robot.write_root_velocity_to_sim(robot.data.default_root_state[:, 7:])
+                    robot.reset()
+                except Exception as e:
+                    print(f"[Reset Warning] {e}")
+
+                # 4. PASO CLAVE: Simular 15 pasos con acciones CERO
+                # Esto 'limpia' el buffer de los controladores PD e ignora el arrastre
+                zero_actions = torch.zeros(env.action_space.shape, device=env.device, dtype=torch.float32)
+                for _ in range(15):
+                    obs, _, _, _, _ = env.step(zero_actions)
+
+                # 5. Volver a vaciar objetivos por si llegó algún paquete DDS durante los 15 pasos
+                with _targets_lock:
+                    _arm_targets = None
+                    _hand_targets = None
+
+                step = 0
+                print("\n>>> SIMULACIÓN Y ROBOT RESETEADOS A POSE INICIAL <<<\n")
+
         with torch.inference_mode():
             if args_cli.random_actions:
                 raw     = env.action_space.sample()

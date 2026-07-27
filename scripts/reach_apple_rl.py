@@ -1,10 +1,34 @@
 #!/usr/bin/env python3
 # Copyright 2026 - G1 Dex3 Apple Grasp Project
 """reach_apple_rl.py
-
 -----------------
 Trajectory planning and execution using trained Stable-Baselines3 RL policies
 for the Unitree G1 humanoid robot over Unitree DDS.
+
+FIXES vs the previous version:
+  1. FRAME: G1ArmEnv._fk() (and therefore everything the policy was trained
+     on) returns poses in the PELVIS frame (g1_dex3_right_arm.yml's
+     base_link), not the torso frame. The pelvis is rigidly fixed in world
+     at (0, 0, ROBOT_ROOT_HEIGHT) with identity rotation (fix_root_link=True,
+     no rotation in init_state) -- see apple_grasp_env_cfg.py. So converting
+     world -> pelvis is just a constant subtraction, no rotation needed.
+     (The cuRobo scripts use torso_link instead because THEY explicitly
+     override base_link to torso_link in their own copy of the yml -- that
+     override was never applied here.)
+  2. ORIENTATION: run_env.py's DDS state never publishes an apple
+     orientation (no apple_quat/apple_ori/target_quat key), so the old
+     extract_target_rotation() silently fell back to np.eye(3) every call.
+     That's an arbitrary, likely-unreachable orientation target. Replaced
+     with a fixed, tunable approach orientation (same idea as
+     scripts/orient_tune.py) via --roll-deg/--pitch-deg/--yaw-deg.
+  3. SCALE: ARM_ACTION_SCALE/HAND_ACTION_SCALE now match
+     apple_grasp_env_cfg.py's ActionsCfg (scale=1.0), not the old 0.5/0.3.
+
+Sanity check before trusting a real apple reach: pick a random q_test,
+compute pos_t, rot_t = env._fk(q_test), and command that as the target with
+q_start = q_test's neighbour. If the arm reliably reaches a self-consistent
+FK target, the control loop is correct and any remaining apple-specific
+error is just approach-offset/orientation tuning, not a frame bug.
 """
 
 from __future__ import annotations
@@ -32,26 +56,47 @@ DEFAULT_CONFIG = "/home/pablo_kevin/dex3_rl_manipulation/envs/g1_arm_policies/co
 DEFAULT_CHECKPOINT = (
     "/home/pablo_kevin/dex3_rl_manipulation/envs/g1_arm_policies/g1_right_arm_sac.zip"
 )
-DEFAULT_MODE = (
-    "plan"  # Options: "plan" (step-by-step rollout) or "closed_loop" (real-time)
-)
+DEFAULT_MODE = "plan"  # Options: "plan" (step-by-step rollout) or "closed_loop" (real-time)
 DEFAULT_STEP_DT = 0.02
 DEFAULT_HOLD_TIME = 3.0
 
 # ── 2. Action & Observation Constants ────────────────────────────────────────
-ARM_ACTION_SCALE = 0.5
-HAND_ACTION_SCALE = 0.3
+# Must match apple_grasp_env_cfg.py's ActionsCfg exactly (both scale=1.0).
+ARM_ACTION_SCALE = 1.0
+HAND_ACTION_SCALE = 1.0
 NUM_ARM_JOINTS = 7
 NUM_HAND_JOINTS = 7
 MAX_JOINT_STEP = 0.05
 
-"""CALIBRATION_OFFSET_POS = np.array(
-    [-0.29299, -0.37033, -0.20517], dtype=np.float32
-)"""
+# ── 3. Frame constants ────────────────────────────────────────────────────────
+# Pelvis is fixed (fix_root_link=True) at this world pose with IDENTITY
+# rotation -- see apple_grasp_env_cfg.py's G1_DEX3_CFG.init_state. If that
+# ever changes (robot moved, rotated base, etc.) update this constant, or
+# better: have run_env.py publish the pelvis pose directly over DDS.
+ROBOT_ROOT_HEIGHT = 0.793
+PELVIS_POS_WORLD = np.array([0.0, 0.0, ROBOT_ROOT_HEIGHT], dtype=np.float64)
 
-CALIBRATION_OFFSET_POS = np.array(
-    [0, 0, 0], dtype=np.float32
-)
+# Apple grasp geometry: aim slightly below the apple's centre (cupping from
+# underneath), same idea as APPROACH_Z_OFFSET in reach_apple_curobo.py.
+APPLE_RADIUS = 0.04
+APPLE_APPROACH_Z_OFFSET = +APPLE_RADIUS * 2.0
+
+# Fixed target orientation (degrees), since no real apple orientation is
+# ever published. This is a PELVIS-frame Euler triple (fixed base ==
+# world-aligned), so it's not quite identical to the "torso frame" tuning
+# in orient_tune.py -- torso is tilted from pelvis by waist_pitch (~0.1 rad,
+# ~5.7 deg) in the default pose. Close enough to start; iterate with the
+# CLI flags below if the palm approach still looks off.
+DEFAULT_ROLL_DEG, DEFAULT_PITCH_DEG, DEFAULT_YAW_DEG = 90.0, 0.0, 0.0
+
+
+#CALIBRATION RESULTS SUMMARY (pelvis-local frame)
+CALIBRATION_VECTOR = [-0.0055, 0.019, -0.2178] # m [dx,dy,dz]
+
+
+def world_to_pelvis(pos_world: np.ndarray) -> np.ndarray:
+    """Constant-offset transform: pelvis is fixed in world with identity rotation."""
+    return pos_world - PELVIS_POS_WORLD
 
 
 class DDSRobotInterface:
@@ -87,10 +132,7 @@ class DDSRobotInterface:
                     with self.state_lock:
                         self.latest_state = data
                 except Exception as e:
-                    print(
-                        f"[DDS Interface] Error parsing incoming state JSON:"
-                        f" {e}"
-                    )
+                    print(f"[DDS Interface] Error parsing incoming state JSON: {e}")
 
             self.subscriber = ChannelSubscriber(self.state_topic, String_)
             self.subscriber.Init(_state_callback, 1)
@@ -102,9 +144,7 @@ class DDSRobotInterface:
                 f" publishing to '{self.target_topic}'."
             )
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to initialize Unitree DDS channels: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to initialize Unitree DDS channels: {e}") from e
 
     def get_state(self) -> Optional[Dict[str, Any]]:
         with self.state_lock:
@@ -115,17 +155,11 @@ class DDSRobotInterface:
         start_time = time.time()
         while time.time() - start_time < timeout:
             state = self.get_state()
-            if (
-                state is not None
-                and "apple_pos" in state
-                and "arm_joint_pos" in state
-            ):
+            if state is not None and "apple_pos" in state and "arm_joint_pos" in state:
                 print("[DDS Interface] Valid state received!")
                 return state
             time.sleep(0.05)
-        raise TimeoutError(
-            "[DDS Interface] Timed out waiting for robot state."
-        )
+        raise TimeoutError("[DDS Interface] Timed out waiting for robot state.")
 
     def publish_joint_targets(
         self,
@@ -133,14 +167,8 @@ class DDSRobotInterface:
         default_arm_pos: List[float],
         hand_joint_angles: Optional[List[float]] = None,
     ) -> None:
-        if (
-            len(arm_joint_angles) != NUM_ARM_JOINTS
-            or len(default_arm_pos) != NUM_ARM_JOINTS
-        ):
-            raise ValueError(
-                f"Arm joint angles and defaults must have length"
-                f" {NUM_ARM_JOINTS}"
-            )
+        if len(arm_joint_angles) != NUM_ARM_JOINTS or len(default_arm_pos) != NUM_ARM_JOINTS:
+            raise ValueError(f"Arm joint angles and defaults must have length {NUM_ARM_JOINTS}")
 
         raw_arm = [
             (target - def_q) / ARM_ACTION_SCALE
@@ -161,38 +189,29 @@ class DDSRobotInterface:
             print(f"[DDS Interface] Failed to publish action: {e}")
 
 
-def extract_target_rotation(state: Dict[str, Any]) -> np.ndarray:
-    """Extracts target rotation matrix (3x3) from quaternion [w, x, y, z] in DDS state."""
-    quat = None
-    if "apple_quat" in state and len(state["apple_quat"]) == 4:
-        quat = state["apple_quat"]
-    elif "apple_ori" in state and len(state["apple_ori"]) == 4:
-        quat = state["apple_ori"]
-    elif "target_quat" in state and len(state["target_quat"]) == 4:
-        quat = state["target_quat"]
-
-    if quat is not None:
-        w, x, y, z = quat
-        return R.from_quat([x, y, z, w]).as_matrix()
-    return np.eye(3)
+def compute_local_target(state: Dict[str, Any], target_rot_local: np.ndarray,
+                          approach_z_offset: float) -> Tuple[np.ndarray, np.ndarray]:
+    """World-frame apple position -> pelvis-frame target the policy expects."""
+    apple_pos_world = np.array(state["apple_pos"], dtype=np.float64)
+    approach_point_world = apple_pos_world + np.array([0.0, 0.0, approach_z_offset])
+    target_pos_local = world_to_pelvis(approach_point_world)
+    return target_pos_local.astype(np.float32), target_rot_local
 
 
 def build_observation(
     env: G1ArmEnv,
     q_current: np.ndarray,
     dq_current: np.ndarray,
-    apple_pos: np.ndarray,
-    target_rot: np.ndarray,
+    target_pos_local: np.ndarray,
+    target_rot_local: np.ndarray,
     step_count: int = 0,
 ) -> np.ndarray:
     """Constructs the exact 21-dim observation vector expected by G1ArmEnv policies."""
     env.q = q_current.copy()
     env.dq = dq_current.copy()
     env._step_count = step_count
-
-    # Apply workspace calibration offset
-    env._target_pos = apple_pos - CALIBRATION_OFFSET_POS
-    env._target_rot = target_rot
+    env._target_pos = target_pos_local
+    env._target_rot = target_rot_local
 
     pos_err, _, ori_err, _ = env._ee_pos_error()
     return env._obs(pos_err, ori_err)
@@ -202,15 +221,12 @@ def plan_trajectory_offline(
     model: Any,
     env: G1ArmEnv,
     q_start: np.ndarray,
-    apple_pos: np.ndarray,
-    target_rot: np.ndarray,
+    target_pos_local: np.ndarray,
+    target_rot_local: np.ndarray,
     max_steps: int = 200,
 ) -> np.ndarray:
     """Unrolls the RL policy step-by-step using joint-space integration."""
-    print(
-        f"[Planner] Unrolling RL policy toward apple at"
-        f" {np.round(apple_pos, 3)}..."
-    )
+    print(f"[Planner] Unrolling RL policy toward pelvis-frame target {np.round(target_pos_local, 3)}...")
 
     q_current = q_start.copy()
     dq_current = np.zeros(NUM_ARM_JOINTS, dtype=np.float64)
@@ -218,7 +234,7 @@ def plan_trajectory_offline(
 
     for step in range(max_steps):
         obs = build_observation(
-            env, q_current, dq_current, apple_pos, target_rot, step_count=step
+            env, q_current, dq_current, target_pos_local, target_rot_local, step_count=step
         )
         action, _ = model.predict(obs, deterministic=True)
 
@@ -261,6 +277,8 @@ def run_closed_loop_reactive(
     model: Any,
     env: G1ArmEnv,
     dds: DDSRobotInterface,
+    target_rot_local: np.ndarray,
+    approach_z_offset: float,
     control_dt: float = 0.02,
 ) -> None:
     """Runs real-time reactive control loop."""
@@ -277,11 +295,8 @@ def run_closed_loop_reactive(
                 continue
 
             current_q = np.array(state["arm_joint_pos"], dtype=np.float32)
-            default_q = state.get(
-                "default_arm_pos", [0.0] * NUM_ARM_JOINTS
-            )
-            apple_pos = np.array(state["apple_pos"], dtype=np.float32)
-            target_rot = extract_target_rotation(state)
+            default_q = state.get("default_arm_pos", [0.0] * NUM_ARM_JOINTS)
+            target_pos_local, _ = compute_local_target(state, target_rot_local, approach_z_offset)
 
             if prev_q is None:
                 current_dq = np.zeros(NUM_ARM_JOINTS, dtype=np.float32)
@@ -293,8 +308,8 @@ def run_closed_loop_reactive(
                 env,
                 current_q,
                 current_dq,
-                apple_pos,
-                target_rot,
+                target_pos_local,
+                target_rot_local,
                 step_count=step_count,
             )
             action, _ = model.predict(obs, deterministic=True)
@@ -312,43 +327,33 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Reach Apple with Trained RL Policy over Unitree DDS"
     )
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to env config YAML")
     parser.add_argument(
-        "--config", default=DEFAULT_CONFIG, help="Path to env config YAML"
+        "--checkpoint", default=DEFAULT_CHECKPOINT, help="Path to trained SB3 model checkpoint"
     )
     parser.add_argument(
-        "--checkpoint",
-        default=DEFAULT_CHECKPOINT,
-        help="Path to trained SB3 model checkpoint",
+        "--mode", choices=["plan", "closed_loop"], default=DEFAULT_MODE, help="Operation mode"
     )
+    parser.add_argument("--step-dt", type=float, default=DEFAULT_STEP_DT, help="Time delay between DDS actions (s)")
+    parser.add_argument("--hold-time", type=float, default=DEFAULT_HOLD_TIME, help="Seconds to hold pose at the end")
+    parser.add_argument("--roll-deg", type=float, default=DEFAULT_ROLL_DEG, help="Target palm roll (pelvis frame, deg)")
+    parser.add_argument("--pitch-deg", type=float, default=DEFAULT_PITCH_DEG, help="Target palm pitch (pelvis frame, deg)")
+    parser.add_argument("--yaw-deg", type=float, default=DEFAULT_YAW_DEG, help="Target palm yaw (pelvis frame, deg)")
     parser.add_argument(
-        "--mode",
-        choices=["plan", "closed_loop"],
-        default=DEFAULT_MODE,
-        help="Operation mode",
-    )
-    parser.add_argument(
-        "--step-dt",
-        type=float,
-        default=DEFAULT_STEP_DT,
-        help="Time delay between DDS actions (s)",
-    )
-    parser.add_argument(
-        "--hold-time",
-        type=float,
-        default=DEFAULT_HOLD_TIME,
-        help="Seconds to hold pose at the end",
+        "--approach-offset", type=float, default=APPLE_APPROACH_Z_OFFSET,
+        help="Z offset (m) from apple centre to aim at, world frame (default: cup from below)"
     )
     args = parser.parse_args()
 
-    project_root = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..")
-    )
+
+    target_rot_local = R.from_euler(
+        "xyz", [args.roll_deg, args.pitch_deg, args.yaw_deg], degrees=True
+    ).as_matrix()
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     config_path = (
-        os.path.join(project_root, args.config)
-        if not os.path.isabs(args.config)
-        else args.config
+        os.path.join(project_root, args.config) if not os.path.isabs(args.config) else args.config
     )
-    
     checkpoint_path = (
         os.path.join(project_root, args.checkpoint)
         if not os.path.isabs(args.checkpoint)
@@ -361,29 +366,26 @@ def main() -> None:
     algo_name = env.cfg.get("training", {}).get("algorithm", "SAC").upper()
     ModelCls = SAC if algo_name == "SAC" else TD3
 
-    print(
-        f"[Setup] Loading {algo_name} policy checkpoint from"
-        f" '{checkpoint_path}'..."
-    )
+    print(f"[Setup] Loading {algo_name} policy checkpoint from '{checkpoint_path}'...")
     model = ModelCls.load(checkpoint_path, env=env)
 
     dds = DDSRobotInterface()
     initial_state = dds.wait_for_state()
-    default_arm_pos = initial_state.get(
-        "default_arm_pos", [0.0] * NUM_ARM_JOINTS
-    )
+    default_arm_pos = initial_state.get("default_arm_pos", [0.0] * NUM_ARM_JOINTS)
+
+    target_pos_local, _ = compute_local_target(initial_state, target_rot_local, args.approach_offset)
+    print(f"[Setup] Apple (world): {initial_state['apple_pos']}")
+    print(f"[Setup] Target (pelvis frame, after approach offset): {target_pos_local.tolist()}")
 
     if args.mode == "plan":
         current_q = np.array(initial_state["arm_joint_pos"], dtype=np.float32)
-        apple_pos = np.array(initial_state["apple_pos"], dtype=np.float32)
-        target_rot = extract_target_rotation(initial_state)
 
         q_traj = plan_trajectory_offline(
             model=model,
             env=env,
             q_start=current_q,
-            apple_pos=apple_pos,
-            target_rot=target_rot,
+            target_pos_local=target_pos_local,
+            target_rot_local=target_rot_local,
         )
 
         execute_trajectory(
@@ -398,6 +400,7 @@ def main() -> None:
             model=model,
             env=env,
             dds=dds,
+            target_rot_local=target_rot_local,
             control_dt=args.step_dt,
         )
 

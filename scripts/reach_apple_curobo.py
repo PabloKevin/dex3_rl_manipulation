@@ -156,7 +156,7 @@ ARM_SCALE = 0.5
 
 APPLE_RADIUS = 0.04
 APPLE_COLLISION_RADIUS = APPLE_RADIUS + 0.02  # small buffer so planned poses don't skim/push the apple surface
-APPROACH_Z_OFFSET = -APPLE_RADIUS * 3.0  # target sits BELOW the apple center (world -z), cupping from underneath
+APPROACH_Z_OFFSET = -APPLE_RADIUS * 5.0  # target sits BELOW the apple center (world -z), cupping from underneath
 
 # Palm orientation in the TORSO frame, tuned by eye — see orient_tune.py for a
 # fast (no-motion-planning) way to iterate on these three numbers.
@@ -175,6 +175,11 @@ HAND_OPEN_RAW = [0.0, 0.0, 0.0, 0.0, 0.0, 0.7, 0.0]
 
 CONTROL_HZ = 50
 STEP_DT = 1.0 / CONTROL_HZ
+
+# Calibration vectors
+CALIBRATION_POS_BIAS_LOCAL = [-0.3667474538087845, 0.10057900846004486, 0.02839040756225586]
+CALIBRATION_ROT_BIAS_LOCAL = [0.13799192942678928, 1.1956529319286346, 0.6591126918792725]
+
 
 
 def publish(arm_raw: list, hand_raw: list) -> None:
@@ -228,6 +233,29 @@ def build_robot_cfg_dict():
         ]
 
     return robot_cfg_dict
+
+
+def quat_log(q: torch.Tensor) -> torch.Tensor:
+    """Unit quaternion (w,x,y,z) -> rotation vector (axis * angle), radians."""
+    if q[0] < 0:
+        q = -q
+    w = torch.clamp(q[0], -1.0, 1.0)
+    angle = 2.0 * torch.acos(w)
+    s = torch.sqrt(torch.clamp(1.0 - w * w, min=1e-12))
+    if s < 1e-6:
+        return torch.zeros(3, device=q.device)
+    axis = q[1:] / s
+    return axis * angle
+
+
+def quat_exp(rotvec: torch.Tensor) -> torch.Tensor:
+    """Inverse of quat_log: rotation vector (axis * angle) -> unit quaternion."""
+    angle = torch.norm(rotvec)
+    if angle < 1e-8:
+        return torch.tensor([1.0, 0.0, 0.0, 0.0], device=rotvec.device)
+    axis = rotvec / angle
+    return quat_from_axis_angle(axis, angle)
+
 
 
 def main():
@@ -299,6 +327,13 @@ def main():
     )
 
     goal_quat = euler_xyz_deg_to_quat(ROLL_DEG, PITCH_DEG, YAW_DEG, tensor_args.device)
+
+    pos_bias = torch.tensor(CALIBRATION_POS_BIAS_LOCAL, device=tensor_args.device, dtype=torch.float32)
+    rot_bias = torch.tensor(CALIBRATION_ROT_BIAS_LOCAL, device=tensor_args.device, dtype=torch.float32)
+
+    goal_local = goal_local - pos_bias                          # cancel position bias
+    goal_quat  = quat_mul(goal_quat, quat_conjugate(quat_exp(rot_bias)))  # cancel rotation bias
+
     goal_pose = Pose(position=goal_local, quaternion=goal_quat)
 
     print("Planning trajectory...")

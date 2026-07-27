@@ -1,0 +1,172 @@
+{
+  "summary": {
+    "n_points": 10,
+    "n_success": 2,
+    "pos_error_mean_m": 0.42690688371658325,
+    "pos_error_std_m": 0.027113646268844604,
+    "pos_error_max_m": 0.45402052998542786,
+    "orient_error_mean_deg": 114.22122275427196,
+    "orient_error_std_deg": 5.30820787197505,
+    "orient_error_max_deg": 119.52943062624702,
+    "mean_bias_pos_local_m": [
+      -0.3667474538087845,
+      0.10057900846004486,
+      0.02839040756225586
+    ],
+    "mean_bias_rot_local_rotvec": [
+      0.13799192942678928,
+      1.1956529319286346,
+      0.6591126918792725
+    ]
+  },
+  "points": [
+    {
+      "index": 0,
+      "success": false,
+      "status": "MotionGenStatus.IK_FAIL"
+    },
+    {
+      "index": 1,
+      "success": false,
+      "status": "MotionGenStatus.IK_FAIL"
+    },
+    {
+      "index": 2,
+      "success": true,
+      "goal_pos_local": [
+        0.34395986795425415,
+        -0.06986188143491745,
+        0.4688766598701477
+      ],
+      "goal_quat_local": [
+        0.7048699855804443,
+        0.70428067445755,
+        -0.06315711885690689,
+        0.056198615580797195
+      ],
+      "actual_pos_local": [
+        0.058423083275556564,
+        0.2050892412662506,
+        0.5208886861801147
+      ],
+      "actual_quat_local": [
+        0.4625815749168396,
+        0.395747572183609,
+        0.7013565301895142,
+        0.3708112835884094
+      ],
+      "goal_pos_world": [
+        0.3660697340965271,
+        -0.07716980576515198,
+        1.2843865156173706
+      ],
+      "actual_pos_world": [
+        0.08390706777572632,
+        0.19658470153808594,
+        1.3570315837860107
+      ],
+      "actual_quat_world": [
+        0.43910297751426697,
+        0.4096876382827759,
+        0.7112615704536438,
+        0.3653101921081543
+      ],
+      "pos_error_vec_local": [
+        -0.2855367958545685,
+        0.27495113015174866,
+        0.05201202630996704
+      ],
+      "pos_error_m": 0.39979323744773865,
+      "orient_error_rotvec_local": [
+        0.037374068051576614,
+        1.7813266515731812,
+        -0.6624680757522583
+      ],
+      "orient_error_deg": 108.91301488229692
+    },
+    {
+      "index": 3,
+      "success": true,
+      "goal_pos_local": [
+        0.3083750903606415,
+        -0.1637878715991974,
+        0.41146519780158997
+      ],
+      "goal_quat_local": [
+        0.7037647366523743,
+        0.7051568031311035,
+        -0.052478253841400146,
+        0.06866731494665146
+      ],
+      "actual_pos_local": [
+        -0.13958300650119781,
+        -0.23758098483085632,
+        0.41623398661613464
+      ],
+      "actual_quat_local": [
+        0.24163107573986053,
+        0.36423391103744507,
+        -0.4202832579612732,
+        0.7951791286468506
+      ],
+      "goal_pos_world": [
+        0.35171380639076233,
+        -0.11438782513141632,
+        1.2263816595077515
+      ],
+      "actual_pos_world": [
+        -0.09318610280752182,
+        -0.1702064722776413,
+        1.2976765632629395
+      ],
+      "actual_quat_world": [
+        0.30471011996269226,
+        0.3896602690219879,
+        -0.350083589553833,
+        0.7954608201980591
+      ],
+      "pos_error_vec_local": [
+        -0.4479581117630005,
+        -0.07379311323165894,
+        0.004768788814544678
+      ],
+      "pos_error_m": 0.45402052998542786,
+      "orient_error_rotvec_local": [
+        0.23860979080200195,
+        0.6099792122840881,
+        1.9806934595108032
+      ],
+      "orient_error_deg": 119.52943062624702
+    },
+    {
+      "index": 4,
+      "success": false,
+      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+    },
+    {
+      "index": 5,
+      "success": false,
+      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+    },
+    {
+      "index": 6,
+      "success": false,
+      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+    },
+    {
+      "index": 7,
+      "success": false,
+      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+    },
+    {
+      "index": 8,
+      "success": false,
+      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+    },
+    {
+      "index": 9,
+      "success": false,
+      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+    }
+  ]
+}

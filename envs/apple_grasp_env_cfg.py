@@ -153,15 +153,15 @@ G1_DEX3_CFG = ArticulationCfg(
             "left_wrist_pitch_joint":     0.0,
             "left_wrist_yaw_joint":       0.0,
             # ── right arm (controlled) ────────────────────────────────
-            "right_shoulder_pitch_joint": 0.3,
-            "right_shoulder_roll_joint": -0.2,
+            "right_shoulder_pitch_joint": 0.0,
+            "right_shoulder_roll_joint": 0.0,
             "right_shoulder_yaw_joint":   0.0,
             "right_elbow_joint":          0.8,
             "right_wrist_roll_joint":     0.0,
             "right_wrist_pitch_joint":    0.0,
             "right_wrist_yaw_joint":      0.0,
             # ── right Dex3 hand (open) ────────────────────────────────
-            "right_hand.*":  0.0,
+            "right_hand_thumb_1_joint":  0.55,
         },
         joint_vel={".*": 0.0},
     ),
