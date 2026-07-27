@@ -130,8 +130,6 @@ G1_DEX3_CFG = ArticulationCfg(
         pos=(0.0, 0.0, ROBOT_ROOT_HEIGHT),
         # Standing-like pose so the robot looks correct visually
         # even though legs are irrelevant for this task.
-        # TODO: verify joint names match your URDF with:
-        #   python scripts/run_env.py --debug_links
         joint_pos={
             # ── legs (visual only, not in action space) ──────────────
             ".*hip_pitch.*":   -0.10,
@@ -156,7 +154,7 @@ G1_DEX3_CFG = ArticulationCfg(
             "right_shoulder_pitch_joint": 0.0,
             "right_shoulder_roll_joint": 0.0,
             "right_shoulder_yaw_joint":   0.0,
-            "right_elbow_joint":          0.8,
+            "right_elbow_joint":          0.5,
             "right_wrist_roll_joint":     0.0,
             "right_wrist_pitch_joint":    0.0,
             "right_wrist_yaw_joint":      0.0,
@@ -239,7 +237,6 @@ G1_DEX3_CFG = ArticulationCfg(
 @configclass
 class AppleGraspSceneCfg(InteractiveSceneCfg):
     """Minimal scene: G1+Dex3 fixed base, red sphere apple, ground, light."""
-
     # ── Ground ──────────────────────────────────────────────────────────
     ground = AssetBaseCfg(
         prim_path="/World/ground",

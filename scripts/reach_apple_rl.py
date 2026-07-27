@@ -79,7 +79,7 @@ PELVIS_POS_WORLD = np.array([0.0, 0.0, ROBOT_ROOT_HEIGHT], dtype=np.float64)
 # Apple grasp geometry: aim slightly below the apple's centre (cupping from
 # underneath), same idea as APPROACH_Z_OFFSET in reach_apple_curobo.py.
 APPLE_RADIUS = 0.04
-APPLE_APPROACH_Z_OFFSET = +APPLE_RADIUS * 2.0
+APPLE_APPROACH_Z_OFFSET = + APPLE_RADIUS * 1.50
 
 # Fixed target orientation (degrees), since no real apple orientation is
 # ever published. This is a PELVIS-frame Euler triple (fixed base ==
@@ -91,7 +91,7 @@ DEFAULT_ROLL_DEG, DEFAULT_PITCH_DEG, DEFAULT_YAW_DEG = 90.0, 0.0, 0.0
 
 
 #CALIBRATION RESULTS SUMMARY (pelvis-local frame)
-CALIBRATION_VECTOR = [-0.0055, 0.019, -0.2178] # m [dx,dy,dz]
+CALIBRATION_VECTOR = [-0.0277, 0.007, -0.2137] # m [dx,dy,dz]
 
 
 def world_to_pelvis(pos_world: np.ndarray) -> np.ndarray:
@@ -192,7 +192,8 @@ class DDSRobotInterface:
 def compute_local_target(state: Dict[str, Any], target_rot_local: np.ndarray,
                           approach_z_offset: float) -> Tuple[np.ndarray, np.ndarray]:
     """World-frame apple position -> pelvis-frame target the policy expects."""
-    apple_pos_world = np.array(state["apple_pos"], dtype=np.float64)
+    calibration_vector = np.array(CALIBRATION_VECTOR)
+    apple_pos_world = np.array(state["apple_pos"], dtype=np.float64) - calibration_vector
     approach_point_world = apple_pos_world + np.array([0.0, 0.0, approach_z_offset])
     target_pos_local = world_to_pelvis(approach_point_world)
     return target_pos_local.astype(np.float32), target_rot_local
@@ -401,6 +402,7 @@ def main() -> None:
             env=env,
             dds=dds,
             target_rot_local=target_rot_local,
+            approach_z_offset=APPLE_APPROACH_Z_OFFSET,
             control_dt=args.step_dt,
         )
 
