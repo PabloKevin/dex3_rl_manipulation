@@ -127,17 +127,19 @@ class StemManager:
         except Exception:
             pass
 
-    def _check_break(self, env, apple, idx: int,
-                     state: _StemState) -> None:
+    def _check_break(self, env, apple, idx: int, state: _StemState) -> None:
         """Break joint when contact force exceeds threshold."""
         try:
-            sensor     = env.scene["contact_forces"]
-            forces     = sensor.data.net_forces_w[idx]   # [num_bodies, 3]
-            net_force  = forces.norm(dim=-1).sum().item()
+            sensor = env.scene["contact_forces"]
+            net_force = sensor.data.net_forces_w[idx].norm(dim=-1).sum().item()
         except Exception:
             net_force = 0.0
 
-        if net_force >= BREAK_FORCE:
+        threshold = (
+            env._stem_break_force[idx].item()
+            if hasattr(env, "_stem_break_force") else BREAK_FORCE
+        )
+        if net_force >= threshold:
             print(f"[tree_utils] env_{idx}: BREAKING "
                   f"(force={net_force:.1f} N)")
             self._delete_joint(state.joint_path)

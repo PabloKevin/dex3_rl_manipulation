@@ -29,6 +29,7 @@ Observation space (Phase 1 — no camera yet, add in Phase 3):
 import math
 import os
 from dataclasses import MISSING
+import random
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -48,6 +49,7 @@ from isaaclab.utils import configclass
 import isaaclab.envs.mdp as mdp
 
 from . import mdp as task_mdp  # our custom mdp functions
+from .mdp import domain_randomization as dr
 
 # ─────────────────────────────────────────────
 #  PATHS  ← set these before running
@@ -68,19 +70,26 @@ HEAD_CAMERA_LINK = "head_link"   # ← verify with your URDF
 # ─────────────────────────────────────────────
 #  CONSTANTS
 # ─────────────────────────────────────────────
+RAND_PCT = 0.20  # ±20%
 
-APPLE_RADIUS = 0.04          # 4 cm radius sphere
-APPLE_MASS   = 0.15          # kg — roughly a real apple
+def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
+    return nominal * random.uniform(1.0 - pct, 1.0 + pct)
 
-# Tree geometry
-# Tree trunk is placed to the LEFT of the robot (negative Y), slightly forward.
-# Branch extends along +X from trunk top toward the robot's right arm.
-TREE_POS      = (0.55, 0.35, 0.0)    # trunk base (x, y) in world frame
-TREE_HEIGHT   = 1.35                  # trunk height — branch ends above wrist
-BRANCH_LENGTH = 0.50                  # how far branch extends toward robot
-BRANCH_RADIUS = 0.04                  # radius of the branch
+# ── Launch-time domain randomization (once per training run) ─────────────────
+# Seed however you like — os.environ, cfg.seed, etc. Left un-seeded here so
+# every process launch gets a different layout.
+APPLE_RADIUS   = _jitter(0.04)
+APPLE_MASS     = _jitter(0.15)
+TREE_POS       = (_jitter(0.55), _jitter(-0.55), 0.0)
+TREE_HEIGHT    = _jitter(1.25)
+BRANCH_LENGTH  = _jitter(0.50)
+BRANCH_RADIUS  = _jitter(0.04)
+BRANCH_ROTATION = _jitter(110.0)
+APPLE_STEM_BREAK_FORCE  = _jitter(2.5)   # nominal only — real per-episode value comes from EventTerm below
+APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
 
-BRANCH_ROTATION = -110 # degrees
+# Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
+# With fix_root_link the pelvis is fixed here in world frame.
 # Branch pivot calculations — rotates around trunk junction
 branch_mid_x = TREE_POS[0] + (BRANCH_LENGTH / 2.0) * math.cos(math.radians(BRANCH_ROTATION))
 branch_mid_y = TREE_POS[1] + (BRANCH_LENGTH / 2.0) * math.sin(math.radians(BRANCH_ROTATION))
@@ -95,14 +104,6 @@ branch_tip_x = TREE_POS[0] + BRANCH_LENGTH * math.cos(math.radians(BRANCH_ROTATI
 branch_tip_y = TREE_POS[1] + BRANCH_LENGTH * math.sin(math.radians(BRANCH_ROTATION))
 APPLE_INIT_POS = (branch_tip_x, branch_tip_y, TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS)
 
-# Break force for the apple stem joint (Newtons).
-# The robot must apply at least this force downward to detach the apple.
-# ~2 N is roughly the weight of a real apple × a small safety factor.
-APPLE_STEM_BREAK_FORCE  = 2.5   # N  (linear break)
-APPLE_STEM_BREAK_TORQUE = 0.5   # N·m (angular break)
-
-# Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
-# With fix_root_link the pelvis is fixed here in world frame.
 ROBOT_ROOT_HEIGHT = 0.793  # G1 pelvis height in standing pose (metres)
 
 
@@ -573,11 +574,8 @@ class TerminationsCfg:
     #             "hold_time": 1.0},
     # )
 
-
 @configclass
 class EventsCfg:
-    """Randomisation events — applied on episode reset."""
-
     # Reset robot to default joint positions (with small noise)
     reset_robot = EventTerm(
         func=mdp.reset_joints_by_offset,
@@ -589,17 +587,39 @@ class EventsCfg:
         },
     )
 
-    # Randomise apple position in a small box around its nominal position
     reset_apple = EventTerm(
         func=task_mdp.reset_apple_pose,
         mode="reset",
         params={
             "object_cfg": SceneEntityCfg("apple"),
-            "pos_range_x": (-0.06, 0.06),   # ±6 cm
+            "pos_range_x": (-0.06, 0.06),
             "pos_range_y": (-0.06, 0.06),
             "pos_range_z": (-0.03, 0.03),
             "base_pos": APPLE_INIT_POS,
         },
+    )
+
+    # ── NEW: cheap per-episode randomization ──────────────────────────────
+    randomize_apple_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,   # isaaclab.envs.mdp built-in
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("apple"),
+            "mass_distribution_params": (0.8, 1.2),
+            "operation": "scale",
+        },
+    )
+
+    randomize_apple_scale = EventTerm(
+        func=dr.randomize_apple_scale,
+        mode="reset",
+        params={"object_cfg": SceneEntityCfg("apple"), "nominal_radius": APPLE_RADIUS},
+    )
+
+    randomize_stem_break = EventTerm(
+        func=dr.randomize_stem_break_params,
+        mode="reset",
+        params={"nominal_force": APPLE_STEM_BREAK_FORCE, "nominal_torque": APPLE_STEM_BREAK_TORQUE},
     )
 
 
