@@ -548,6 +548,31 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot"), "soft_ratio": 0.9},
     )
 
+    # Reaching the apple pos
+    palm_position = RewTerm(
+        func=task_mdp.reward_palm_below_apple,
+        weight=1.5,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "object_cfg": SceneEntityCfg("apple"),
+            "offset_z": 0.08,
+            "std": 0.05,
+        },
+    )
+
+    palm_orientation = RewTerm(
+        func=task_mdp.reward_palm_orientation,
+        weight=1.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "torso_cfg": SceneEntityCfg("robot", body_names=["torso_link"]),
+            "target_roll_deg": 90.0,   # confirm with orient_tune.py first
+            "target_pitch_deg": 0.0,
+            "target_yaw_deg": 0.0,
+            "std_rad": 0.3,
+        },
+    )
+
 
 @configclass
 class TerminationsCfg:
@@ -587,7 +612,7 @@ class EventsCfg:
         },
     )
 
-    reset_apple = EventTerm(
+    """reset_apple = EventTerm(
         func=task_mdp.reset_apple_pose,
         mode="reset",
         params={
@@ -597,9 +622,25 @@ class EventsCfg:
             "pos_range_z": (-0.03, 0.03),
             "base_pos": APPLE_INIT_POS,
         },
+    )"""
+
+    randomize_tree = EventTerm(
+        func=dr.randomize_tree_and_apple,
+        mode="reset",
+        params={
+            "object_cfg": SceneEntityCfg("apple"),
+            "tree_pos_xy": TREE_POS[:2],
+            "tree_height_nominal": TREE_HEIGHT,
+            "branch_length_nominal": BRANCH_LENGTH,
+            "branch_radius_nominal": BRANCH_RADIUS,
+            "branch_rotation_deg_nominal": BRANCH_ROTATION,
+            "apple_radius_nominal": APPLE_RADIUS,
+        },
     )
 
     # ── NEW: cheap per-episode randomization ──────────────────────────────
+    # (randomize_apple_scale below is the exception: it's a raw USD write, so
+    # it runs once at "prestartup" instead — see its EventTerm for why.)
     randomize_apple_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,   # isaaclab.envs.mdp built-in
         mode="reset",
@@ -612,7 +653,7 @@ class EventsCfg:
 
     randomize_apple_scale = EventTerm(
         func=dr.randomize_apple_scale,
-        mode="reset",
+        mode="prestartup",   # raw USD scale write — must happen before sim.reset() creates the GPU tensor views
         params={"object_cfg": SceneEntityCfg("apple"), "nominal_radius": APPLE_RADIUS},
     )
 
@@ -649,6 +690,12 @@ class AppleGraspEnvCfg(ManagerBasedRLEnvCfg):
 
         # Disable camera scene asset in Phase 1 (saves VRAM)
         self.scene.head_camera = None   # ← remove to enable camera
+
+        # randomize_apple_scale (mode="prestartup") does a raw per-env USD scale
+        # write, which IsaacLab refuses to allow under scene replication (cloned
+        # envs would otherwise share the same USD-level properties). At our env
+        # counts (<=32) the replication speedup is negligible, so this is safe.
+        self.scene.replicate_physics = False
 
         # Viewer camera (for run_env.py, not used during training)
         self.viewer.eye = (1.5, -1.5, 1.8)

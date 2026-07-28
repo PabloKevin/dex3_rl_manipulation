@@ -27,6 +27,8 @@ from .rewards import (
     reward_place,
     penalty_joint_limits,
     penalty_action_rate,
+    reward_palm_below_apple,     
+    reward_palm_orientation, 
 )
 
 from .terminations_and_events import (
@@ -34,4 +36,10 @@ from .terminations_and_events import (
     apple_lifted_success,
     apple_placed_success,
     reset_apple_pose,
+)
+
+from .domain_randomization import (
+    randomize_apple_scale,
+    randomize_stem_break_params,
+    randomize_tree_and_apple,
 )

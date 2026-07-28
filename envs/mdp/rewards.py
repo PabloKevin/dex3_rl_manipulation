@@ -21,6 +21,8 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
+import math
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -227,3 +229,86 @@ def penalty_action_rate(
         return torch.zeros(env.num_envs, device=env.device)
     delta = curr - prev
     return (delta**2).sum(dim=-1)  # [N]
+
+# ─────────────────────────────────────────────
+#  Palm pose reward (position below apple + cupping orientation)
+# ─────────────────────────────────────────────
+
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Batched Hamilton product. q: [N,4] wxyz."""
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
+
+
+def _quat_angle_diff(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Geodesic angle (rad) between batched quats [N,4] wxyz."""
+    dot = (q1 * q2).sum(-1).abs().clamp(-1.0, 1.0)
+    return 2.0 * torch.acos(dot)
+
+
+def _euler_xyz_deg_to_quat(roll_deg, pitch_deg, yaw_deg, device) -> torch.Tensor:
+    """Single non-batched target quat [4] wxyz. Same convention as
+    reach_apple_curobo.py's euler_xyz_deg_to_quat (intrinsic X, Y, Z)."""
+    r, p, y = (math.radians(a) for a in (roll_deg, pitch_deg, yaw_deg))
+    cr, sr = math.cos(r/2), math.sin(r/2)
+    cp, sp = math.cos(p/2), math.sin(p/2)
+    cy, sy = math.cos(y/2), math.sin(y/2)
+    qx = torch.tensor([cr, sr, 0.0, 0.0], device=device)
+    qy = torch.tensor([cp, 0.0, sp, 0.0], device=device)
+    qz = torch.tensor([cy, 0.0, 0.0, sy], device=device)
+    return _quat_mul(_quat_mul(qx.unsqueeze(0), qy.unsqueeze(0)), qz.unsqueeze(0)).squeeze(0)
+
+
+def reward_palm_below_apple(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,   # body_names=["right_hand_palm_link"]
+    object_cfg: SceneEntityCfg,  # apple
+    offset_z: float = 0.08,
+    std: float = 0.05,
+) -> torch.Tensor:
+    """Reward palm being `offset_z` metres directly below the apple centre."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    apple: RigidObject = env.scene[object_cfg.name]
+
+    palm_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    target = apple.data.root_pos_w.clone()
+    target[:, 2] -= offset_z
+
+    dist = torch.norm(target - palm_pos, dim=-1)
+    return torch.exp(-dist**2 / (2 * std**2))
+
+
+def reward_palm_orientation(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,   # body_names=["right_hand_palm_link"]
+    torso_cfg: SceneEntityCfg,   # body_names=["torso_link"]
+    target_roll_deg: float = 90.0,
+    target_pitch_deg: float = 0.0,
+    target_yaw_deg: float = 0.0,
+    std_rad: float = 0.3,
+) -> torch.Tensor:
+    """Reward palm orientation matching the torso-frame cupping pose
+    (fingers horizontal, palm normal facing up toward the apple) —
+    same ROLL/PITCH/YAW convention as reach_apple_curobo.py / orient_tune.py.
+    Tune those two scripts first to confirm the exact angles for YOUR urdf,
+    then hardcode them here.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    palm_quat = robot.data.body_quat_w[:, robot_cfg.body_ids[0], :]
+    torso_quat = robot.data.body_quat_w[:, torso_cfg.body_ids[0], :]
+
+    if not hasattr(env, "_palm_target_local_quat"):
+        env._palm_target_local_quat = _euler_xyz_deg_to_quat(
+            target_roll_deg, target_pitch_deg, target_yaw_deg, env.device
+        )
+    target_local = env._palm_target_local_quat.unsqueeze(0).expand(torso_quat.shape[0], -1)
+    target_world = _quat_mul(torso_quat, target_local)
+
+    ang_err = _quat_angle_diff(palm_quat, target_world)
+    return torch.exp(-(ang_err**2) / (2 * std_rad**2))

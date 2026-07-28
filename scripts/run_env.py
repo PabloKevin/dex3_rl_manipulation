@@ -331,10 +331,10 @@ def main():
 
     while simulation_app.is_running():
         # Verificar si el usuario solicitó reset por terminal
-        with _reset_lock:
+        with torch.inference_mode(), _reset_lock:
             if _reset_requested:
                 _reset_requested = False
-                
+
                 # 1. Vaciar objetivos DDS
                 with _targets_lock:
                     _arm_targets = None

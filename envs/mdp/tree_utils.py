@@ -81,12 +81,12 @@ class StemManager:
         return [s.phase == "RELEASED" for s in self._states]
 
     # ── internals ────────────────────────────────────────────────────────
-
     def _get_anchor(self, env, env_idx: int) -> torch.Tensor:
+        if hasattr(env, "_stem_anchor_pos"):
+            return env._stem_anchor_pos[env_idx].clone()
         from envs.apple_grasp_env_cfg import APPLE_INIT_POS
         origin = env.scene.env_origins[env_idx]
-        local  = torch.tensor(list(APPLE_INIT_POS),
-                               device=env.device, dtype=torch.float32)
+        local = torch.tensor(list(APPLE_INIT_POS), device=env.device, dtype=torch.float32)
         return origin + local
 
     def _create_joint(self, env, env_idx: int,
