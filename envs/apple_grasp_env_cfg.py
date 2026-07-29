@@ -13,16 +13,18 @@ Action space:
   - Right Dex3: 7 joints
   - Total: 14-dim joint position targets (relative to default pose)
 
-Observation space (Phase 1 — no camera yet, add in Phase 3):
+Observation space (Phase 1 — reach only, no camera yet, add in Phase 3):
   - Right arm joint positions (7)
   - Right arm joint velocities (7)
-  - Right arm joint torques (7)
   - Right hand joint positions (7)
   - Right hand joint velocities (7)
-  - Right hand fingertip contact forces (7 × 3 = 21, flattened)
   - Apple position relative to wrist (3)
-  - Apple position in world (3)
-  Total: ~62-dim proprioceptive vector
+  - Palm orientation relative to torso, quaternion wxyz (4)
+  Total: 35-dim proprioceptive vector
+  (Joint torques and fingertip contact forces are dropped for this reach-only
+  phase — not needed to reach, and just extra dimensions for the network to
+  learn through. Re-add them (task_mdp.joint_effort_selected /
+  task_mdp.fingertip_contact_forces) once grasp/manipulation training starts.)
   (Camera obs added in Phase 3 via AppleGraspCameraEnvCfg)
 """
 
@@ -450,19 +452,6 @@ class ObservationsCfg:
                 ],
             )},
         )
-        right_arm_torque = ObsTerm(
-            func=task_mdp.joint_effort_selected,
-            params={"asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
-                    "right_shoulder_yaw_joint", "right_elbow_joint",
-                    "right_wrist_roll_joint", "right_wrist_pitch_joint",
-                    "right_wrist_yaw_joint",
-                ],
-            )},
-        )
-
         # Right hand
         right_hand_pos = ObsTerm(
             func=task_mdp.joint_pos_selected,
@@ -477,19 +466,8 @@ class ObservationsCfg:
             )},
         )
 
-        # Contact forces (right fingertips × apple)
-        fingertip_contacts = ObsTerm(
-            func=task_mdp.fingertip_contact_forces,
-            params={"sensor_cfg": SceneEntityCfg("contact_forces")},
-        )
-
-        # Apple position in world frame
-        apple_pos_world = ObsTerm(
-            func=task_mdp.object_pos_world,
-            params={"object_cfg": SceneEntityCfg("apple")},
-        )
-
-        # Apple position relative to right wrist
+        # Apple position relative to right wrist — the reach-error vector.
+        # (apple_pos_world dropped: redundant with this for a fixed-base robot.)
         apple_pos_wrist = ObsTerm(
             func=task_mdp.object_pos_relative_to_body,
             params={
@@ -499,6 +477,21 @@ class ObservationsCfg:
                 ),
             },
         )
+
+        # Palm orientation relative to torso — same frame reward_palm_orientation
+        # scores against, giving the policy a direct signal for that reward
+        # instead of forcing it to infer orientation purely from joint angles.
+        palm_orientation_torso = ObsTerm(
+            func=task_mdp.body_quat_relative_to_body,
+            params={
+                "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+                "reference_cfg": SceneEntityCfg("robot", body_names=["torso_link"]),
+            },
+        )
+
+        # NOTE: fingertip_contacts (24-dim) removed for the reach-only phase —
+        # not needed to reach, and not yet needed until grasp/manipulation
+        # training, where it can be re-added (see task_mdp.fingertip_contact_forces).
 
         def __post_init__(self):
             self.enable_corruption = False  # add noise in Phase 3

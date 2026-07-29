@@ -16,6 +16,7 @@ from .observations import (
     object_pos_world,
     object_pos_relative_to_body,
     object_vel_world,
+    body_quat_relative_to_body,
 )
 
 from .rewards import (

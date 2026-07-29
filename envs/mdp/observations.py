@@ -14,6 +14,7 @@ import torch
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_conjugate, quat_mul
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -139,6 +140,23 @@ def object_pos_relative_to_body(
     wrist_local  = wrist_pos_w  - env_origins
 
     return apple_local - wrist_local  # [num_envs, 3]
+
+
+def body_quat_relative_to_body(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,      # body to report orientation of, e.g. right_hand_palm_link
+    reference_cfg: SceneEntityCfg,  # reference frame body, e.g. torso_link
+) -> torch.Tensor:
+    """One robot body's orientation expressed relative to another (e.g. palm
+    relative to torso) — same torso-relative frame reward_palm_orientation
+    scores against, so the policy can observe directly what that reward wants.
+
+    Shape: [num_envs, 4] (w, x, y, z)
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    body_quat = robot.data.body_quat_w[:, robot_cfg.body_ids[0], :]
+    ref_quat = robot.data.body_quat_w[:, reference_cfg.body_ids[0], :]
+    return quat_mul(quat_conjugate(ref_quat), body_quat)
 
 
 def object_vel_world(

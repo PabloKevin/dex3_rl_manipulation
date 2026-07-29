@@ -1,0 +1,173 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/apple_grasp_env_cfg.py
+	modified:   envs/mdp/__init__.py
+	modified:   envs/mdp/__pycache__/__init__.cpython-310.pyc
+	modified:   envs/mdp/__pycache__/observations.cpython-310.pyc
+	modified:   envs/mdp/observations.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	outputs/2026-07-29/04-07-51/
+	scripts/logs/
+	scripts/outputs/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index d282442..823be08 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index 812f99c..7c5c0b8 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -13,16 +13,18 @@ Action space:
+   - Right Dex3: 7 joints
+   - Total: 14-dim joint position targets (relative to default pose)
+ 
+-Observation space (Phase 1 — no camera yet, add in Phase 3):
++Observation space (Phase 1 — reach only, no camera yet, add in Phase 3):
+   - Right arm joint positions (7)
+   - Right arm joint velocities (7)
+-  - Right arm joint torques (7)
+   - Right hand joint positions (7)
+   - Right hand joint velocities (7)
+-  - Right hand fingertip contact forces (7 × 3 = 21, flattened)
+   - Apple position relative to wrist (3)
+-  - Apple position in world (3)
+-  Total: ~62-dim proprioceptive vector
++  - Palm orientation relative to torso, quaternion wxyz (4)
++  Total: 35-dim proprioceptive vector
++  (Joint torques and fingertip contact forces are dropped for this reach-only
++  phase — not needed to reach, and just extra dimensions for the network to
++  learn through. Re-add them (task_mdp.joint_effort_selected /
++  task_mdp.fingertip_contact_forces) once grasp/manipulation training starts.)
+   (Camera obs added in Phase 3 via AppleGraspCameraEnvCfg)
+ """
+ 
+@@ -450,19 +452,6 @@ class ObservationsCfg:
+                 ],
+             )},
+         )
+-        right_arm_torque = ObsTerm(
+-            func=task_mdp.joint_effort_selected,
+-            params={"asset_cfg": SceneEntityCfg(
+-                "robot",
+-                joint_names=[
+-                    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+-                    "right_shoulder_yaw_joint", "right_elbow_joint",
+-                    "right_wrist_roll_joint", "right_wrist_pitch_joint",
+-                    "right_wrist_yaw_joint",
+-                ],
+-            )},
+-        )
+-
+         # Right hand
+         right_hand_pos = ObsTerm(
+             func=task_mdp.joint_pos_selected,
+@@ -477,19 +466,8 @@ class ObservationsCfg:
+             )},
+         )
+ 
+-        # Contact forces (right fingertips × apple)
+-        fingertip_contacts = ObsTerm(
+-            func=task_mdp.fingertip_contact_forces,
+-            params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+-        )
+-
+-        # Apple position in world frame
+-        apple_pos_world = ObsTerm(
+-            func=task_mdp.object_pos_world,
+-            params={"object_cfg": SceneEntityCfg("apple")},
+-        )
+-
+-        # Apple position relative to right wrist
++        # Apple position relative to right wrist — the reach-error vector.
++        # (apple_pos_world dropped: redundant with this for a fixed-base robot.)
+         apple_pos_wrist = ObsTerm(
+             func=task_mdp.object_pos_relative_to_body,
+             params={
+@@ -500,6 +478,21 @@ class ObservationsCfg:
+             },
+         )
+ 
++        # Palm orientation relative to torso — same frame reward_palm_orientation
++        # scores against, giving the policy a direct signal for that reward
++        # instead of forcing it to infer orientation purely from joint angles.
++        palm_orientation_torso = ObsTerm(
++            func=task_mdp.body_quat_relative_to_body,
++            params={
++                "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
++                "reference_cfg": SceneEntityCfg("robot", body_names=["torso_link"]),
++            },
++        )
++
++        # NOTE: fingertip_contacts (24-dim) removed for the reach-only phase —
++        # not needed to reach, and not yet needed until grasp/manipulation
++        # training, where it can be re-added (see task_mdp.fingertip_contact_forces).
++
+         def __post_init__(self):
+             self.enable_corruption = False  # add noise in Phase 3
+ 
+diff --git a/envs/mdp/__init__.py b/envs/mdp/__init__.py
+index 0a054ea..bc9d173 100644
+--- a/envs/mdp/__init__.py
++++ b/envs/mdp/__init__.py
+@@ -16,6 +16,7 @@ from .observations import (
+     object_pos_world,
+     object_pos_relative_to_body,
+     object_vel_world,
++    body_quat_relative_to_body,
+ )
+ 
+ from .rewards import (
+diff --git a/envs/mdp/__pycache__/__init__.cpython-310.pyc b/envs/mdp/__pycache__/__init__.cpython-310.pyc
+index 3c08360..cb4fd51 100644
+Binary files a/envs/mdp/__pycache__/__init__.cpython-310.pyc and b/envs/mdp/__pycache__/__init__.cpython-310.pyc differ
+diff --git a/envs/mdp/__pycache__/observations.cpython-310.pyc b/envs/mdp/__pycache__/observations.cpython-310.pyc
+index 5c887c8..8b708d1 100644
+Binary files a/envs/mdp/__pycache__/observations.cpython-310.pyc and b/envs/mdp/__pycache__/observations.cpython-310.pyc differ
+diff --git a/envs/mdp/observations.py b/envs/mdp/observations.py
+index 9f5c346..efa985c 100644
+--- a/envs/mdp/observations.py
++++ b/envs/mdp/observations.py
+@@ -14,6 +14,7 @@ import torch
+ from isaaclab.assets import Articulation, RigidObject
+ from isaaclab.managers import SceneEntityCfg
+ from isaaclab.sensors import ContactSensor
++from isaaclab.utils.math import quat_conjugate, quat_mul
+ 
+ if TYPE_CHECKING:
+     from isaaclab.envs import ManagerBasedRLEnv
+@@ -141,6 +142,23 @@ def object_pos_relative_to_body(
+     return apple_local - wrist_local  # [num_envs, 3]
+ 
+ 
++def body_quat_relative_to_body(
++    env: ManagerBasedRLEnv,
++    robot_cfg: SceneEntityCfg,      # body to report orientation of, e.g. right_hand_palm_link
++    reference_cfg: SceneEntityCfg,  # reference frame body, e.g. torso_link
++) -> torch.Tensor:
++    """One robot body's orientation expressed relative to another (e.g. palm
++    relative to torso) — same torso-relative frame reward_palm_orientation
++    scores against, so the policy can observe directly what that reward wants.
++
++    Shape: [num_envs, 4] (w, x, y, z)
++    """
++    robot: Articulation = env.scene[robot_cfg.name]
++    body_quat = robot.data.body_quat_w[:, robot_cfg.body_ids[0], :]
++    ref_quat = robot.data.body_quat_w[:, reference_cfg.body_ids[0], :]
++    return quat_mul(quat_conjugate(ref_quat), body_quat)
++
++
+ def object_vel_world(
+     env: ManagerBasedRLEnv,
+     object_cfg: SceneEntityCfg,
