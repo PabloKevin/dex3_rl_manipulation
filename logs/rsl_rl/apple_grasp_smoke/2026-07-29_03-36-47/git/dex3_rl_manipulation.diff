@@ -1,0 +1,111 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   README.md
+	modified:   envs/__init__.py
+	modified:   envs/__pycache__/__init__.cpython-310.pyc
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	envs/agents/
+	logs/
+	outputs/
+	scripts/__pycache__/cli_args.cpython-310.pyc
+	scripts/cli_args.py
+	scripts/play.py
+	scripts/train.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/README.md b/README.md
+index a16dfd2..4270f6f 100644
+--- a/README.md
++++ b/README.md
+@@ -113,18 +113,29 @@ Watch the LIFT stage. Check the printed `apple_z`:
+ 
+ ---
+ 
+-## Phase 2 — RL training (PPO)
++## Phase 2 — RL training (PPO via rsl_rl)
+ 
+-_Coming after Phase 1 validation._
++One-time setup (in the `isaaclab_curobo` conda env):
++```bash
++pip install rsl-rl-lib==3.0.1
++```
+ 
+ ```bash
+-# Train (32 envs, ~6h on RTX 4060):
+-python scripts/train.py --task AppleGrasp-v0 --num_envs 32
++# Train (32 envs, ~6h on RTX 4060). Logs land in logs/rsl_rl/apple_grasp_reach/<timestamp>/:
++python scripts/train.py --task AppleGrasp-v0 --num_envs 32 --headless
+ 
+-# Watch trained policy:
+-python scripts/play.py --checkpoint logs/ppo/.../model_XXXXX.pt
++# Watch training progress:
++tensorboard --logdir logs/rsl_rl/apple_grasp_reach
++
++# Watch the trained policy (auto-picks the latest run/checkpoint, or pass --checkpoint <path>):
++python scripts/play.py --task AppleGrasp-Play-v0 --num_envs 1
+ ```
+ 
++PPO hyperparameters live in `envs/agents/rsl_rl_ppo_cfg.py`
++(`AppleGraspPPORunnerCfg`); the reward/termination/domain-randomization setup
++described above is unchanged for training — only `envs/__init__.py` gains an
++`rsl_rl_cfg_entry_point` pointing at that config.
++
+ ---
+ 
+ ## Phase 3 — Add camera observations
+@@ -136,7 +147,9 @@ python scripts/train.py --task AppleGrasp-Camera-v0 --num_envs 8
+ ```
+ 
+ The head camera (128×128 RGB+Depth) is already wired up in `AppleGraspCameraEnvCfg`.  
+-You will need to add image encoding (CNN / ViT) to the policy network — see `config/ppo_apple_grasp.yaml`.
++You will need to add image encoding (CNN / ViT) to the policy network, and register
++a new agent config / `rsl_rl_cfg_entry_point` for `AppleGrasp-Camera-v0` — see
++`envs/agents/rsl_rl_ppo_cfg.py` for the pattern used by `AppleGrasp-v0`.
+ 
+ ---
+ 
+diff --git a/envs/__init__.py b/envs/__init__.py
+index 4e5320c..d545f54 100644
+--- a/envs/__init__.py
++++ b/envs/__init__.py
+@@ -7,18 +7,25 @@ from .apple_grasp_env_cfg import (
+     AppleGraspEnvCfg_PLAY,
+     AppleGraspCameraEnvCfg,
+ )
++from .agents.rsl_rl_ppo_cfg import AppleGraspPPORunnerCfg
+ 
+ gym.register(
+     id="AppleGrasp-v0",
+     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+-    kwargs={"env_cfg_entry_point": AppleGraspEnvCfg},
++    kwargs={
++        "env_cfg_entry_point": AppleGraspEnvCfg,
++        "rsl_rl_cfg_entry_point": AppleGraspPPORunnerCfg,
++    },
+     disable_env_checker=True,
+ )
+ 
+ gym.register(
+     id="AppleGrasp-Play-v0",
+     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+-    kwargs={"env_cfg_entry_point": AppleGraspEnvCfg_PLAY},
++    kwargs={
++        "env_cfg_entry_point": AppleGraspEnvCfg_PLAY,
++        "rsl_rl_cfg_entry_point": AppleGraspPPORunnerCfg,
++    },
+     disable_env_checker=True,
+ )
+ 
+diff --git a/envs/__pycache__/__init__.cpython-310.pyc b/envs/__pycache__/__init__.cpython-310.pyc
+index ec64f96..bd8c922 100644
+Binary files a/envs/__pycache__/__init__.cpython-310.pyc and b/envs/__pycache__/__init__.cpython-310.pyc differ

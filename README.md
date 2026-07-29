@@ -113,17 +113,28 @@ Watch the LIFT stage. Check the printed `apple_z`:
 
 ---
 
-## Phase 2 — RL training (PPO)
+## Phase 2 — RL training (PPO via rsl_rl)
 
-_Coming after Phase 1 validation._
+One-time setup (in the `isaaclab_curobo` conda env):
+```bash
+pip install rsl-rl-lib==3.0.1
+```
 
 ```bash
-# Train (32 envs, ~6h on RTX 4060):
-python scripts/train.py --task AppleGrasp-v0 --num_envs 32
+# Train (32 envs, ~6h on RTX 4060). Logs land in logs/rsl_rl/apple_grasp_reach/<timestamp>/:
+python scripts/train.py --task AppleGrasp-v0 --num_envs 32 --headless
 
-# Watch trained policy:
-python scripts/play.py --checkpoint logs/ppo/.../model_XXXXX.pt
+# Watch training progress:
+tensorboard --logdir logs/rsl_rl/apple_grasp_reach
+
+# Watch the trained policy (auto-picks the latest run/checkpoint, or pass --checkpoint <path>):
+python scripts/play.py --task AppleGrasp-Play-v0 --num_envs 1
 ```
+
+PPO hyperparameters live in `envs/agents/rsl_rl_ppo_cfg.py`
+(`AppleGraspPPORunnerCfg`); the reward/termination/domain-randomization setup
+described above is unchanged for training — only `envs/__init__.py` gains an
+`rsl_rl_cfg_entry_point` pointing at that config.
 
 ---
 
@@ -136,7 +147,9 @@ python scripts/train.py --task AppleGrasp-Camera-v0 --num_envs 8
 ```
 
 The head camera (128×128 RGB+Depth) is already wired up in `AppleGraspCameraEnvCfg`.  
-You will need to add image encoding (CNN / ViT) to the policy network — see `config/ppo_apple_grasp.yaml`.
+You will need to add image encoding (CNN / ViT) to the policy network, and register
+a new agent config / `rsl_rl_cfg_entry_point` for `AppleGrasp-Camera-v0` — see
+`envs/agents/rsl_rl_ppo_cfg.py` for the pattern used by `AppleGrasp-v0`.
 
 ---
 

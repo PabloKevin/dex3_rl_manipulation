@@ -7,18 +7,25 @@ from .apple_grasp_env_cfg import (
     AppleGraspEnvCfg_PLAY,
     AppleGraspCameraEnvCfg,
 )
+from .agents.rsl_rl_ppo_cfg import AppleGraspPPORunnerCfg
 
 gym.register(
     id="AppleGrasp-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": AppleGraspEnvCfg},
+    kwargs={
+        "env_cfg_entry_point": AppleGraspEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspPPORunnerCfg,
+    },
     disable_env_checker=True,
 )
 
 gym.register(
     id="AppleGrasp-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    kwargs={"env_cfg_entry_point": AppleGraspEnvCfg_PLAY},
+    kwargs={
+        "env_cfg_entry_point": AppleGraspEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspPPORunnerCfg,
+    },
     disable_env_checker=True,
 )
 

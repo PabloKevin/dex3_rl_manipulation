@@ -1,0 +1,1202 @@
+env:
+  viewer:
+    eye:
+    - 1.5
+    - -1.5
+    - 1.8
+    lookat:
+    - 0.5
+    - -0.25
+    - 1.0
+    cam_prim_path: /OmniverseKit_Persp
+    resolution:
+    - 1280
+    - 720
+    origin_type: world
+    env_index: 0
+    asset_name: null
+    body_name: null
+  sim:
+    physics_prim_path: /physicsScene
+    device: cuda:0
+    dt: 0.005
+    render_interval: 4
+    gravity:
+    - 0.0
+    - 0.0
+    - -9.81
+    enable_scene_query_support: false
+    use_fabric: true
+    physx:
+      solver_type: 1
+      solve_articulation_contact_last: false
+      min_position_iteration_count: 1
+      max_position_iteration_count: 255
+      min_velocity_iteration_count: 0
+      max_velocity_iteration_count: 255
+      enable_ccd: false
+      enable_stabilization: false
+      enable_external_forces_every_iteration: false
+      enable_enhanced_determinism: false
+      bounce_threshold_velocity: 0.5
+      friction_offset_threshold: 0.04
+      friction_correlation_distance: 0.025
+      gpu_max_rigid_contact_count: 8388608
+      gpu_max_rigid_patch_count: 163840
+      gpu_found_lost_pairs_capacity: 2097152
+      gpu_found_lost_aggregate_pairs_capacity: 33554432
+      gpu_total_aggregate_pairs_capacity: 2097152
+      gpu_collision_stack_size: 67108864
+      gpu_heap_capacity: 67108864
+      gpu_temp_buffer_capacity: 16777216
+      gpu_max_num_partitions: 8
+      gpu_max_soft_body_contacts: 1048576
+      gpu_max_particle_contacts: 1048576
+    physics_material:
+      func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+      static_friction: 0.5
+      dynamic_friction: 0.5
+      restitution: 0.0
+      friction_combine_mode: average
+      restitution_combine_mode: average
+      compliant_contact_stiffness: 0.0
+      compliant_contact_damping: 0.0
+    render:
+      enable_translucency: null
+      enable_reflections: null
+      enable_global_illumination: null
+      antialiasing_mode: null
+      enable_dlssg: null
+      enable_dl_denoiser: null
+      dlss_mode: null
+      enable_direct_lighting: null
+      samples_per_pixel: null
+      enable_shadows: null
+      enable_ambient_occlusion: null
+      dome_light_upper_lower_strategy: null
+      carb_settings: null
+      rendering_mode: null
+    create_stage_in_memory: false
+    logging_level: WARNING
+    save_logs_to_file: true
+    log_dir: null
+  ui_window_class_type: isaaclab.envs.ui.manager_based_rl_env_window:ManagerBasedRLEnvWindow
+  seed: null
+  decimation: 4
+  scene:
+    num_envs: 1
+    env_spacing: 2.5
+    lazy_sensor_update: true
+    replicate_physics: false
+    filter_collisions: true
+    clone_in_fabric: false
+    robot:
+      class_type: isaaclab.assets.articulation.articulation:Articulation
+      prim_path: '{ENV_REGEX_NS}/Robot'
+      spawn:
+        func: isaaclab.sim.spawners.from_files.from_files:spawn_from_usd
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        mass_props: null
+        deformable_props: null
+        rigid_props:
+          rigid_body_enabled: null
+          kinematic_enabled: null
+          disable_gravity: false
+          linear_damping: null
+          angular_damping: null
+          max_linear_velocity: null
+          max_angular_velocity: null
+          max_depenetration_velocity: 5.0
+          max_contact_impulse: null
+          enable_gyroscopic_forces: true
+          retain_accelerations: null
+          solver_position_iteration_count: null
+          solver_velocity_iteration_count: null
+          sleep_threshold: null
+          stabilization_threshold: null
+        collision_props: null
+        activate_contact_sensors: true
+        scale: null
+        articulation_props:
+          articulation_enabled: null
+          enabled_self_collisions: false
+          solver_position_iteration_count: 8
+          solver_velocity_iteration_count: 0
+          sleep_threshold: null
+          stabilization_threshold: null
+          fix_root_link: true
+        fixed_tendons_props: null
+        spatial_tendons_props: null
+        joint_drive_props: null
+        visual_material_path: material
+        visual_material: null
+        usd_path: /home/pablo_kevin/dex3_rl_manipulation/envs/assets/robots/g1_29dof_with_hand_rev_1_0.usd
+        variants: null
+      init_state:
+        pos:
+        - 0.0
+        - 0.0
+        - 0.793
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        lin_vel:
+        - 0.0
+        - 0.0
+        - 0.0
+        ang_vel:
+        - 0.0
+        - 0.0
+        - 0.0
+        joint_pos:
+          .*hip_pitch.*: -0.1
+          .*hip_roll.*: 0.0
+          .*hip_yaw.*: 0.0
+          .*knee.*: 0.3
+          .*ankle_pitch.*: -0.2
+          .*ankle_roll.*: 0.0
+          waist_yaw_joint: 0.0
+          waist_roll_joint: 0.0
+          waist_pitch_joint: 0.1
+          left_shoulder_pitch_joint: 0.3
+          left_shoulder_roll_joint: 0.2
+          left_shoulder_yaw_joint: 0.0
+          left_elbow_joint: 0.8
+          left_wrist_roll_joint: 0.0
+          left_wrist_pitch_joint: 0.0
+          left_wrist_yaw_joint: 0.0
+          right_shoulder_pitch_joint: 0.0
+          right_shoulder_roll_joint: 0.0
+          right_shoulder_yaw_joint: 0.0
+          right_elbow_joint: 0.5
+          right_wrist_roll_joint: 0.0
+          right_wrist_pitch_joint: 0.0
+          right_wrist_yaw_joint: 0.0
+          right_hand_thumb_1_joint: 0.55
+        joint_vel:
+          .*: 0.0
+      collision_group: 0
+      debug_vis: false
+      articulation_root_prim_path: null
+      soft_joint_pos_limit_factor: 1.0
+      actuators:
+        right_arm:
+          class_type: isaaclab.actuators.actuator_pd:ImplicitActuator
+          joint_names_expr:
+          - right_shoulder_pitch_joint
+          - right_shoulder_roll_joint
+          - right_shoulder_yaw_joint
+          - right_elbow_joint
+          - right_wrist_roll_joint
+          - right_wrist_pitch_joint
+          - right_wrist_yaw_joint
+          effort_limit: 87.0
+          velocity_limit: 2.175
+          effort_limit_sim: null
+          velocity_limit_sim: null
+          stiffness: 40.0
+          damping: 1.0
+          armature: null
+          friction: null
+          dynamic_friction: null
+          viscous_friction: null
+        right_hand:
+          class_type: isaaclab.actuators.actuator_pd:ImplicitActuator
+          joint_names_expr:
+          - right_hand.*
+          effort_limit: 2.0
+          velocity_limit: 3.14
+          effort_limit_sim: null
+          velocity_limit_sim: null
+          stiffness: 1.0
+          damping: 0.05
+          armature: null
+          friction: null
+          dynamic_friction: null
+          viscous_friction: null
+        left_arm:
+          class_type: isaaclab.actuators.actuator_pd:ImplicitActuator
+          joint_names_expr:
+          - left_shoulder_pitch_joint
+          - left_shoulder_roll_joint
+          - left_shoulder_yaw_joint
+          - left_elbow_joint
+          - left_wrist_roll_joint
+          - left_wrist_pitch_joint
+          - left_wrist_yaw_joint
+          effort_limit: 87.0
+          velocity_limit: 2.175
+          effort_limit_sim: null
+          velocity_limit_sim: null
+          stiffness: 40.0
+          damping: 1.0
+          armature: null
+          friction: null
+          dynamic_friction: null
+          viscous_friction: null
+        left_hand:
+          class_type: isaaclab.actuators.actuator_pd:ImplicitActuator
+          joint_names_expr:
+          - left_hand.*
+          effort_limit: 2.0
+          velocity_limit: 3.14
+          effort_limit_sim: null
+          velocity_limit_sim: null
+          stiffness: 1.0
+          damping: 0.05
+          armature: null
+          friction: null
+          dynamic_friction: null
+          viscous_friction: null
+        legs:
+          class_type: isaaclab.actuators.actuator_pd:ImplicitActuator
+          joint_names_expr:
+          - .*hip.*
+          - .*knee.*
+          - .*ankle.*
+          - waist_yaw_joint
+          - waist_roll_joint
+          - waist_pitch_joint
+          effort_limit: 200.0
+          velocity_limit: 10.0
+          effort_limit_sim: null
+          velocity_limit_sim: null
+          stiffness: 100.0
+          damping: 5.0
+          armature: null
+          friction: null
+          dynamic_friction: null
+          viscous_friction: null
+      actuator_value_resolution_debug_print: false
+    tree_base:
+      class_type: null
+      prim_path: '{ENV_REGEX_NS}/TreeBase'
+      spawn:
+        func: isaaclab.sim.spawners.shapes.shapes:spawn_cuboid
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        mass_props: null
+        rigid_props: null
+        collision_props: null
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material:
+          func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+          diffuse_color:
+          - 0.25
+          - 0.14
+          - 0.05
+          emissive_color:
+          - 0.0
+          - 0.0
+          - 0.0
+          roughness: 1.0
+          metallic: 0.0
+          opacity: 1.0
+        physics_material_path: material
+        physics_material: null
+        size:
+        - 0.3
+        - 0.3
+        - 0.06
+      init_state:
+        pos:
+        - 0.5807208086904958
+        - -0.5627795918128963
+        - 0.03
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      collision_group: 0
+      debug_vis: false
+    tree_trunk:
+      class_type: null
+      prim_path: '{ENV_REGEX_NS}/TreeTrunk'
+      spawn:
+        func: isaaclab.sim.spawners.shapes.shapes:spawn_cylinder
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        mass_props: null
+        rigid_props: null
+        collision_props: null
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material:
+          func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+          diffuse_color:
+          - 0.35
+          - 0.2
+          - 0.08
+          emissive_color:
+          - 0.0
+          - 0.0
+          - 0.0
+          roughness: 1.0
+          metallic: 0.0
+          opacity: 1.0
+        physics_material_path: material
+        physics_material: null
+        radius: 0.06
+        height: 1.3363307942124278
+        axis: Z
+      init_state:
+        pos:
+        - 0.5807208086904958
+        - -0.5627795918128963
+        - 0.6681653971062139
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      collision_group: 0
+      debug_vis: false
+    tree_branch:
+      class_type: null
+      prim_path: '{ENV_REGEX_NS}/TreeBranch'
+      spawn:
+        func: isaaclab.sim.spawners.shapes.shapes:spawn_cylinder
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        mass_props: null
+        rigid_props: null
+        collision_props: null
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material:
+          func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+          diffuse_color:
+          - 0.13
+          - 0.42
+          - 0.08
+          emissive_color:
+          - 0.0
+          - 0.0
+          - 0.0
+          roughness: 0.9
+          metallic: 0.0
+          opacity: 1.0
+        physics_material_path: material
+        physics_material: null
+        radius: 0.04116861858237532
+        height: 0.5943247990113086
+        axis: X
+      init_state:
+        pos:
+        - 0.4474179706322212
+        - -0.29719373931776144
+        - 1.3363307942124278
+        rot:
+        - 0.5250781760887911
+        - 0.0
+        - 0.0
+        - 0.8510539988715572
+      collision_group: 0
+      debug_vis: false
+    apple:
+      class_type: isaaclab.assets.rigid_object.rigid_object:RigidObject
+      prim_path: '{ENV_REGEX_NS}/Apple'
+      spawn:
+        func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        mass_props:
+          mass: 0.1671077708216391
+          density: null
+        rigid_props:
+          rigid_body_enabled: null
+          kinematic_enabled: null
+          disable_gravity: false
+          linear_damping: null
+          angular_damping: null
+          max_linear_velocity: 20.0
+          max_angular_velocity: 50.0
+          max_depenetration_velocity: null
+          max_contact_impulse: null
+          enable_gyroscopic_forces: true
+          retain_accelerations: null
+          solver_position_iteration_count: 16
+          solver_velocity_iteration_count: 1
+          sleep_threshold: null
+          stabilization_threshold: null
+        collision_props:
+          collision_enabled: null
+          contact_offset: 0.002
+          rest_offset: 0.0
+          torsional_patch_radius: null
+          min_torsional_patch_radius: null
+        activate_contact_sensors: false
+        visual_material_path: material
+        visual_material:
+          func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+          diffuse_color:
+          - 0.82
+          - 0.06
+          - 0.06
+          emissive_color:
+          - 0.0
+          - 0.0
+          - 0.0
+          roughness: 0.5
+          metallic: 0.0
+          opacity: 1.0
+        physics_material_path: material
+        physics_material: null
+        radius: 0.04489044960470502
+      init_state:
+        pos:
+        - 0.3141151325739466
+        - -0.03160788682262661
+        - 1.2502717260253473
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+        lin_vel:
+        - 0.0
+        - 0.0
+        - 0.0
+        ang_vel:
+        - 0.0
+        - 0.0
+        - 0.0
+      collision_group: 0
+      debug_vis: false
+    contact_forces:
+      class_type: isaaclab.sensors.contact_sensor.contact_sensor:ContactSensor
+      prim_path: '{ENV_REGEX_NS}/Robot/right_hand.*_link'
+      update_period: 0.0
+      history_length: 3
+      debug_vis: false
+      track_pose: false
+      track_contact_points: false
+      track_friction_forces: false
+      max_contact_data_count_per_prim: 4
+      track_air_time: true
+      force_threshold: 1.0
+      filter_prim_paths_expr:
+      - '{ENV_REGEX_NS}/Apple'
+      visualizer_cfg:
+        prim_path: /Visuals/ContactSensor
+        markers:
+          contact:
+            func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+            visible: true
+            semantic_tags: null
+            copy_from_source: true
+            mass_props: null
+            rigid_props: null
+            collision_props: null
+            activate_contact_sensors: false
+            visual_material_path: material
+            visual_material:
+              func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+              diffuse_color:
+              - 1.0
+              - 0.0
+              - 0.0
+              emissive_color:
+              - 0.0
+              - 0.0
+              - 0.0
+              roughness: 0.5
+              metallic: 0.0
+              opacity: 1.0
+            physics_material_path: material
+            physics_material: null
+            radius: 0.02
+          no_contact:
+            func: isaaclab.sim.spawners.shapes.shapes:spawn_sphere
+            visible: false
+            semantic_tags: null
+            copy_from_source: true
+            mass_props: null
+            rigid_props: null
+            collision_props: null
+            activate_contact_sensors: false
+            visual_material_path: material
+            visual_material:
+              func: isaaclab.sim.spawners.materials.visual_materials:spawn_preview_surface
+              diffuse_color:
+              - 0.0
+              - 1.0
+              - 0.0
+              emissive_color:
+              - 0.0
+              - 0.0
+              - 0.0
+              roughness: 0.5
+              metallic: 0.0
+              opacity: 1.0
+            physics_material_path: material
+            physics_material: null
+            radius: 0.02
+    head_camera: null
+    ground:
+      class_type: null
+      prim_path: /World/ground
+      spawn:
+        func: isaaclab.sim.spawners.from_files.from_files:spawn_ground_plane
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        usd_path: http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5/Isaac/Environments/Grid/default_environment.usd
+        color:
+        - 0.0
+        - 0.0
+        - 0.0
+        size:
+        - 100.0
+        - 100.0
+        physics_material:
+          func: isaaclab.sim.spawners.materials.physics_materials:spawn_rigid_body_material
+          static_friction: 0.5
+          dynamic_friction: 0.5
+          restitution: 0.0
+          friction_combine_mode: average
+          restitution_combine_mode: average
+          compliant_contact_stiffness: 0.0
+          compliant_contact_damping: 0.0
+      init_state:
+        pos:
+        - 0.0
+        - 0.0
+        - 0.0
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      collision_group: 0
+      debug_vis: false
+    distant_light:
+      class_type: null
+      prim_path: /World/DistantLight
+      spawn:
+        func: isaaclab.sim.spawners.lights.lights:spawn_light
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        prim_type: DistantLight
+        color:
+        - 1.0
+        - 0.98
+        - 0.92
+        enable_color_temperature: false
+        color_temperature: 6500.0
+        normalize: false
+        exposure: 0.0
+        intensity: 3000.0
+        angle: 0.5
+      init_state:
+        pos:
+        - 0.0
+        - 0.0
+        - 0.0
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      collision_group: 0
+      debug_vis: false
+    dome_light:
+      class_type: null
+      prim_path: /World/DomeLight
+      spawn:
+        func: isaaclab.sim.spawners.lights.lights:spawn_light
+        visible: true
+        semantic_tags: null
+        copy_from_source: true
+        prim_type: DomeLight
+        color:
+        - 0.75
+        - 0.75
+        - 1.0
+        enable_color_temperature: false
+        color_temperature: 6500.0
+        normalize: false
+        exposure: 0.0
+        intensity: 500.0
+        texture_file: null
+        texture_format: automatic
+        visible_in_primary_ray: true
+      init_state:
+        pos:
+        - 0.0
+        - 0.0
+        - 0.0
+        rot:
+        - 1.0
+        - 0.0
+        - 0.0
+        - 0.0
+      collision_group: 0
+      debug_vis: false
+  recorders:
+    dataset_file_handler_class_type: isaaclab.utils.datasets.hdf5_dataset_file_handler:HDF5DatasetFileHandler
+    dataset_export_dir_path: /tmp/isaaclab/logs
+    dataset_filename: dataset
+    dataset_export_mode:
+      _value_: 1
+      _name_: EXPORT_ALL
+    export_in_record_pre_reset: true
+    export_in_close: false
+  observations:
+    policy:
+      concatenate_terms: true
+      concatenate_dim: -1
+      enable_corruption: false
+      history_length: null
+      flatten_history_dim: true
+      right_arm_pos:
+        func: envs.mdp.observations:joint_pos_selected
+        params:
+          asset_cfg:
+            name: robot
+            joint_names:
+            - right_shoulder_pitch_joint
+            - right_shoulder_roll_joint
+            - right_shoulder_yaw_joint
+            - right_elbow_joint
+            - right_wrist_roll_joint
+            - right_wrist_pitch_joint
+            - right_wrist_yaw_joint
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      right_arm_vel:
+        func: envs.mdp.observations:joint_vel_selected
+        params:
+          asset_cfg:
+            name: robot
+            joint_names:
+            - right_shoulder_pitch_joint
+            - right_shoulder_roll_joint
+            - right_shoulder_yaw_joint
+            - right_elbow_joint
+            - right_wrist_roll_joint
+            - right_wrist_pitch_joint
+            - right_wrist_yaw_joint
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      right_arm_torque:
+        func: envs.mdp.observations:joint_effort_selected
+        params:
+          asset_cfg:
+            name: robot
+            joint_names:
+            - right_shoulder_pitch_joint
+            - right_shoulder_roll_joint
+            - right_shoulder_yaw_joint
+            - right_elbow_joint
+            - right_wrist_roll_joint
+            - right_wrist_pitch_joint
+            - right_wrist_yaw_joint
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      right_hand_pos:
+        func: envs.mdp.observations:joint_pos_selected
+        params:
+          asset_cfg:
+            name: robot
+            joint_names:
+            - right_hand.*
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      right_hand_vel:
+        func: envs.mdp.observations:joint_vel_selected
+        params:
+          asset_cfg:
+            name: robot
+            joint_names:
+            - right_hand.*
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      fingertip_contacts:
+        func: envs.mdp.observations:fingertip_contact_forces
+        params:
+          sensor_cfg:
+            name: contact_forces
+            joint_names: null
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      apple_pos_world:
+        func: envs.mdp.observations:object_pos_world
+        params:
+          object_cfg:
+            name: apple
+            joint_names: null
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+      apple_pos_wrist:
+        func: envs.mdp.observations:object_pos_relative_to_body
+        params:
+          object_cfg:
+            name: apple
+            joint_names: null
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names: null
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+          robot_cfg:
+            name: robot
+            joint_names: null
+            joint_ids: slice(None,None,None)
+            fixed_tendon_names: null
+            fixed_tendon_ids: slice(None,None,None)
+            body_names:
+            - right_wrist_yaw_link
+            body_ids: slice(None,None,None)
+            object_collection_names: null
+            object_collection_ids: slice(None,None,None)
+            preserve_order: false
+        modifiers: null
+        noise: null
+        clip: null
+        scale: null
+        history_length: 0
+        flatten_history_dim: true
+  actions:
+    right_arm:
+      class_type: isaaclab.envs.mdp.actions.joint_actions:JointPositionAction
+      asset_name: robot
+      debug_vis: false
+      clip: null
+      joint_names:
+      - right_shoulder_pitch_joint
+      - right_shoulder_roll_joint
+      - right_shoulder_yaw_joint
+      - right_elbow_joint
+      - right_wrist_roll_joint
+      - right_wrist_pitch_joint
+      - right_wrist_yaw_joint
+      scale: 1.0
+      offset: 0.0
+      preserve_order: false
+      use_default_offset: true
+    right_hand:
+      class_type: isaaclab.envs.mdp.actions.joint_actions:JointPositionAction
+      asset_name: robot
+      debug_vis: false
+      clip: null
+      joint_names:
+      - right_hand.*
+      scale: 1.0
+      offset: 0.0
+      preserve_order: false
+      use_default_offset: true
+  events:
+    reset_robot: null
+    randomize_tree_geometry:
+      func: envs.mdp.domain_randomization:randomize_tree_geometry
+      params:
+        tree_height_nominal: 1.3363307942124278
+        branch_length_nominal: 0.5943247990113086
+      mode: prestartup
+      interval_range_s: null
+      is_global_time: false
+      min_step_count_between_reset: 0
+    randomize_apple_scale:
+      func: envs.mdp.domain_randomization:randomize_apple_scale
+      params:
+        object_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        nominal_radius: 0.04489044960470502
+      mode: prestartup
+      interval_range_s: null
+      is_global_time: false
+      min_step_count_between_reset: 0
+    randomize_apple_mass:
+      func: isaaclab.envs.mdp.events:randomize_rigid_body_mass
+      params:
+        asset_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        mass_distribution_params:
+        - 0.8
+        - 1.2
+        operation: scale
+      mode: startup
+      interval_range_s: null
+      is_global_time: false
+      min_step_count_between_reset: 0
+    randomize_tree:
+      func: envs.mdp.domain_randomization:randomize_tree_and_apple
+      params:
+        object_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        tree_pos_xy_nominal:
+        - 0.5807208086904958
+        - -0.5627795918128963
+        tree_pos_jitter_xy: 0.05
+        branch_radius_nominal: 0.04116861858237532
+        branch_rotation_deg_nominal: 116.65298764369889
+        apple_radius_nominal: 0.04489044960470502
+        tree_height_nominal: 1.3363307942124278
+        branch_length_nominal: 0.5943247990113086
+      mode: reset
+      interval_range_s: null
+      is_global_time: false
+      min_step_count_between_reset: 0
+    randomize_stem_break:
+      func: envs.mdp.domain_randomization:randomize_stem_break_params
+      params:
+        nominal_force: 2.992159198856308
+        nominal_torque: 0.4962521763878356
+      mode: reset
+      interval_range_s: null
+      is_global_time: false
+      min_step_count_between_reset: 0
+    reset_apple: null
+  rerender_on_reset: false
+  num_rerenders_on_reset: 0
+  wait_for_textures: true
+  xr: null
+  teleop_devices:
+    devices: {}
+  export_io_descriptors: false
+  log_dir: null
+  is_finite_horizon: false
+  episode_length_s: 10.0
+  rewards:
+    reaching:
+      func: envs.mdp.rewards:reward_reaching
+      params:
+        robot_cfg:
+          name: robot
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names:
+          - right_wrist_yaw_link
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        object_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        std: 0.15
+      weight: 1.0
+    contact:
+      func: envs.mdp.rewards:reward_fingertip_contact
+      params:
+        sensor_cfg:
+          name: contact_forces
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        threshold: 0.1
+      weight: 2.0
+    lift:
+      func: envs.mdp.rewards:reward_lift
+      params:
+        object_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        init_height: 1.2502717260253473
+        target_height: 1.3502717260253474
+      weight: 5.0
+    action_penalty:
+      func: isaaclab.envs.mdp.rewards:joint_vel_limits
+      params:
+        asset_cfg:
+          name: robot
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        soft_ratio: 0.9
+      weight: -0.01
+    palm_position:
+      func: envs.mdp.rewards:reward_palm_below_apple
+      params:
+        robot_cfg:
+          name: robot
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names:
+          - right_hand_palm_link
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        object_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        offset_z: 0.08
+        std: 0.05
+      weight: 1.5
+    palm_orientation:
+      func: envs.mdp.rewards:reward_palm_orientation
+      params:
+        robot_cfg:
+          name: robot
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names:
+          - right_hand_palm_link
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        torso_cfg:
+          name: robot
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names:
+          - torso_link
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        target_roll_deg: 90.0
+        target_pitch_deg: 0.0
+        target_yaw_deg: 0.0
+        std_rad: 0.3
+      weight: 1.0
+  terminations:
+    time_out:
+      func: isaaclab.envs.mdp.terminations:time_out
+      params: {}
+      time_out: true
+    apple_dropped:
+      func: envs.mdp.terminations_and_events:apple_dropped
+      params:
+        object_cfg:
+          name: apple
+          joint_names: null
+          joint_ids: slice(None,None,None)
+          fixed_tendon_names: null
+          fixed_tendon_ids: slice(None,None,None)
+          body_names: null
+          body_ids: slice(None,None,None)
+          object_collection_names: null
+          object_collection_ids: slice(None,None,None)
+          preserve_order: false
+        min_height: -0.1
+      time_out: false
+  curriculum: null
+  commands: null
+agent:
+  seed: 42
+  device: cuda:0
+  num_steps_per_env: 48
+  max_iterations: 3000
+  empirical_normalization: null
+  obs_groups:
+    policy:
+    - policy
+    critic:
+    - policy
+  clip_actions: null
+  save_interval: 100
+  experiment_name: apple_grasp_reach
+  run_name: ''
+  logger: tensorboard
+  neptune_project: isaaclab
+  wandb_project: isaaclab
+  resume: false
+  load_run: .*
+  load_checkpoint: model_.*.pt
+  class_name: OnPolicyRunner
+  policy:
+    class_name: ActorCritic
+    init_noise_std: 1.0
+    noise_std_type: scalar
+    state_dependent_std: false
+    actor_obs_normalization: true
+    critic_obs_normalization: true
+    actor_hidden_dims:
+    - 128
+    - 128
+    - 64
+    critic_hidden_dims:
+    - 128
+    - 128
+    - 64
+    activation: elu
+  algorithm:
+    class_name: PPO
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    learning_rate: 0.0003
+    schedule: adaptive
+    gamma: 0.99
+    lam: 0.95
+    entropy_coef: 0.005
+    desired_kl: 0.01
+    max_grad_norm: 1.0
+    value_loss_coef: 1.0
+    use_clipped_value_loss: true
+    clip_param: 0.2
+    normalize_advantage_per_mini_batch: false
+    rnd_cfg: null
+    symmetry_cfg: null
