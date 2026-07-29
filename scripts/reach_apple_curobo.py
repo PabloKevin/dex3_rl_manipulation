@@ -28,6 +28,7 @@ Key changes from the previous version:
     wrong even after the crash was fixed.
 """
 import json
+import os
 import time
 import math
 import threading
@@ -132,7 +133,7 @@ try:
     from curobo.types.base import TensorDeviceType
     from curobo.types.math import Pose
     from curobo.types.state import JointState
-    from curobo.util_file import get_robot_configs_path, join_path, load_yaml
+    from curobo.util_file import load_yaml
     from curobo.util.logger import setup_curobo_logger
 
     setup_curobo_logger("error")
@@ -148,7 +149,16 @@ RIGHT_ARM_JOINT_NAMES = [
 ]
 EE_LINK_NAME = "right_hand_palm_link"
 BASE_LINK_NAME = "torso_link"
-ROBOT_CFG_FILENAME = "g1_dex3_right_arm.yml"
+# Load the repo's OWN tracked copy directly — NOT cuRobo's package-installed
+# copy (get_robot_configs_path()/"g1_dex3_right_arm.yml"). That path requires
+# manually re-copying this file into the curobo package's content/configs/robot
+# dir after every edit (see envs/assets/cuRobo/run_g1_curobo.py's comment) and
+# had silently drifted out of sync with this tracked copy — edits made here
+# were having zero effect on what actually got solved against.
+ROBOT_CFG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "envs", "assets", "cuRobo", "g1_dex3_right_arm.yml",
+)
 
 # Must match apple_grasp_env_cfg.py ActionsCfg + robot init_state right arm.
 ARM_DEFAULT_POSE = [0.3, -0.2, 0.0, 0.8, 0.0, 0.0, 0.0]
@@ -218,8 +228,7 @@ def world_to_torso(pos_world: torch.Tensor, torso_pos: torch.Tensor, torso_quat:
 
 def build_robot_cfg_dict():
     """Load the bundled yml and override kinematics for a torso-based, arm-only chain."""
-    cfg_path = join_path(get_robot_configs_path(), ROBOT_CFG_FILENAME)
-    robot_cfg_dict = load_yaml(cfg_path)
+    robot_cfg_dict = load_yaml(ROBOT_CFG_PATH)
     kinematics = robot_cfg_dict["robot_cfg"]["kinematics"]
 
     kinematics["base_link"] = BASE_LINK_NAME

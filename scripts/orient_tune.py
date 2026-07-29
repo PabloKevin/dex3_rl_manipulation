@@ -13,6 +13,7 @@ Usage (run_env.py must already be running):
 """
 import json
 import math
+import os
 import time
 import threading
 import torch
@@ -24,7 +25,7 @@ from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 from curobo.geom.types import WorldConfig, Sphere, Cuboid
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
-from curobo.util_file import get_robot_configs_path, join_path, load_yaml
+from curobo.util_file import load_yaml
 from curobo.util.logger import setup_curobo_logger
 
 setup_curobo_logger("error")
@@ -36,6 +37,13 @@ ROTATION_THRESHOLD = 0.08
 
 EE_LINK_NAME = "right_hand_palm_link"
 BASE_LINK_NAME = "torso_link"
+# Load the repo's OWN tracked copy directly — see reach_apple_curobo.py's
+# ROBOT_CFG_PATH comment for why (get_robot_configs_path() resolves to
+# cuRobo's package-installed copy, which drifts out of sync with this one).
+ROBOT_CFG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "envs", "assets", "cuRobo", "g1_dex3_right_arm.yml",
+)
 APPLE_RADIUS = 0.04
 APPLE_COLLISION_RADIUS = APPLE_RADIUS + 0.02
 APPROACH_Z_OFFSET = -APPLE_RADIUS * 3.0
@@ -139,8 +147,7 @@ ground_center_world = torch.tensor([0.0, 0.0, -0.05], device=tensor_args.device)
 ground_pos_local  = world_to_torso(ground_center_world, torso_pos, torso_quat)
 ground_quat_local = quat_conjugate(torso_quat)
 
-cfg_path = join_path(get_robot_configs_path(), "g1_dex3_right_arm.yml")
-robot_cfg_dict = load_yaml(cfg_path)
+robot_cfg_dict = load_yaml(ROBOT_CFG_PATH)
 kin = robot_cfg_dict["robot_cfg"]["kinematics"]
 kin["base_link"] = BASE_LINK_NAME
 kin["lock_joints"] = {}

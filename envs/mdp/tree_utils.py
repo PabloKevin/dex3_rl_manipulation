@@ -54,7 +54,29 @@ class StemManager:
 
     def __init__(self, env: "ManagerBasedRLEnv"):
         self._states: List[_StemState] = []
+        self._enabled = self._apple_is_dynamic(env)
+        if not self._enabled:
+            print(
+                "[tree_utils] apple RigidObjectCfg has kinematic_enabled=True "
+                "(current Phase-1 reach-only config, see AppleGraspSceneCfg.apple) "
+                "— StemManager will NOT create a FixedJoint. A kinematic body is "
+                "immovable from PhysX's point of view, same as the world anchor on "
+                "the joint's other end, so PhysX rejects the join with 'cannot create "
+                "a joint between static bodies'. Flip the apple to a real dynamic body "
+                "(kinematic_enabled=False, disable_gravity=False) once grasp/lift "
+                "training needs the breakable stem."
+            )
         self.reset(env)
+
+    @staticmethod
+    def _apple_is_dynamic(env: "ManagerBasedRLEnv") -> bool:
+        """True if the configured apple is a real (non-kinematic) rigid body."""
+        try:
+            rigid_props = env.cfg.scene.apple.spawn.rigid_props
+            return not bool(getattr(rigid_props, "kinematic_enabled", False))
+        except Exception:
+            # Can't tell — default to "try", rather than silently no-op-ing.
+            return True
 
     # ── public API ───────────────────────────────────────────────────────
 
@@ -64,12 +86,15 @@ class StemManager:
         for env_idx in range(env.num_envs):
             state = _StemState()
             state.anchor_pos = self._get_anchor(env, env_idx)
-            state.joint_path = self._create_joint(env, env_idx, state.anchor_pos)
+            if self._enabled:
+                state.joint_path = self._create_joint(env, env_idx, state.anchor_pos)
             state.phase = "HELD"
             self._states.append(state)
 
     def update(self, env: "ManagerBasedRLEnv") -> None:
         """Call once per simulation step."""
+        if not self._enabled:
+            return
         apple = env.scene["apple"]
         for idx, state in enumerate(self._states):
             if state.phase == "HELD":

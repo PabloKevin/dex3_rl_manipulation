@@ -327,7 +327,7 @@ def main():
     except Exception:
         sensor = None
 
-    global _reset_requested
+    global _reset_requested, _arm_targets, _hand_targets
 
     while simulation_app.is_running():
         # Verificar si el usuario solicitó reset por terminal
@@ -385,6 +385,16 @@ def main():
             step += 1
             if terminated.any() or truncated.any():
                 stem.reset(env)
+                # env.step() already teleported the terminated/truncated envs back to
+                # their reset state internally — but without clearing the DDS targets
+                # here too, the very next _get_actions() call re-applies whatever stale
+                # target an external controller (reach_apple_curobo.py, the calibration
+                # script, ...) is still streaming, snapping the arm right back toward
+                # its pre-reset pose. Same fix as the manual 'r' reset path below.
+                with _targets_lock:
+                    _arm_targets = None
+                    _hand_targets = None
+                print("\n>>> Episode auto-reset (time_out/termination) — cleared stale DDS targets <<<\n")
 
             if step % 100 == 0:
                 apple_z = apple.data.root_pos_w[0, 2].item()

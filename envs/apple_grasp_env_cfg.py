@@ -731,6 +731,17 @@ class AppleGraspEnvCfg_PLAY(AppleGraspEnvCfg):
         self.events.reset_apple = None
         self.events.reset_robot = None
 
+        # AppleGraspEnvCfg.__post_init__ sets episode_length_s = 10.0, meant for
+        # short RL training rollouts. run_env.py (the interactive viewer used with
+        # reach_apple_curobo.py / reach_apple_ik.py / calibrate_reach_apple_curobo.py)
+        # uses this PLAY config too, and a silent env reset every 10 s — moving the
+        # tree/apple via randomize_tree and teleporting the robot back to its default
+        # joint state — was firing in the middle of manual reach testing and
+        # multi-second calibration runs, fighting whatever external controller was
+        # still streaming targets over DDS. Effectively disable the time_out for
+        # interactive use; apple_dropped remains as the only termination.
+        self.episode_length_s = 1.0e6
+
 
 @configclass
 class AppleGraspCameraEnvCfg(AppleGraspEnvCfg):
