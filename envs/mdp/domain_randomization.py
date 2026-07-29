@@ -1,7 +1,14 @@
 # Copyright 2025 - G1 Dex3 Apple Grasp Project
-"""Cheap per-episode domain randomization: apple mass, apple scale (~radius),
-and stem break force/torque. All ops are either the built-in tensor mass API
-or plain-Python values — no per-step USD writes, no static-collider re-cook risk.
+"""Domain randomization for the apple-grasp scene.
+
+Fixed once per env at "prestartup"/"startup" (before/just-after the GPU tensor
+views exist): apple scale, apple mass, trunk height, branch length — anything
+that requires a raw USD collider-geometry write, since that's illegal against
+a live PhysX GPU-direct-API tensor view.
+
+Re-sampled every episode at "reset": whole-tree (x, y) translation, branch
+yaw rotation, apple position (via the tensor API, tracking the branch tip),
+and stem break thresholds (plain Python values).
 """
 from __future__ import annotations
 import random
@@ -106,32 +113,103 @@ def _set_rotate_z(prim, angle_rad):
     from pxr import UsdGeom, Gf
     op = _get_or_add_xform_op(prim, UsdGeom.XformOp.TypeOrient)
     half = angle_rad / 2.0
-    op.Set(Gf.Quatf(math.cos(half), 0.0, 0.0, math.sin(half)))
+    w, x, y, z = math.cos(half), 0.0, 0.0, math.sin(half)
+    # existing xformOp:orient attrs authored by Isaac Lab's create_prim are
+    # GfQuatd (double precision) — match whatever precision is already there
+    # instead of hardcoding Quatf, or USD raises a type-mismatch error.
+    if op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat:
+        op.Set(Gf.Quatf(w, x, y, z))
+    else:
+        op.Set(Gf.Quatd(w, x, y, z))
 
 
-def _find_cylinder(stage, base_path):
-    """Cylinder geom may live on the prim itself or under a 'geometry' child,
-    depending on your Isaac Lab spawner version — try both."""
+def _get_cylinder_mesh(stage, base_path):
+    """The actual Cylinder geometry for an Isaac Lab CylinderCfg spawn lives at
+    '{base_path}/geometry/mesh' — '{base_path}' itself is just the Xform root
+    (see isaaclab.sim.spawners.shapes._spawn_geom_from_prim_type). Also check
+    prim.IsA(UsdGeom.Cylinder) explicitly: UsdGeom.Cylinder(prim) on a non-
+    Cylinder prim still constructs a "valid" (truthy) schema wrapper, it just
+    has no height/radius attributes — a classic silent-no-op USD footgun.
+    """
     from pxr import UsdGeom
-    for path in (base_path, f"{base_path}/geometry"):
-        prim = stage.GetPrimAtPath(path)
-        cyl = UsdGeom.Cylinder(prim) if prim.IsValid() else None
-        if cyl:
-            return prim, cyl
+    prim = stage.GetPrimAtPath(f"{base_path}/geometry/mesh")
+    if prim.IsValid() and prim.IsA(UsdGeom.Cylinder):
+        return prim, UsdGeom.Cylinder(prim)
     return None, None
+
+
+def randomize_tree_geometry(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor | None,
+    tree_height_nominal: float,
+    branch_length_nominal: float,
+) -> None:
+    """One-time (mode="prestartup") per-env trunk-height / branch-length pick.
+
+    Resizing collider geometry is a raw USD write, same constraint as
+    randomize_apple_scale — must happen before sim.reset() creates the GPU
+    tensor views, so it can only run once per env, not every episode. The
+    sampled values are cached on `env` so randomize_tree_and_apple (mode=
+    "reset") can reuse them every episode without touching cylinder geometry
+    again — it only translates/rotates the (now-fixed-shape) trunk & branch.
+    """
+    try:
+        import omni.usd
+    except ImportError:
+        return
+
+    stage = omni.usd.get_context().get_stage()
+
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+
+    h_lo, h_hi = _range(tree_height_nominal)
+    l_lo, l_hi = _range(branch_length_nominal)
+
+    env._tree_height = torch.full((env.num_envs,), tree_height_nominal, device=env.device)
+    env._branch_length = torch.full((env.num_envs,), branch_length_nominal, device=env.device)
+
+    for idx in env_ids.tolist():
+        tree_h = random.uniform(h_lo, h_hi)
+        branch_len = random.uniform(l_lo, l_hi)
+        env._tree_height[idx] = tree_h
+        env._branch_length[idx] = branch_len
+
+        env_ns = f"/World/envs/env_{idx}"
+
+        _, trunk_cyl = _get_cylinder_mesh(stage, f"{env_ns}/TreeTrunk")
+        if trunk_cyl:
+            trunk_cyl.GetHeightAttr().Set(tree_h)
+
+        _, branch_cyl = _get_cylinder_mesh(stage, f"{env_ns}/TreeBranch")
+        if branch_cyl:
+            branch_cyl.GetHeightAttr().Set(branch_len)
 
 
 def randomize_tree_and_apple(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
     object_cfg: SceneEntityCfg,
-    tree_pos_xy: tuple,          # fixed (x, y) — keep the trunk base put
-    tree_height_nominal: float,
-    branch_length_nominal: float,
+    tree_pos_xy_nominal: tuple,
+    tree_pos_jitter_xy: float,
     branch_radius_nominal: float,
     branch_rotation_deg_nominal: float,
     apple_radius_nominal: float,
+    tree_height_nominal: float,
+    branch_length_nominal: float,
 ) -> None:
+    """Per-episode (mode="reset") whole-tree translate + branch rotate.
+
+    Trunk height and branch length are fixed per env (set once by
+    randomize_tree_geometry at "prestartup") — only the tree's (x, y)
+    position and the branch's yaw are re-sampled here. Trunk/branch are moved
+    by translating/rotating their root Xform prim (a cheap, legal USD write
+    for these *static* AssetBaseCfg colliders — unlike the Apple, they are
+    not dynamic RigidObjects tracked by the GPU tensor view, so this doesn't
+    hit the eENABLE_DIRECT_GPU_API restriction). The apple's pose is then
+    computed from the SAME branch-tip forward kinematics and written through
+    the tensor API, so it always stays attached at the same relative spot.
+    """
     try:
         import omni.usd
     except ImportError:
@@ -142,20 +220,27 @@ def randomize_tree_and_apple(
 
     if not hasattr(env, "_stem_anchor_pos"):
         env._stem_anchor_pos = torch.zeros(env.num_envs, 3, device=env.device)
+    if not hasattr(env, "_tree_height"):
+        # randomize_tree_geometry (prestartup) should always run first; fall back
+        # to nominal only to avoid a hard crash if events are ever reordered.
+        env._tree_height = torch.full((env.num_envs,), tree_height_nominal, device=env.device)
+    if not hasattr(env, "_branch_length"):
+        env._branch_length = torch.full((env.num_envs,), branch_length_nominal, device=env.device)
 
-    h_lo, h_hi = _range(tree_height_nominal)
-    l_lo, l_hi = _range(branch_length_nominal)
+    x_lo, x_hi = -tree_pos_jitter_xy, tree_pos_jitter_xy
+    y_lo, y_hi = -tree_pos_jitter_xy, tree_pos_jitter_xy
     r_lo, r_hi = _range(branch_rotation_deg_nominal)
 
     apple_pos_local = torch.zeros(len(env_ids), 3, device=env.device)
 
     for k, idx in enumerate(env_ids.tolist()):
-        tree_h = random.uniform(h_lo, h_hi)
-        branch_len = random.uniform(l_lo, l_hi)
+        tree_h = env._tree_height[idx].item()
+        branch_len = env._branch_length[idx].item()
         branch_rot_deg = random.uniform(r_lo, r_hi)
         branch_rot_rad = math.radians(branch_rot_deg)
 
-        tree_x, tree_y = tree_pos_xy
+        tree_x = tree_pos_xy_nominal[0] + random.uniform(x_lo, x_hi)
+        tree_y = tree_pos_xy_nominal[1] + random.uniform(y_lo, y_hi)
         branch_mid_x = tree_x + (branch_len / 2.0) * math.cos(branch_rot_rad)
         branch_mid_y = tree_y + (branch_len / 2.0) * math.sin(branch_rot_rad)
         branch_tip_x = tree_x + branch_len * math.cos(branch_rot_rad)
@@ -164,14 +249,12 @@ def randomize_tree_and_apple(
 
         env_ns = f"/World/envs/env_{idx}"
 
-        trunk_prim, trunk_cyl = _find_cylinder(stage, f"{env_ns}/TreeTrunk")
-        if trunk_cyl:
-            trunk_cyl.GetHeightAttr().Set(tree_h)
+        trunk_prim = stage.GetPrimAtPath(f"{env_ns}/TreeTrunk")
+        if trunk_prim.IsValid():
             _set_translate(trunk_prim, tree_x, tree_y, tree_h / 2.0)
 
-        branch_prim, branch_cyl = _find_cylinder(stage, f"{env_ns}/TreeBranch")
-        if branch_cyl:
-            branch_cyl.GetHeightAttr().Set(branch_len)
+        branch_prim = stage.GetPrimAtPath(f"{env_ns}/TreeBranch")
+        if branch_prim.IsValid():
             _set_translate(branch_prim, branch_mid_x, branch_mid_y, tree_h)
             _set_rotate_z(branch_prim, branch_rot_rad)
 

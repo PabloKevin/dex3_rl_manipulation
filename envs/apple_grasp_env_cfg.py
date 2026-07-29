@@ -85,6 +85,7 @@ TREE_HEIGHT    = _jitter(1.25)
 BRANCH_LENGTH  = _jitter(0.50)
 BRANCH_RADIUS  = _jitter(0.04)
 BRANCH_ROTATION = _jitter(110.0)
+TREE_POS_JITTER_XY = 0.05   # metres — per-episode (x, y) translation range for the whole tree
 APPLE_STEM_BREAK_FORCE  = _jitter(2.5)   # nominal only — real per-episode value comes from EventTerm below
 APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
 
@@ -624,30 +625,14 @@ class EventsCfg:
         },
     )"""
 
-    randomize_tree = EventTerm(
-        func=dr.randomize_tree_and_apple,
-        mode="reset",
+    # ── Fixed once per env, at prestartup (before sim.reset() creates the GPU
+    #    tensor views — raw USD collider resizes are illegal after that point) ──
+    randomize_tree_geometry = EventTerm(
+        func=dr.randomize_tree_geometry,
+        mode="prestartup",
         params={
-            "object_cfg": SceneEntityCfg("apple"),
-            "tree_pos_xy": TREE_POS[:2],
             "tree_height_nominal": TREE_HEIGHT,
             "branch_length_nominal": BRANCH_LENGTH,
-            "branch_radius_nominal": BRANCH_RADIUS,
-            "branch_rotation_deg_nominal": BRANCH_ROTATION,
-            "apple_radius_nominal": APPLE_RADIUS,
-        },
-    )
-
-    # ── NEW: cheap per-episode randomization ──────────────────────────────
-    # (randomize_apple_scale below is the exception: it's a raw USD write, so
-    # it runs once at "prestartup" instead — see its EventTerm for why.)
-    randomize_apple_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,   # isaaclab.envs.mdp built-in
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("apple"),
-            "mass_distribution_params": (0.8, 1.2),
-            "operation": "scale",
         },
     )
 
@@ -655,6 +640,37 @@ class EventsCfg:
         func=dr.randomize_apple_scale,
         mode="prestartup",   # raw USD scale write — must happen before sim.reset() creates the GPU tensor views
         params={"object_cfg": SceneEntityCfg("apple"), "nominal_radius": APPLE_RADIUS},
+    )
+
+    # Mass randomization uses the tensor API (root_physx_view), so it's safe at
+    # any mode — but IsaacLab's own docstring recommends "startup" (once, right
+    # after the physics view is created) over "reset" for anything meant to be
+    # fixed for the whole run rather than resampled every episode.
+    randomize_apple_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,   # isaaclab.envs.mdp built-in
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("apple"),
+            "mass_distribution_params": (0.8, 1.2),
+            "operation": "scale",
+        },
+    )
+
+    # ── Per-episode variation: whole tree translates + branch rotates, apple
+    #    stays attached at the branch tip (see randomize_tree_and_apple) ──────
+    randomize_tree = EventTerm(
+        func=dr.randomize_tree_and_apple,
+        mode="reset",
+        params={
+            "object_cfg": SceneEntityCfg("apple"),
+            "tree_pos_xy_nominal": TREE_POS[:2],
+            "tree_pos_jitter_xy": TREE_POS_JITTER_XY,
+            "branch_radius_nominal": BRANCH_RADIUS,
+            "branch_rotation_deg_nominal": BRANCH_ROTATION,
+            "apple_radius_nominal": APPLE_RADIUS,
+            "tree_height_nominal": TREE_HEIGHT,
+            "branch_length_nominal": BRANCH_LENGTH,
+        },
     )
 
     randomize_stem_break = EventTerm(
