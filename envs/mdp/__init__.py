@@ -43,4 +43,5 @@ from .domain_randomization import (
     randomize_apple_scale,
     randomize_stem_break_params,
     randomize_tree_and_apple,
+    randomize_tree_geometry,
 )

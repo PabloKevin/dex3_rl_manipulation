@@ -322,24 +322,30 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # ── Apple (red sphere, gravity enabled, held by breakable stem joint) ─
-    # The apple hangs below the branch tip via a thin stem RigidObject.
-    # A PhysX D6 joint with break force connects stem → apple.
-    # When the robot applies enough downward force the joint breaks and
-    # the apple falls free (gravity takes over). This is created at runtime
-    # in the post_reset hook in scripts/run_env.py using the helper function
-    # create_apple_stem_joint() defined in envs/mdp/tree_utils.py.
+    # ── Apple (red sphere, kinematic — reach-only phase) ───────────────────
+    # Reach-only phase: the apple is kinematic (tensor-API pose-driven, not
+    # affected by gravity/collisions/joints) and simply teleported to the
+    # branch-tip target every reset by randomize_tree_and_apple. It stays
+    # exactly there for the whole episode — no breakable stem joint needed.
+    #
+    # We tried a real dynamic apple held by a PhysX FixedJoint to a kinematic
+    # anchor body instead (matching tree_utils.StemManager's design, used by
+    # run_env.py's manual demo loop). That anchor body correctly held a
+    # distinct per-env position throughout (confirmed via direct testing),
+    # but the *joint* itself did not — apples across differently-randomized
+    # envs still converged to one shared height, pointing at some kind of
+    # per-env joint-cooking/replication issue in the GPU physics pipeline
+    # that wasn't worth chasing further just to hold the apple still. Revisit
+    # this (dynamic apple + working joint, or StemManager's breakable stem)
+    # when grasp/manipulation training needs the apple to be a real dynamic
+    # body — see tree_utils.py's module docstring for that mechanism.
     apple: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Apple",
         spawn=sim_utils.SphereCfg(
             radius=APPLE_RADIUS,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                solver_position_iteration_count=16,
-                solver_velocity_iteration_count=1,
-                max_angular_velocity=50.0,
-                max_linear_velocity=20.0,
-                enable_gyroscopic_forces=True,
-                disable_gravity=False,   # gravity on — stem joint holds apple up
+                kinematic_enabled=True,
+                disable_gravity=True,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=APPLE_MASS),
             collision_props=sim_utils.CollisionPropertiesCfg(
@@ -524,14 +530,17 @@ class RewardsCfg:
         },
     )
 
-    # ── Lift: reward apple height above initial position ──────────────────
+    # ── Lift: reward apple height above ITS per-episode spawn height ───────
+    # Note: with the apple kinematic (reach-only phase, see AppleGraspSceneCfg
+    # .apple), it physically cannot move, so this correctly stays at 0 for
+    # now — it becomes meaningful again once the apple is a real dynamic body
+    # for grasp/lift training.
     lift = RewTerm(
         func=task_mdp.reward_lift,
         weight=5.0,
         params={
             "object_cfg": SceneEntityCfg("apple"),
-            "init_height": APPLE_INIT_POS[2],
-            "target_height": APPLE_INIT_POS[2] + 0.10,  # 10 cm lift
+            "lift_height": 0.10,  # 10 cm lift
         },
     )
 

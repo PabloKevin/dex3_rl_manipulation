@@ -128,23 +128,33 @@ def reward_grasp_quality(
 def reward_lift(
     env: ManagerBasedRLEnv,
     object_cfg: SceneEntityCfg,
-    init_height: float,
-    target_height: float,
+    lift_height: float = 0.10,
 ) -> torch.Tensor:
-    """Reward for lifting the apple above init height, shaped toward target.
+    """Reward for lifting the apple above ITS per-episode spawn height,
+    shaped toward init_height + lift_height.
 
-    r = clamp((z - init) / (target - init), 0, 1)
-    Ranges in [0, 1]. Zero until apple is above init_height.
+    r = clamp((z - init) / lift_height, 0, 1)
+    Ranges in [0, 1]. Zero until apple is above its own spawn height.
+
+    init_height is read per-env from env._stem_anchor_pos (set every reset by
+    randomize_tree_and_apple to the exact height the apple was placed at that
+    episode) rather than a fixed nominal constant — domain randomization
+    varies spawn height across envs/episodes, so a fixed reference would give
+    a spurious reward purely from the random spawn height, unrelated to any
+    actual lifting.
 
     Args:
-        init_height:   z of apple at reset (world frame)
-        target_height: z at which reward saturates
+        lift_height: metres above spawn height at which reward saturates.
     """
     apple: RigidObject = env.scene[object_cfg.name]
     apple_z = apple.data.root_pos_w[:, 2]  # [num_envs]
 
-    height_delta = target_height - init_height
-    progress = (apple_z - init_height) / (height_delta + 1e-6)
+    if hasattr(env, "_stem_anchor_pos"):
+        init_height = env._stem_anchor_pos[:, 2]
+    else:
+        init_height = apple_z  # before the first reset has ever run
+
+    progress = (apple_z - init_height) / (lift_height + 1e-6)
     return progress.clamp(0.0, 1.0)
 
 

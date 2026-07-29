@@ -1,0 +1,181 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/apple_grasp_env_cfg.py
+	modified:   envs/mdp/__init__.py
+	modified:   envs/mdp/__pycache__/__init__.cpython-310.pyc
+	modified:   envs/mdp/__pycache__/domain_randomization.cpython-310.pyc
+	modified:   envs/mdp/__pycache__/rewards.cpython-310.pyc
+	modified:   envs/mdp/domain_randomization.py
+	modified:   envs/mdp/rewards.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/rsl_rl/apple_grasp_reach/
+	outputs/2026-07-29/06-20-33/
+	outputs/2026-07-29/06-22-46/
+	outputs/2026-07-29/14-21-41/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index 823be08..287a260 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index 7c5c0b8..60c34b9 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -322,24 +322,30 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
+         ),
+     )
+ 
+-    # ── Apple (red sphere, gravity enabled, held by breakable stem joint) ─
+-    # The apple hangs below the branch tip via a thin stem RigidObject.
+-    # A PhysX D6 joint with break force connects stem → apple.
+-    # When the robot applies enough downward force the joint breaks and
+-    # the apple falls free (gravity takes over). This is created at runtime
+-    # in the post_reset hook in scripts/run_env.py using the helper function
+-    # create_apple_stem_joint() defined in envs/mdp/tree_utils.py.
++    # ── Apple (red sphere, kinematic — reach-only phase) ───────────────────
++    # Reach-only phase: the apple is kinematic (tensor-API pose-driven, not
++    # affected by gravity/collisions/joints) and simply teleported to the
++    # branch-tip target every reset by randomize_tree_and_apple. It stays
++    # exactly there for the whole episode — no breakable stem joint needed.
++    #
++    # We tried a real dynamic apple held by a PhysX FixedJoint to a kinematic
++    # anchor body instead (matching tree_utils.StemManager's design, used by
++    # run_env.py's manual demo loop). That anchor body correctly held a
++    # distinct per-env position throughout (confirmed via direct testing),
++    # but the *joint* itself did not — apples across differently-randomized
++    # envs still converged to one shared height, pointing at some kind of
++    # per-env joint-cooking/replication issue in the GPU physics pipeline
++    # that wasn't worth chasing further just to hold the apple still. Revisit
++    # this (dynamic apple + working joint, or StemManager's breakable stem)
++    # when grasp/manipulation training needs the apple to be a real dynamic
++    # body — see tree_utils.py's module docstring for that mechanism.
+     apple: RigidObjectCfg = RigidObjectCfg(
+         prim_path="{ENV_REGEX_NS}/Apple",
+         spawn=sim_utils.SphereCfg(
+             radius=APPLE_RADIUS,
+             rigid_props=sim_utils.RigidBodyPropertiesCfg(
+-                solver_position_iteration_count=16,
+-                solver_velocity_iteration_count=1,
+-                max_angular_velocity=50.0,
+-                max_linear_velocity=20.0,
+-                enable_gyroscopic_forces=True,
+-                disable_gravity=False,   # gravity on — stem joint holds apple up
++                kinematic_enabled=True,
++                disable_gravity=True,
+             ),
+             mass_props=sim_utils.MassPropertiesCfg(mass=APPLE_MASS),
+             collision_props=sim_utils.CollisionPropertiesCfg(
+@@ -524,14 +530,17 @@ class RewardsCfg:
+         },
+     )
+ 
+-    # ── Lift: reward apple height above initial position ──────────────────
++    # ── Lift: reward apple height above ITS per-episode spawn height ───────
++    # Note: with the apple kinematic (reach-only phase, see AppleGraspSceneCfg
++    # .apple), it physically cannot move, so this correctly stays at 0 for
++    # now — it becomes meaningful again once the apple is a real dynamic body
++    # for grasp/lift training.
+     lift = RewTerm(
+         func=task_mdp.reward_lift,
+         weight=5.0,
+         params={
+             "object_cfg": SceneEntityCfg("apple"),
+-            "init_height": APPLE_INIT_POS[2],
+-            "target_height": APPLE_INIT_POS[2] + 0.10,  # 10 cm lift
++            "lift_height": 0.10,  # 10 cm lift
+         },
+     )
+ 
+diff --git a/envs/mdp/__init__.py b/envs/mdp/__init__.py
+index bc9d173..2c27c88 100644
+--- a/envs/mdp/__init__.py
++++ b/envs/mdp/__init__.py
+@@ -43,4 +43,5 @@ from .domain_randomization import (
+     randomize_apple_scale,
+     randomize_stem_break_params,
+     randomize_tree_and_apple,
++    randomize_tree_geometry,
+ )
+\ No newline at end of file
+diff --git a/envs/mdp/__pycache__/__init__.cpython-310.pyc b/envs/mdp/__pycache__/__init__.cpython-310.pyc
+index cb4fd51..5f475b7 100644
+Binary files a/envs/mdp/__pycache__/__init__.cpython-310.pyc and b/envs/mdp/__pycache__/__init__.cpython-310.pyc differ
+diff --git a/envs/mdp/__pycache__/domain_randomization.cpython-310.pyc b/envs/mdp/__pycache__/domain_randomization.cpython-310.pyc
+index ccf60a5..54d8fbe 100644
+Binary files a/envs/mdp/__pycache__/domain_randomization.cpython-310.pyc and b/envs/mdp/__pycache__/domain_randomization.cpython-310.pyc differ
+diff --git a/envs/mdp/__pycache__/rewards.cpython-310.pyc b/envs/mdp/__pycache__/rewards.cpython-310.pyc
+index fc18270..c9e9195 100644
+Binary files a/envs/mdp/__pycache__/rewards.cpython-310.pyc and b/envs/mdp/__pycache__/rewards.cpython-310.pyc differ
+diff --git a/envs/mdp/domain_randomization.py b/envs/mdp/domain_randomization.py
+index e2a678d..1d191d0 100644
+--- a/envs/mdp/domain_randomization.py
++++ b/envs/mdp/domain_randomization.py
+@@ -208,7 +208,9 @@ def randomize_tree_and_apple(
+     not dynamic RigidObjects tracked by the GPU tensor view, so this doesn't
+     hit the eENABLE_DIRECT_GPU_API restriction). The apple's pose is then
+     computed from the SAME branch-tip forward kinematics and written through
+-    the tensor API, so it always stays attached at the same relative spot.
++    the tensor API. The apple itself is kinematic (see AppleGraspSceneCfg.apple
++    for why), so this teleport is all that's needed to hold it there for the
++    whole episode — no joint required.
+     """
+     try:
+         import omni.usd
+diff --git a/envs/mdp/rewards.py b/envs/mdp/rewards.py
+index aa7ee9a..35ce1cf 100644
+--- a/envs/mdp/rewards.py
++++ b/envs/mdp/rewards.py
+@@ -128,23 +128,33 @@ def reward_grasp_quality(
+ def reward_lift(
+     env: ManagerBasedRLEnv,
+     object_cfg: SceneEntityCfg,
+-    init_height: float,
+-    target_height: float,
++    lift_height: float = 0.10,
+ ) -> torch.Tensor:
+-    """Reward for lifting the apple above init height, shaped toward target.
++    """Reward for lifting the apple above ITS per-episode spawn height,
++    shaped toward init_height + lift_height.
++
++    r = clamp((z - init) / lift_height, 0, 1)
++    Ranges in [0, 1]. Zero until apple is above its own spawn height.
+ 
+-    r = clamp((z - init) / (target - init), 0, 1)
+-    Ranges in [0, 1]. Zero until apple is above init_height.
++    init_height is read per-env from env._stem_anchor_pos (set every reset by
++    randomize_tree_and_apple to the exact height the apple was placed at that
++    episode) rather than a fixed nominal constant — domain randomization
++    varies spawn height across envs/episodes, so a fixed reference would give
++    a spurious reward purely from the random spawn height, unrelated to any
++    actual lifting.
+ 
+     Args:
+-        init_height:   z of apple at reset (world frame)
+-        target_height: z at which reward saturates
++        lift_height: metres above spawn height at which reward saturates.
+     """
+     apple: RigidObject = env.scene[object_cfg.name]
+     apple_z = apple.data.root_pos_w[:, 2]  # [num_envs]
+ 
+-    height_delta = target_height - init_height
+-    progress = (apple_z - init_height) / (height_delta + 1e-6)
++    if hasattr(env, "_stem_anchor_pos"):
++        init_height = env._stem_anchor_pos[:, 2]
++    else:
++        init_height = apple_z  # before the first reset has ever run
++
++    progress = (apple_z - init_height) / (lift_height + 1e-6)
+     return progress.clamp(0.0, 1.0)
+ 
+ 

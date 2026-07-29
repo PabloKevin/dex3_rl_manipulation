@@ -208,7 +208,9 @@ def randomize_tree_and_apple(
     not dynamic RigidObjects tracked by the GPU tensor view, so this doesn't
     hit the eENABLE_DIRECT_GPU_API restriction). The apple's pose is then
     computed from the SAME branch-tip forward kinematics and written through
-    the tensor API, so it always stays attached at the same relative spot.
+    the tensor API. The apple itself is kinematic (see AppleGraspSceneCfg.apple
+    for why), so this teleport is all that's needed to hold it there for the
+    whole episode — no joint required.
     """
     try:
         import omni.usd
