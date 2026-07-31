@@ -94,10 +94,30 @@ BRANCH_LENGTH   = _jitter(0.50)
 BRANCH_RADIUS   = _jitter(0.04)
 BRANCH_ROTATION = _jitter(140.0)
  
-# Per-episode tree translation. Widened 0.05 -> 0.15 so the policy learns a
-# mapping from the observed apple offset instead of memorising one arm pose.
-TREE_POS_JITTER_XY = 0.15
- 
+# Reach envelope: apple xy is now sampled directly in the right shoulder's
+# own polar coordinates (see domain_randomization.randomize_tree_and_apple),
+# not derived incidentally from TREE_POS/BRANCH_LENGTH jitter — the old
+# scheme routinely placed the apple out of reach (or behind the robot).
+# Measured via probe_arm_reach.py: right_shoulder_pitch_link sits at
+# env-local (0.0, -0.10, 1.085) and the rigid chain shoulder->elbow->wrist->
+# palm sums to ~0.42 m (hard upper bound, before PALM_LOCAL_OFFSET's extra
+# ~0.14 m out toward the fingers). If you change the USD/arm or push
+# PALM_LOCAL_OFFSET further, re-run probe_arm_reach.py and update REACH_MAX
+# to match. REACH_MIN was raised 0.15 -> 0.25: below that the target sits
+# close enough to the shoulder that the elbow has to fold in toward the
+# torso to reach it, which is what was causing self-collision — reported
+# empirically, not derived from a measured self-collision boundary, so
+# tighten/loosen it based on what you actually see in play.py.
+# REACH_AZIMUTH_CENTER_DEG=-45 keeps the nominal direction this task always
+# used (front-right of the robot, matching the old TREE_POS); widen
+# REACH_AZIMUTH_SPAN_DEG for a policy that should generalise over more of
+# the workspace, narrow it (or watch play.py) if the arm still saturates
+# near the arc's edges.
+REACH_MIN = 0.25
+REACH_MAX = 0.42
+REACH_AZIMUTH_CENTER_DEG = -45.0
+REACH_AZIMUTH_SPAN_DEG = 70.0
+
 APPLE_STEM_BREAK_FORCE  = _jitter(2.5)
 APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
  
@@ -123,6 +143,16 @@ RIGHT_ARM_JOINTS = [
 # normal pointed sideways (toward the left arm) instead of up: the reward
 # was rewarding the wrong local axis for facing the sky.
 PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
+
+# Grasp reference point, in right_hand_palm_link's OWN local frame. The link
+# origin sits back near the wrist; probed empirically (probe_palm_offset.py,
+# via right_hand_middle_1_link / right_hand_index_1_link relative to the
+# palm link at the default pose) that local +X points toward the fingers,
+# with the first knuckle ~0.123 m out. Pushed a bit further (0.14) toward
+# where the finger pads / contact sensors actually are. Retune by re-running
+# the probe against right_hand_*_2_link (fingertip segments) once you have a
+# converged policy and want the exact contact point instead of an estimate.
+PALM_LOCAL_OFFSET = (0.14, 0.0, 0.0)
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
@@ -496,6 +526,7 @@ class ObservationsCfg:
             params={
                 "object_cfg": SceneEntityCfg("apple"),
                 "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+                "local_offset": PALM_LOCAL_OFFSET,
             },
         )
 
@@ -547,6 +578,7 @@ class RewardsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "offset_z": 0.08,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
     reach_residual = RewTerm(
@@ -556,6 +588,7 @@ class RewardsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "offset_z": 0.08,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
     reach_coarse = RewTerm(
@@ -566,6 +599,7 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "offset_z": 0.08,
             "std": 0.25,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
     reach_fine = RewTerm(
@@ -576,6 +610,7 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "offset_z": 0.08,
             "std": 0.04,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
 
@@ -593,6 +628,7 @@ class RewardsCfg:
             "std_rad": 0.5,      # ~29 deg basin
             "gate_dist": 0.25,   # metres
             "offset_z": 0.08,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
 
@@ -607,6 +643,7 @@ class RewardsCfg:
             "ori_tol_rad": 0.30,
             "offset_z": 0.08,
             "palm_normal_axis": PALM_NORMAL_AXIS,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
 
@@ -641,6 +678,7 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "brake_dist": 0.15,
             "offset_z": 0.08,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
 
@@ -719,6 +757,7 @@ class TerminationsCfg:
             "offset_z": 0.08,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "hold_time": 0.5,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
 
@@ -814,13 +853,19 @@ class EventsCfg:
         mode="reset",
         params={
             "object_cfg": SceneEntityCfg("apple"),
-            "tree_pos_xy_nominal": TREE_POS[:2],
-            "tree_pos_jitter_xy": TREE_POS_JITTER_XY,
             "branch_radius_nominal": BRANCH_RADIUS,
             "branch_rotation_deg_nominal": BRANCH_ROTATION,
             "apple_radius_nominal": APPLE_RADIUS,
             "tree_height_nominal": TREE_HEIGHT,
             "branch_length_nominal": BRANCH_LENGTH,
+            # Reach envelope around right_shoulder_pitch_link — see
+            # probe_arm_reach.py / randomize_tree_and_apple's docstring for
+            # how these were derived (measured max chain length ~0.42 m).
+            "reach_min": REACH_MIN,
+            "reach_max": REACH_MAX,
+            "reach_azimuth_center_deg": REACH_AZIMUTH_CENTER_DEG,
+            "reach_azimuth_span_deg": REACH_AZIMUTH_SPAN_DEG,
+            "offset_z": 0.08,
         },
     )
 

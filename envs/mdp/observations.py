@@ -14,7 +14,7 @@ import torch
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_conjugate, quat_mul
+from isaaclab.utils.math import matrix_from_quat, quat_conjugate, quat_mul
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -116,10 +116,18 @@ def object_pos_relative_to_body(
     env: ManagerBasedRLEnv,
     object_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg,
+    local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
-    """Apple position expressed in the robot body link's local frame.
+    """Apple position relative to a point on the robot body link (world-axis
+    aligned, just translated — NOT rotated into the body's own frame despite
+    the name; translation-invariant w.r.t. env origin is the only thing this
+    buys over a raw world-frame difference).
 
-    Gives the policy a translation-invariant signal regardless of env offset.
+    `local_offset` (in the body link's OWN local frame, same convention as
+    reach_rewards.PALM_LOCAL_OFFSET) shifts the reference point off the link
+    origin — e.g. from right_hand_palm_link's origin (near the wrist) out to
+    where the fingers/contact pads actually are — so this observation lines
+    up with whatever point reach_rewards._palm_ref_pos is scoring against.
     Shape: [num_envs, 3]
     """
     obj: RigidObject = env.scene[object_cfg.name]
@@ -128,18 +136,22 @@ def object_pos_relative_to_body(
     # World positions
     apple_pos_w = obj.data.root_pos_w  # [num_envs, 3]
 
-    # Body positions in world frame [num_envs, num_bodies, 3]
-    body_pos_w = robot.data.body_pos_w[:, robot_cfg.body_ids, :]
-    # Take first matched body (wrist link)
-    wrist_pos_w = body_pos_w[:, 0, :]  # [num_envs, 3]
+    # Body position in world frame (first matched body, e.g. palm link)
+    body_pos_w = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]  # [num_envs, 3]
+
+    if any(o != 0.0 for o in local_offset):
+        quat = robot.data.body_quat_w[:, robot_cfg.body_ids[0], :]
+        rot = matrix_from_quat(quat)  # [num_envs, 3, 3], local -> world
+        offset = torch.tensor(local_offset, device=env.device, dtype=body_pos_w.dtype)
+        body_pos_w = body_pos_w + torch.matmul(rot, offset)
 
     # Also subtract the env origin so relative pos is env-independent
     env_origins = env.scene.env_origins  # [num_envs, 3]
 
-    apple_local  = apple_pos_w  - env_origins
-    wrist_local  = wrist_pos_w  - env_origins
+    apple_local = apple_pos_w - env_origins
+    body_local = body_pos_w - env_origins
 
-    return apple_local - wrist_local  # [num_envs, 3]
+    return apple_local - body_local  # [num_envs, 3]
 
 
 def body_quat_relative_to_body(

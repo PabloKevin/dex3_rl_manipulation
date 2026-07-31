@@ -277,24 +277,23 @@ def _publish_state(robot: Articulation, apple: RigidObject,
         print(f"[DDS] state publish error: {e}")
 
 def _find_last_policy():
+    """Path to the latest run's JIT-exported policy — NOT the raw model_*.pt
+    checkpoints (those are plain torch.save'd rsl_rl runner state, not a
+    TorchScript archive; torch.jit.load on one fails with something like
+    "PytorchStreamReader failed locating file constants.pkl"). The exported
+    file only exists once play.py has been run against that run at least
+    once (play.py is what calls export_policy_as_jit)."""
     base_dir = "/home/pablo_kevin/dex3_rl_manipulation/logs/rsl_rl/apple_grasp_reach"
-    # 1. Get the newest folder (alphabetical order works for YYYY-MM-DD_HH-MM-SS)
+    # Get the newest folder (alphabetical order works for YYYY-MM-DD_HH-MM-SS)
     latest_folder = max(os.listdir(base_dir))
-    folder_path = os.path.join(base_dir, latest_folder)
-    # 2. Filter model files
-    model_files = [
-        f
-        for f in os.listdir(folder_path)
-        if f.startswith("model_") and f.endswith(".pt")
-    ]
-    # 3. Find the model with the highest numerical step number
-    last_model = max(
-        model_files, key=lambda f: int(f.split("_")[1].replace(".pt", ""))
-    )
-    # Full path to the latest model
-    last_model_path = os.path.join(folder_path, last_model)
-
-    return last_model_path
+    exported_path = os.path.join(base_dir, latest_folder, "exported", "policy.pt")
+    if not os.path.isfile(exported_path):
+        raise FileNotFoundError(
+            f"No exported policy at {exported_path}. Run play.py against this "
+            f"checkpoint first (it exports policy.pt as a side effect), e.g.:\n"
+            f"  python scripts/play.py --task AppleGrasp-Play-v0 --num_envs 1"
+        )
+    return exported_path
 
 
 def main():

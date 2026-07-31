@@ -67,6 +67,7 @@ def reach_success(
     offset_z: float = 0.08,
     palm_normal_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
     hold_time: float = 0.5,
+    palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
     """Terminate once the palm has held within [pos_tol, ori_tol_rad] of the
     grasp point for `hold_time` continuous seconds — the same neighbourhood
@@ -86,7 +87,7 @@ def reach_success(
     """
     from .reach_rewards import _palm_target_dist, _palm_normal_angle
 
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z)
+    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
     theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
     in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
 
