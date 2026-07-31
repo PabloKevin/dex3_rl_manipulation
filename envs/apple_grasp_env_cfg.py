@@ -147,13 +147,7 @@ RIGHT_ARM_JOINTS = [
     "right_wrist_yaw_joint",
 ]
  
-# Palm normal in the palm link's LOCAL frame. Confirmed via run_env.py
-# --debug_pose's axis probe: local Z has world-Z component 1.000 at the
-# default pose, and stays the largest of the three (0.91 vs 0.4/0.12 for
-# X/Y) even under the (0,1,0)-trained policy's converged pose — local Z is
-# the true palm normal. The earlier (0,1,0) setting is why the trained palm
-# normal pointed sideways (toward the left arm) instead of up: the reward
-# was rewarding the wrong local axis for facing the sky.
+# Palm normal in the palm link's LOCAL frame. 
 PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 
 # Grasp reference point, in right_hand_palm_link's OWN local frame. The link
@@ -164,7 +158,7 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 # where the finger pads / contact sensors actually are. Retune by re-running
 # the probe against right_hand_*_2_link (fingertip segments) once you have a
 # converged policy and want the exact contact point instead of an estimate.
-PALM_LOCAL_OFFSET = (0.14, 0.0, 0.0)
+PALM_LOCAL_OFFSET = (0.07, 0.0, 0.0)
 
 # Vertical gap between the apple centre and the "grasp point" every reach
 # reward/termination scores against (target_z = apple_z - GRASP_OFFSET_Z).
@@ -182,7 +176,7 @@ PALM_LOCAL_OFFSET = (0.14, 0.0, 0.0)
 # a converged policy can sit at (anywhere within pos_tol=0.04 of the target
 # still counts as "reached") + a small margin.
 _THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
-GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS + 0.04 + 0.02
+GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.5 # + 0.04  + 0.02
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
@@ -728,9 +722,16 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                             preserve_order=True)},
     )
+    # weight raised 15x (-0.02 -> -0.3): reported symptom was a smooth
+    # (non-vibrating) but never-settling drift near the target -- not
+    # buzzing, just failing to commit to zero velocity once inside the hold
+    # neighbourhood. reward_reach_hold pays out the SAME 3.0/step whether
+    # the arm sits dead still or wanders continuously in and out of the
+    # tol box, so at the old brake weight there was nothing to actually
+    # prefer stillness over drifting -- this is that preference.
     brake = RewTerm(
         func=rr.penalty_near_goal_velocity,
-        weight=-0.02,
+        weight=-0.3,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                         preserve_order=True),
@@ -758,21 +759,29 @@ class RewardsCfg:
         },
     )
 
-    # DISABLED (weight=0.0) until you have read the bad pose off
-    # play_debug_patch.py's readout and know which joint to box in. Then set
-    # the offending entry in `upper` (or `lower`) just inside the angle you
-    # want to forbid and raise weight to about -2.0. Joint order:
+    # Elbow-into-torso guard. Measured via probe_shoulder_roll.py (varied
+    # right_shoulder_roll_joint, read right_elbow_link's world-Y relative to
+    # the shoulder): negative shoulder_roll swings the elbow AWAY from the
+    # torso (elbow_y more negative than shoulder_y=-0.10), positive swings
+    # it IN, crossing past the shoulder line (self-collision territory)
+    # around +0.5 rad. This is the redundant "swivel" DOF of the arm's IK
+    # (fixed palm position+orientation still leaves shoulder_roll free to
+    # pick which side the elbow swings to) — PPO was landing on the
+    # colliding branch since nothing told it not to. upper[1]=0.35 boxes
+    # shoulder_roll well before the ~0.5 rad crossing point, zero cost
+    # below that (negative/away-from-torso stays completely free). Only
+    # shoulder_roll is boxed -- elbow_joint itself is flexion (bend amount),
+    # it doesn't control which side the arm swings to. Joint order:
     #   [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
     #    wrist_roll, wrist_pitch, wrist_yaw]
-    # Current bounds are just the hardware soft limits (no-op).
     posture_box = RewTerm(
         func=rr.penalty_joint_range_box,
-        weight=0.0,
+        weight=-2.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                         preserve_order=True),
             "lower": [-3.09, -2.25, -2.62, -1.05, -1.97, -1.61, -1.61],
-            "upper": [ 2.67,  1.59,  2.62,  2.09,  1.97,  1.61,  1.61],
+            "upper": [ 2.67,  0.35,  2.62,  2.09,  1.97,  1.61,  1.61],
         },
     )
 
