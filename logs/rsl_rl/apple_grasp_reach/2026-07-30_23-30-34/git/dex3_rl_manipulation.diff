@@ -1,0 +1,36 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/apple_grasp_env_cfg.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/rsl_rl/apple_grasp_reach/2026-07-30_23-30-34/
+	outputs/2026-07-30/23-26-05/
+	outputs/2026-07-30/23-30-34/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index 5bb0655..363550f 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index 56b0085..a520be0 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -117,7 +117,7 @@ RIGHT_ARM_JOINTS = [
+  
+ # Palm normal in the palm link's LOCAL frame. Run play_debug_patch.py's probe
+ # and set this before you trust the orientation reward. (0,0,1) is a guess.
+-PALM_NORMAL_AXIS = (0.0, 0.0, 1.0)
++PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
+ 
+ # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
+ # With fix_root_link the pelvis is fixed here in world frame.

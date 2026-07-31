@@ -46,6 +46,15 @@ parser.add_argument("--num_envs",       type=int,  default=1,    help="Number of
 parser.add_argument("--debug_links",    action="store_true",      help="Print all robot link names and exit")
 parser.add_argument("--debug_joints",   action="store_true",      help="Print all robot joint names and exit")
 parser.add_argument("--random_actions", action="store_true",      help="Send random actions instead of zeros")
+parser.add_argument("--policy",         type=str,  default=None,
+                     help="Path to a JIT-exported policy (e.g. logs/rsl_rl/<exp>/<run>/exported/policy.pt "
+                          "from play.py). If set, the loaded policy drives the arm every step instead of "
+                          "DDS targets/zeros — reuses THIS script's already-running env, so you can 'r'+Enter "
+                          "reset and re-run the policy repeatedly without relaunching Isaac Sim.")
+parser.add_argument("--debug_pose",     action="store_true",
+                     help="Print the palm's local-axis-to-world-Z probe once at start (to find "
+                          "PALM_NORMAL_AXIS), plus a periodic joint-pose/distance readout and a "
+                          "post-reset pose printout.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -222,11 +231,21 @@ def _start_dds():
         _dds_ok = False
 
 def _get_actions(device, action_shape):
-    """Return action tensor from latest DDS targets, or zeros if none received."""
+    """Return action tensor from latest DDS targets, or zeros if none received.
+
+    Sized to match action_shape[-1]: 7 (arm-only, current reach-phase
+    ActionsCfg) or 14 (arm+hand, if the Dex3 hand action is ever restored for
+    grasp training) — rather than hardcoding 14, which broke the moment
+    ActionsCfg dropped the hand action.
+    """
+    action_dim = action_shape[-1]
     with _targets_lock:
-        arm  = list(_arm_targets)  if _arm_targets  is not None else [0.0] * 7
-        hand = list(_hand_targets) if _hand_targets is not None else [0.0] * 7
-        combined = arm + hand
+        arm = list(_arm_targets) if _arm_targets is not None else [0.0] * 7
+        if action_dim == 7:
+            combined = arm
+        else:
+            hand = list(_hand_targets) if _hand_targets is not None else [0.0] * 7
+            combined = arm + hand
         return torch.tensor([combined], dtype=torch.float32, device=device)
 
 def _publish_state(robot: Articulation, apple: RigidObject,
@@ -256,6 +275,27 @@ def _publish_state(robot: Articulation, apple: RigidObject,
         _state_publisher.Write(String_(data=json.dumps(payload)))
     except Exception as e:
         print(f"[DDS] state publish error: {e}")
+
+def _find_last_policy():
+    base_dir = "/home/pablo_kevin/dex3_rl_manipulation/logs/rsl_rl/apple_grasp_reach"
+    # 1. Get the newest folder (alphabetical order works for YYYY-MM-DD_HH-MM-SS)
+    latest_folder = max(os.listdir(base_dir))
+    folder_path = os.path.join(base_dir, latest_folder)
+    # 2. Filter model files
+    model_files = [
+        f
+        for f in os.listdir(folder_path)
+        if f.startswith("model_") and f.endswith(".pt")
+    ]
+    # 3. Find the model with the highest numerical step number
+    last_model = max(
+        model_files, key=lambda f: int(f.split("_")[1].replace(".pt", ""))
+    )
+    # Full path to the latest model
+    last_model_path = os.path.join(folder_path, last_model)
+
+    return last_model_path
+
 
 def main():
     _start_dds()
@@ -327,6 +367,44 @@ def main():
     except Exception:
         sensor = None
 
+    # ── Optional: drive the arm with a trained policy instead of DDS/zeros ──
+    # Reuses THIS script's already-running env — no second gym.make(), so you
+    # can 'r'+Enter reset and re-run the same loaded policy repeatedly without
+    # relaunching Isaac Sim (unlike play.py, which owns its own env).
+    policy_module = None
+    if args_cli.policy:
+        if args_cli.policy == "last":
+            policy_path = _find_last_policy()
+        else:
+            policy_path = args_cli.policy
+        policy_module = torch.jit.load(policy_path, map_location=env.device).eval()
+        print(f"[Policy] Loaded {policy_path} — driving the arm every step.")
+
+    palm_bid = robot.data.body_names.index("right_hand_palm_link")
+
+    def _fmt(v):
+        return [round(float(x), 3) for x in v]
+
+    def _probe_palm_axes():
+        """Local X/Y/Z of right_hand_palm_link expressed in world coords, for
+        the CURRENT pose. Put the arm in a pose where you KNOW the palm faces
+        up (viewer, or a tuned IK pose), then read which local axis has
+        world-Z component closest to +1 — that's PALM_NORMAL_AXIS in
+        apple_grasp_env_cfg.py. Closest to -1 means negate it."""
+        from isaaclab.utils.math import matrix_from_quat
+        q = robot.data.body_quat_w[0:1, palm_bid, :]
+        R = matrix_from_quat(q)[0]
+        print("\n─── PALM AXIS PROBE (local axis -> world vector) ───")
+        for name, i in (("local X", 0), ("local Y", 1), ("local Z", 2)):
+            ax = R[:, i]
+            print(f"  {name} -> world {_fmt(ax)}    (world-Z component = {float(ax[2]): .3f})")
+        print("  Pick the axis whose world-Z component is nearest +1 in a")
+        print("  palm-up pose; negate it if it is nearest -1.")
+        print("─────────────────────────────────────────────────────\n")
+
+    if args_cli.debug_pose:
+        _probe_palm_axes()
+
     global _reset_requested, _arm_targets, _hand_targets
 
     while simulation_app.is_running():
@@ -370,8 +448,15 @@ def main():
                 step = 0
                 print("\n>>> SIMULACIÓN Y ROBOT RESETEADOS A POSE INICIAL <<<\n")
 
+                if args_cli.debug_pose:
+                    _q  = robot.data.joint_pos[0, arm_joint_idx]
+                    _dq = robot.data.joint_vel[0, arm_joint_idx]
+                    print(f"  RESET -> q={_fmt(_q)}  |dq|={float(torch.norm(_dq)):.4f}")
+
         with torch.inference_mode():
-            if args_cli.random_actions:
+            if policy_module is not None:
+                actions = policy_module(obs["policy"])
+            elif args_cli.random_actions:
                 raw     = env.action_space.sample()
                 actions = torch.tensor(raw, device=env.device, dtype=torch.float32)
             else:
@@ -407,6 +492,23 @@ def main():
                 if any(stem.is_broken()):
                     print("  STEM BROKEN 🍎", end="")
                 print()
+
+                if args_cli.debug_pose:
+                    _q  = robot.data.joint_pos[0, arm_joint_idx]
+                    _dq = robot.data.joint_vel[0, arm_joint_idx]
+                    _palm = robot.data.body_pos_w[0, palm_bid]
+                    _tgt  = apple.data.root_pos_w[0].clone()
+                    _tgt[2] -= 0.08   # matches reach_rewards.py's offset_z
+                    _d = float(torch.norm(_tgt - _palm))
+
+                    from isaaclab.utils.math import matrix_from_quat
+                    _Rp = matrix_from_quat(robot.data.body_quat_w[0:1, palm_bid, :])[0]
+                    _up = [round(float(_Rp[:, i][2]), 2) for i in range(3)]  # world-Z of local X/Y/Z
+
+                    print(f"           d={_d*100:6.1f} cm  local-axis world-Z=[X,Y,Z]={_up}  "
+                          f"|dq|={float(torch.norm(_dq)):5.2f}")
+                    print(f"           q  = {_fmt(_q)}")
+                    print(f"           dq = {_fmt(_dq)}")
 
     env.close()
 

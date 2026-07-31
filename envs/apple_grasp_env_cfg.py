@@ -115,9 +115,14 @@ RIGHT_ARM_JOINTS = [
     "right_wrist_yaw_joint",
 ]
  
-# Palm normal in the palm link's LOCAL frame. Run play_debug_patch.py's probe
-# and set this before you trust the orientation reward. (0,0,1) is a guess.
-PALM_NORMAL_AXIS = (0.0, 0.0, 1.0)
+# Palm normal in the palm link's LOCAL frame. Confirmed via run_env.py
+# --debug_pose's axis probe: local Z has world-Z component 1.000 at the
+# default pose, and stays the largest of the three (0.91 vs 0.4/0.12 for
+# X/Y) even under the (0,1,0)-trained policy's converged pose — local Z is
+# the true palm normal. The earlier (0,1,0) setting is why the trained palm
+# normal pointed sideways (toward the left arm) instead of up: the reward
+# was rewarding the wrong local axis for facing the sky.
+PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
