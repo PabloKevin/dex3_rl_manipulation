@@ -88,7 +88,7 @@ def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
  
 APPLE_RADIUS    = _jitter(0.04)
 APPLE_MASS      = _jitter(0.15)
-TREE_POS        = (_jitter(0.55), _jitter(-0.55), 0.0)
+TREE_POS        = (_jitter(0.60), _jitter(-0.55), 0.0)
 TREE_HEIGHT     = _jitter(1.25)
 BRANCH_LENGTH   = _jitter(0.50)
 BRANCH_RADIUS   = _jitter(0.04)
@@ -113,7 +113,7 @@ BRANCH_ROTATION = _jitter(140.0)
 # REACH_AZIMUTH_SPAN_DEG for a policy that should generalise over more of
 # the workspace, narrow it (or watch play.py) if the arm still saturates
 # near the arc's edges.
-REACH_MIN = 0.25
+REACH_MIN = 0.30
 REACH_MAX = 0.42
 REACH_AZIMUTH_CENTER_DEG = -45.0
 REACH_AZIMUTH_SPAN_DEG = 70.0
@@ -153,6 +153,24 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 # the probe against right_hand_*_2_link (fingertip segments) once you have a
 # converged policy and want the exact contact point instead of an estimate.
 PALM_LOCAL_OFFSET = (0.14, 0.0, 0.0)
+
+# Vertical gap between the apple centre and the "grasp point" every reach
+# reward/termination scores against (target_z = apple_z - GRASP_OFFSET_Z).
+# 0.08 was too shallow: it only accounted for PALM_LOCAL_OFFSET's horizontal
+# (local X) component, not the thumb. probe_palm_offset.py measured
+# right_hand_thumb_2_link at local offset (0.023, 0.065, 0) from the palm —
+# 0.065 m along local Y, the SAME axis as PALM_NORMAL_AXIS. Near the goal
+# the palm normal is driven to point at world +Z (reward_palm_normal_up), so
+# that 0.065 m becomes a near-vertical protrusion ABOVE the reference point
+# reach_progress/hold/etc. actually track. At the old offset_z=0.08 the
+# converged pose put the thumb at apple_z - 0.08 + 0.065 = apple_z - 0.015 —
+# well inside the apple's own radius (~0.04 m) — so the thumb speared the
+# apple even at a "perfect" reach, no reward-shaping bug required. Sized to
+# clear: thumb's own protrusion + the apple's radius + the worst-case slack
+# a converged policy can sit at (anywhere within pos_tol=0.04 of the target
+# still counts as "reached") + a small margin.
+_THUMB_UP_LOCAL_OFFSET = 0.065   # measured via probe_palm_offset.py
+GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS + 0.04 + 0.02
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
@@ -468,26 +486,38 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """7-dim joint position targets: right arm only (reach phase).
 
-    scale=0.5 + clip caps the commanded target at +-1.5 rad from default.
-    The previous scale=1.0 with no clip meant the raw Gaussian action sample
-    (in radians) was added directly to default_q with nothing bounding it —
-    with init_noise_std=1.0 that was +-1 rad jumps (+-3 rad in the tails) at
-    50 Hz, which is what drove joints into saturated, contorted poses.
+    scale=0.5 + clip caps the RAW target at +-1.5 rad from default before
+    rate-limiting. The previous scale=1.0 with no clip meant the raw
+    Gaussian action sample (in radians) was added directly to default_q with
+    nothing bounding it — with init_noise_std=1.0 that was +-1 rad jumps
+    (+-3 rad in the tails) at 50 Hz, which is what drove joints into
+    saturated, contorted poses.
+
+    task_mdp.RateLimitedJointPositionActionCfg (not the stock
+    mdp.JointPositionActionCfg) additionally hard-caps the COMMANDED
+    trajectory's velocity/acceleration every control step — see
+    envs/mdp/actions.py. Added after the arm was observed moving too fast /
+    generating large accelerations for safe sim-to-real transfer: the static
+    clip above only bounds where the target CAN be, not how fast it's
+    allowed to get there, so a policy could still slam between two points
+    inside that range every 20 ms.
 
     Dex3 hand action removed: with the apple kinematic_enabled=True, the
     contact/lift rewards are dead, so the 7 hand DOF were pure exploration
     noise for this reach phase. Restore for grasp training:
-        right_hand: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
+        right_hand: task_mdp.RateLimitedJointPositionActionCfg = task_mdp.RateLimitedJointPositionActionCfg(
             asset_name="robot", joint_names=["right_hand.*"],
             scale=0.5, use_default_offset=True, clip={".*": (-3.0, 3.0)},
         )
     """
-    right_arm: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
+    right_arm: task_mdp.RateLimitedJointPositionActionCfg = task_mdp.RateLimitedJointPositionActionCfg(
         asset_name="robot",
         joint_names=RIGHT_ARM_JOINTS,
         scale=0.5,
         use_default_offset=True,
         clip={".*": (-3.0, 3.0)},
+        max_velocity=2.0,
+        max_acceleration=15.0,
     )
 
 
@@ -577,7 +607,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -587,7 +617,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -597,7 +627,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "std": 0.25,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
@@ -608,7 +638,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "std": 0.04,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
@@ -627,7 +657,7 @@ class RewardsCfg:
             "palm_normal_axis": PALM_NORMAL_AXIS,   # verify with play_debug_patch probe
             "std_rad": 0.5,      # ~29 deg basin
             "gate_dist": 0.25,   # metres
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -641,7 +671,7 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
@@ -660,11 +690,19 @@ class RewardsCfg:
     )
 
     # ── Smoothness / anti-vibration ───────────────────────────────────────
-    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.15)
-    action_jerk = RewTerm(func=rr.penalty_action_jerk, weight=-0.05)
+    # Soft companions to the hard rate limiter on ActionsCfg.right_arm
+    # (envs/mdp/actions.py) — that limiter caps the WORST case; these still
+    # matter to make the policy actually prefer using less of the available
+    # velocity/accel budget rather than habitually pinning against it.
+    # arm_vel bumped 10x (-0.002 -> -0.02): at the old weight it was
+    # negligible next to reach_progress=10.0 etc., essentially free to move
+    # at any speed the whole episode, not just near the goal (that's brake's
+    # job, gated to the last 15 cm).
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.2)
+    action_jerk = RewTerm(func=rr.penalty_action_jerk, weight=-0.08)
     arm_vel = RewTerm(
         func=mdp.joint_vel_l2,
-        weight=-0.002,
+        weight=-0.02,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                             preserve_order=True)},
     )
@@ -677,7 +715,7 @@ class RewardsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "brake_dist": 0.15,
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -754,7 +792,7 @@ class TerminationsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "hold_time": 0.5,
             "palm_local_offset": PALM_LOCAL_OFFSET,
@@ -865,7 +903,7 @@ class EventsCfg:
             "reach_max": REACH_MAX,
             "reach_azimuth_center_deg": REACH_AZIMUTH_CENTER_DEG,
             "reach_azimuth_span_deg": REACH_AZIMUTH_SPAN_DEG,
-            "offset_z": 0.08,
+            "offset_z": GRASP_OFFSET_Z,
         },
     )
 

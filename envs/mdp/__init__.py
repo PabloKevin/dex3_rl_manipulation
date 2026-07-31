@@ -18,6 +18,8 @@ terms in rewards.py, which are unchanged.
 
 from . import reach_rewards
 
+from .actions import RateLimitedJointPositionAction, RateLimitedJointPositionActionCfg
+
 from .observations import (
     joint_pos_selected,
     joint_vel_selected,
