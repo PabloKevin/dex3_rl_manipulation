@@ -1,0 +1,23 @@
+--- git status ---
+On branch main
+Your branch is ahead of 'origin/main' by 1 commit.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/
+	outputs/2026-07-31/05-39-17/
+	outputs/2026-07-31/05-42-13/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index d2ab41f..be6e227 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
