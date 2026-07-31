@@ -158,7 +158,7 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 # where the finger pads / contact sensors actually are. Retune by re-running
 # the probe against right_hand_*_2_link (fingertip segments) once you have a
 # converged policy and want the exact contact point instead of an estimate.
-PALM_LOCAL_OFFSET = (0.075, 0.0, 0.0)
+PALM_LOCAL_OFFSET = (0.08, 0.0, 0.0)
 
 # Vertical gap between the apple centre and the "grasp point" every reach
 # reward/termination scores against (target_z = apple_z - GRASP_OFFSET_Z).
