@@ -158,7 +158,7 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 # where the finger pads / contact sensors actually are. Retune by re-running
 # the probe against right_hand_*_2_link (fingertip segments) once you have a
 # converged policy and want the exact contact point instead of an estimate.
-PALM_LOCAL_OFFSET = (0.07, 0.0, 0.0)
+PALM_LOCAL_OFFSET = (0.075, 0.0, 0.0)
 
 # Vertical gap between the apple centre and the "grasp point" every reach
 # reward/termination scores against (target_z = apple_z - GRASP_OFFSET_Z).
@@ -176,7 +176,7 @@ PALM_LOCAL_OFFSET = (0.07, 0.0, 0.0)
 # a converged policy can sit at (anywhere within pos_tol=0.04 of the target
 # still counts as "reached") + a small margin.
 _THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
-GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.5 # + 0.04  + 0.02
+GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.75 # + 0.04  + 0.02
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
@@ -681,7 +681,7 @@ class RewardsCfg:
     # ── Reason to stop moving once at the target ──────────────────────────
     hold = RewTerm(
         func=rr.reward_reach_hold,
-        weight=3.0,
+        weight=5.0,
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
@@ -702,7 +702,7 @@ class RewardsCfg:
     #    mirroring g1_arm_env's ratio. Tune from the training curve.
     reach_success_bonus = RewTerm(
         func=rr.reward_reach_success,
-        weight=75.0,
+        weight=95.0,
     )
 
     # ── Smoothness / anti-vibration ───────────────────────────────────────
@@ -731,7 +731,7 @@ class RewardsCfg:
     # prefer stillness over drifting -- this is that preference.
     brake = RewTerm(
         func=rr.penalty_near_goal_velocity,
-        weight=-0.3,
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                         preserve_order=True),
@@ -776,7 +776,7 @@ class RewardsCfg:
     #    wrist_roll, wrist_pitch, wrist_yaw]
     posture_box = RewTerm(
         func=rr.penalty_joint_range_box,
-        weight=-2.0,
+        weight=-2.4,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                         preserve_order=True),
@@ -790,6 +790,25 @@ class RewardsCfg:
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
                                             preserve_order=True)},
+    )
+
+    # Penalises pressing hard into the apple (e.g. the thumb-spearing issue),
+    # WITHOUT requiring a contact-force observation -- reward functions see
+    # full sim state regardless of ObservationsCfg, so this stays reward-
+    # only and the obs vector doesn't grow. Uses force_matrix_w (filtered
+    # specifically to the Apple via contact_forces' filter_prim_paths_expr),
+    # not net_forces_w, so self-collision/tree contact can't trigger it.
+    # ref=5.0 N: a light touch costs little (squared penalty), pressing
+    # harder costs much more than linearly. Tune weight from the training
+    # curve -- start small since this stacks with GRASP_OFFSET_Z already
+    # keeping the hand clear of the apple in the nominal converged pose.
+    apple_contact_force = RewTerm(
+        func=rr.penalty_apple_contact_force,
+        weight=-0.05,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "ref": 5.0,
+        },
     )
 
 

@@ -1,0 +1,53 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/apple_grasp_env_cfg.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_19-42-15/
+	outputs/2026-07-31/19-42-15/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index 1cdc309..5a2e7f6 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index b6ae42a..c5672e8 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -158,7 +158,7 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
+ # where the finger pads / contact sensors actually are. Retune by re-running
+ # the probe against right_hand_*_2_link (fingertip segments) once you have a
+ # converged policy and want the exact contact point instead of an estimate.
+-PALM_LOCAL_OFFSET = (0.07, 0.0, 0.0)
++PALM_LOCAL_OFFSET = (0.075, 0.0, 0.0)
+ 
+ # Vertical gap between the apple centre and the "grasp point" every reach
+ # reward/termination scores against (target_z = apple_z - GRASP_OFFSET_Z).
+@@ -176,7 +176,7 @@ PALM_LOCAL_OFFSET = (0.07, 0.0, 0.0)
+ # a converged policy can sit at (anywhere within pos_tol=0.04 of the target
+ # still counts as "reached") + a small margin.
+ _THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
+-GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.5 # + 0.04  + 0.02
++GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.75 # + 0.04  + 0.02
+ 
+ # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
+ # With fix_root_link the pelvis is fixed here in world frame.
+@@ -681,7 +681,7 @@ class RewardsCfg:
+     # ── Reason to stop moving once at the target ──────────────────────────
+     hold = RewTerm(
+         func=rr.reward_reach_hold,
+-        weight=3.0,
++        weight=5.0,
+         params={
+             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+             "object_cfg": SceneEntityCfg("apple"),

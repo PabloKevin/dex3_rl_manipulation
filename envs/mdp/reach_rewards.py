@@ -36,6 +36,7 @@ import torch
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import matrix_from_quat
 
 if TYPE_CHECKING:
@@ -303,6 +304,39 @@ def penalty_action_jerk(env: "ManagerBasedRLEnv") -> torch.Tensor:
 
     env._prev_prev_action = prev.clone()
     return out
+
+
+def penalty_apple_contact_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    ref: float = 0.8,
+) -> torch.Tensor:
+    """Squared-norm penalty on contact force between the hand and the apple.
+
+    Uses force_matrix_w, not net_forces_w -- the latter is the TOTAL contact
+    force on each hand body against ANYTHING (self-collision, the tree,
+    accidental floor contact), which would give a false "pressing the apple"
+    signal for contact that has nothing to do with the apple. force_matrix_w
+    is the force filtered specifically against ContactSensorCfg's
+    filter_prim_paths_expr=["{ENV_REGEX_NS}/Apple"] (see AppleGraspSceneCfg.
+    contact_forces), so this only ever penalises force actually applied to
+    the apple.
+
+    Squared and normalised by `ref` newtons: a light touch (~ref or below)
+    costs little, pressing hard costs much more than linearly. Not a binary
+    contact/no-contact term -- a light graze near a successful reach isn't
+    penalised much, only genuinely pressing into the apple is.
+
+    Deliberately NOT exposed as an observation (see ObservationsCfg in
+    apple_grasp_env_cfg.py) -- the policy doesn't need to measure the force
+    to learn not to apply it, and reward functions have full access to sim
+    state regardless of what's wired into the obs group, so there's no
+    reason to spend an observation dimension on this.
+    """
+    sensor: ContactSensor = env.scene[sensor_cfg.name]
+    forces = sensor.data.force_matrix_w  # [N, B, M=1, 3] -- filtered to Apple
+    force_norm = torch.norm(forces, dim=-1)  # [N, B, M]
+    return ((force_norm / ref) ** 2).sum(dim=(-2, -1))
 
 
 def penalty_joint_jerk(
