@@ -349,7 +349,12 @@ def main():
     result = motion_gen.plan_single(
         start_state=start_state,
         goal_pose=goal_pose,
-        plan_config=MotionGenPlanConfig(enable_finetune_trajopt=False, max_attempts=10, num_trajopt_seeds=12),
+        # enable_finetune_trajopt defaults to True in cuRobo for a reason — its own
+        # docstring warns that with it off, the plan is only guaranteed collision-free
+        # and within joint limits, NOT guaranteed to actually hit the goal pose. That
+        # was silently producing "successful" plans hundreds of mm / tens of degrees
+        # off target.
+        plan_config=MotionGenPlanConfig(enable_finetune_trajopt=True, max_attempts=10, num_trajopt_seeds=12),
     )
 
     if not result.success.item():

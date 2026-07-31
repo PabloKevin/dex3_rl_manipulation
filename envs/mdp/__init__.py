@@ -2,10 +2,21 @@
 """
 Task-specific MDP functions.
 
+Save as:  envs/mdp/__init__.py   (complete replacement)
+
 Import everything here so env_cfg can do:
     from . import mdp as task_mdp
     task_mdp.joint_pos_selected(...)
+
+Reach-phase reward terms live in reach_rewards.py and are imported as a
+module rather than flattened into this namespace, so the env cfg can do:
+    from .mdp import reach_rewards as rr
+    rr.reward_reach_progress(...)
+That keeps the new reach terms visibly separate from the grasp/lift/place
+terms in rewards.py, which are unchanged.
 """
+
+from . import reach_rewards
 
 from .observations import (
     joint_pos_selected,
@@ -28,14 +39,15 @@ from .rewards import (
     reward_place,
     penalty_joint_limits,
     penalty_action_rate,
-    reward_palm_below_apple,     
-    reward_palm_orientation, 
+    reward_palm_below_apple,
+    reward_palm_orientation,
 )
 
 from .terminations_and_events import (
     apple_dropped,
     apple_lifted_success,
     apple_placed_success,
+    reach_success,
     reset_apple_pose,
 )
 

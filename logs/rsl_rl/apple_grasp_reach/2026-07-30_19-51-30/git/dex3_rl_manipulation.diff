@@ -1,0 +1,1148 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/agents/__pycache__/rsl_rl_ppo_cfg.cpython-310.pyc
+	modified:   envs/agents/rsl_rl_ppo_cfg.py
+	modified:   envs/apple_grasp_env_cfg.py
+	modified:   envs/mdp/__init__.py
+	modified:   envs/mdp/__pycache__/__init__.cpython-310.pyc
+	modified:   envs/mdp/__pycache__/terminations_and_events.cpython-310.pyc
+	modified:   envs/mdp/terminations_and_events.py
+	modified:   scripts/__pycache__/calibrate_reach_apple_curobo.cpython-312.pyc
+	modified:   scripts/__pycache__/reach_apple_curobo.cpython-312.pyc
+	modified:   scripts/calibrate_reach_apple_curobo.py
+	modified:   scripts/calibration_results.json
+	modified:   scripts/play.py
+	modified:   scripts/reach_apple_curobo.py
+	modified:   scripts/reach_apple_ik.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	envs/mdp/__pycache__/reach_rewards.cpython-310.pyc
+	envs/mdp/reach_rewards.py
+	logs/rsl_rl/apple_grasp_reach/2026-07-30_19-50-52/
+	logs/rsl_rl/apple_grasp_reach/2026-07-30_19-51-30/
+	outputs/2026-07-30/
+	scripts/__pycache__/diagnose_fk_frame.cpython-312.pyc
+	scripts/diagnose_fk_frame.py
+	scripts/play_debug_patch.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index c2ac502..5955aec 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/agents/__pycache__/rsl_rl_ppo_cfg.cpython-310.pyc b/envs/agents/__pycache__/rsl_rl_ppo_cfg.cpython-310.pyc
+index 4885432..58cef4a 100644
+Binary files a/envs/agents/__pycache__/rsl_rl_ppo_cfg.cpython-310.pyc and b/envs/agents/__pycache__/rsl_rl_ppo_cfg.cpython-310.pyc differ
+diff --git a/envs/agents/rsl_rl_ppo_cfg.py b/envs/agents/rsl_rl_ppo_cfg.py
+index 27bf4f0..ea26384 100644
+--- a/envs/agents/rsl_rl_ppo_cfg.py
++++ b/envs/agents/rsl_rl_ppo_cfg.py
+@@ -1,5 +1,32 @@
+ # Copyright 2025 - G1 Dex3 Apple Grasp Project
+-"""PPO (rsl_rl) runner config for AppleGrasp-v0 / AppleGrasp-Play-v0."""
++"""
++PPO (rsl_rl) runner config for AppleGrasp-v0 / AppleGrasp-Play-v0.
++
++Save as:  envs/agents/rsl_rl_ppo_cfg.py   (complete replacement)
++
++Changes from your previous version, with reasons:
++
++  init_noise_std  1.0 -> 0.5
++      With JointPositionAction(scale=1.0, use_default_offset=True) and no
++      clip, a std of 1.0 meant the policy was sampling +-1 rad target jumps
++      (+-3 rad in the tails) at 50 Hz. Now that scale=0.5 and clip=(-3,3) are
++      set in ActionsCfg, 0.5 gives sane exploration without the flailing.
++
++  entropy_coef    0.005 -> 0.002
++      Lower entropy pressure means the converged policy keeps a tighter
++      action distribution, which shows up directly as less residual jitter.
++      Note this affects TRAINING only -- play.py uses
++      runner.get_inference_policy(), which is the deterministic mean, so the
++      buzzing you see at play time was never exploration noise. It is a
++      closed-loop limit cycle between the policy and an underdamped PD, which
++      is why the actuator damping change and the rate/jerk rewards are the
++      real fix.
++
++  num_steps_per_env  48 -> 64
++      At 50 Hz, 48 steps is a 0.96 s rollout against a (now 5 s) episode.
++      With 64 envs this gives 4096 samples/iteration and 1024 per minibatch,
++      up from 1536/384 -- much less gradient noise per update.
++"""
+ 
+ from isaaclab.utils import configclass
+ 
+@@ -8,7 +35,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
+ 
+ @configclass
+ class AppleGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+-    num_steps_per_env = 48
++    num_steps_per_env = 64
+     max_iterations = 3000
+     save_interval = 100
+     experiment_name = "apple_grasp_reach"
+@@ -16,7 +43,7 @@ class AppleGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+ 
+     policy = RslRlPpoActorCriticCfg(
+-        init_noise_std=1.0,
++        init_noise_std=0.5,
+         actor_obs_normalization=True,
+         critic_obs_normalization=True,
+         actor_hidden_dims=[128, 128, 64],
+@@ -27,7 +54,7 @@ class AppleGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+         value_loss_coef=1.0,
+         use_clipped_value_loss=True,
+         clip_param=0.2,
+-        entropy_coef=0.005,
++        entropy_coef=0.002,
+         num_learning_epochs=5,
+         num_mini_batches=4,
+         learning_rate=3.0e-4,
+@@ -36,4 +63,4 @@ class AppleGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+         lam=0.95,
+         desired_kl=0.01,
+         max_grad_norm=1.0,
+-    )
++    )
+\ No newline at end of file
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index 66b8ecc..d861f55 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -52,6 +52,7 @@ import isaaclab.envs.mdp as mdp
+ 
+ from . import mdp as task_mdp  # our custom mdp functions
+ from .mdp import domain_randomization as dr
++from .mdp import reach_rewards as rr
+ 
+ # ─────────────────────────────────────────────
+ #  PATHS  ← set these before running
+@@ -72,24 +73,51 @@ HEAD_CAMERA_LINK = "head_link"   # ← verify with your URDF
+ # ─────────────────────────────────────────────
+ #  CONSTANTS
+ # ─────────────────────────────────────────────
+-RAND_PCT = 0.20  # ±20%
+-
++RAND_PCT = 0.20  # +-20%
++ 
++# Seeded so the scene is reproducible across processes. train.py and play.py
++# MUST be launched with the same SCENE_SEED, otherwise you evaluate a policy
++# on a tree it never trained on.
++_SCENE_SEED = int(os.environ.get("SCENE_SEED", "12345"))
++_scene_rng = random.Random(_SCENE_SEED)
++ 
++ 
+ def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
+-    return nominal * random.uniform(1.0 - pct, 1.0 + pct)
+-
+-# ── Launch-time domain randomization (once per training run) ─────────────────
+-# Seed however you like — os.environ, cfg.seed, etc. Left un-seeded here so
+-# every process launch gets a different layout.
+-APPLE_RADIUS   = _jitter(0.04)
+-APPLE_MASS     = _jitter(0.15)
+-TREE_POS       = (_jitter(0.55), _jitter(-0.55), 0.0)
+-TREE_HEIGHT    = _jitter(1.25)
+-BRANCH_LENGTH  = _jitter(0.50)
+-BRANCH_RADIUS  = _jitter(0.04)
++    return nominal * _scene_rng.uniform(1.0 - pct, 1.0 + pct)
++ 
++ 
++APPLE_RADIUS    = _jitter(0.04)
++APPLE_MASS      = _jitter(0.15)
++TREE_POS        = (_jitter(0.55), _jitter(-0.55), 0.0)
++TREE_HEIGHT     = _jitter(1.25)
++BRANCH_LENGTH   = _jitter(0.50)
++BRANCH_RADIUS   = _jitter(0.04)
+ BRANCH_ROTATION = _jitter(110.0)
+-TREE_POS_JITTER_XY = 0.05   # metres — per-episode (x, y) translation range for the whole tree
+-APPLE_STEM_BREAK_FORCE  = _jitter(2.5)   # nominal only — real per-episode value comes from EventTerm below
++ 
++# Per-episode tree translation. Widened 0.05 -> 0.15 so the policy learns a
++# mapping from the observed apple offset instead of memorising one arm pose.
++TREE_POS_JITTER_XY = 0.15
++ 
++APPLE_STEM_BREAK_FORCE  = _jitter(2.5)
+ APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
++ 
++# Shared SceneEntityCfgs. preserve_order=True is MANDATORY on _ARM_CFG:
++# every reward that takes a per-joint weight list indexes joint_ids in the
++# order given here, and without preserve_order SceneEntityCfg silently
++# reorders them into articulation order.
++RIGHT_ARM_JOINTS = [
++    "right_shoulder_pitch_joint",
++    "right_shoulder_roll_joint",
++    "right_shoulder_yaw_joint",
++    "right_elbow_joint",
++    "right_wrist_roll_joint",
++    "right_wrist_pitch_joint",
++    "right_wrist_yaw_joint",
++]
++ 
++# Palm normal in the palm link's LOCAL frame. Run play_debug_patch.py's probe
++# and set this before you trust the orientation reward. (0,0,1) is a guess.
++PALM_NORMAL_AXIS = (0.0, 0.0, 1.0)
+ 
+ # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
+ # With fix_root_link the pelvis is fixed here in world frame.
+@@ -130,6 +158,7 @@ G1_DEX3_CFG = ArticulationCfg(
+             fix_root_link=True,          # ← fixed base; no locomotion needed
+         ),
+     ),
++    soft_joint_pos_limit_factor=0.95,   # top-level ArticulationCfg field, not articulation_props
+     init_state=ArticulationCfg.InitialStateCfg(
+         pos=(0.0, 0.0, ROBOT_ROOT_HEIGHT),
+         # Standing-like pose so the robot looks correct visually
+@@ -182,8 +211,8 @@ G1_DEX3_CFG = ArticulationCfg(
+             ],
+             effort_limit=87.0,
+             velocity_limit=2.175,
+-            stiffness=40.0,   # GearboxS kp
+-            damping=1.0,      # GearboxS kd
++            stiffness=100.0,   # was 40.0
++            damping=10.0,      # was 1.0  -> zeta ~0.85 instead of ~0.1
+         ),
+         # ── Right Dex3 hand ───────────────────────────────────────────
+         # From SDK: kp=0.5 (rotate mode), kp=1.5 (grip mode)
+@@ -402,26 +431,28 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
+ 
+ @configclass
+ class ActionsCfg:
+-    """14-dim joint position targets: right arm (7) + right Dex3 (7)."""
++    """7-dim joint position targets: right arm only (reach phase).
++
++    scale=0.5 + clip caps the commanded target at +-1.5 rad from default.
++    The previous scale=1.0 with no clip meant the raw Gaussian action sample
++    (in radians) was added directly to default_q with nothing bounding it —
++    with init_noise_std=1.0 that was +-1 rad jumps (+-3 rad in the tails) at
++    50 Hz, which is what drove joints into saturated, contorted poses.
++
++    Dex3 hand action removed: with the apple kinematic_enabled=True, the
++    contact/lift rewards are dead, so the 7 hand DOF were pure exploration
++    noise for this reach phase. Restore for grasp training:
++        right_hand: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
++            asset_name="robot", joint_names=["right_hand.*"],
++            scale=0.5, use_default_offset=True, clip={".*": (-3.0, 3.0)},
++        )
++    """
+     right_arm: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
+         asset_name="robot",
+-        joint_names=[
+-            "right_shoulder_pitch_joint",
+-            "right_shoulder_roll_joint",
+-            "right_shoulder_yaw_joint",
+-            "right_elbow_joint",
+-            "right_wrist_roll_joint",
+-            "right_wrist_pitch_joint",
+-            "right_wrist_yaw_joint",
+-        ],
+-        scale=1.0,              # scale actions; range [-1,1] → [-0.5, 0.5] rad delta
+-        use_default_offset=True,
+-    )
+-    right_hand: mdp.JointPositionActionCfg = mdp.JointPositionActionCfg(
+-        asset_name="robot",
+-        joint_names=["right_hand.*"],
+-        scale=1.0,
++        joint_names=RIGHT_ARM_JOINTS,
++        scale=0.5,
+         use_default_offset=True,
++        clip={".*": (-3.0, 3.0)},
+     )
+ 
+ 
+@@ -431,62 +462,41 @@ class ObservationsCfg:
+ 
+     @configclass
+     class PolicyObs(ObsGroup):
+-        """Proprioceptive observations for the policy (no camera)."""
++        """Proprioception for the reach phase (no camera, no hand).
++
++        apple_pos_palm and palm_orientation_torso are now both measured from
++        right_hand_palm_link, matching the body the reach/orientation rewards
++        score against — previously the reaching reward used the wrist while
++        palm_position/palm_orientation used the palm, i.e. the reward and part
++        of the observation disagreed about which body mattered.
++
++        last_action is required for the action_rate/action_jerk penalties in
++        RewardsCfg to be learnable — otherwise the policy is charged for a
++        quantity (its own previous command) that it cannot observe.
++        """
+ 
+-        # Right arm
+         right_arm_pos = ObsTerm(
+             func=task_mdp.joint_pos_selected,
+-            params={"asset_cfg": SceneEntityCfg(
+-                "robot",
+-                joint_names=[
+-                    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+-                    "right_shoulder_yaw_joint", "right_elbow_joint",
+-                    "right_wrist_roll_joint", "right_wrist_pitch_joint",
+-                    "right_wrist_yaw_joint",
+-                ],
+-            )},
++            params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS)},
+         )
+         right_arm_vel = ObsTerm(
+             func=task_mdp.joint_vel_selected,
+-            params={"asset_cfg": SceneEntityCfg(
+-                "robot",
+-                joint_names=[
+-                    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+-                    "right_shoulder_yaw_joint", "right_elbow_joint",
+-                    "right_wrist_roll_joint", "right_wrist_pitch_joint",
+-                    "right_wrist_yaw_joint",
+-                ],
+-            )},
+-        )
+-        # Right hand
+-        right_hand_pos = ObsTerm(
+-            func=task_mdp.joint_pos_selected,
+-            params={"asset_cfg": SceneEntityCfg(
+-                "robot", joint_names=["right_hand.*"]
+-            )},
+-        )
+-        right_hand_vel = ObsTerm(
+-            func=task_mdp.joint_vel_selected,
+-            params={"asset_cfg": SceneEntityCfg(
+-                "robot", joint_names=["right_hand.*"]
+-            )},
++            params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS)},
+         )
+ 
+-        # Apple position relative to right wrist — the reach-error vector.
+-        # (apple_pos_world dropped: redundant with this for a fixed-base robot.)
+-        apple_pos_wrist = ObsTerm(
++        # Reach-error vector, measured from the palm (same body the reach
++        # rewards use — see reach_rewards._palm_target_dist).
++        apple_pos_palm = ObsTerm(
+             func=task_mdp.object_pos_relative_to_body,
+             params={
+                 "object_cfg": SceneEntityCfg("apple"),
+-                "robot_cfg": SceneEntityCfg(
+-                    "robot", body_names=["right_wrist_yaw_link"]
+-                ),
++                "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+             },
+         )
+ 
+-        # Palm orientation relative to torso — same frame reward_palm_orientation
+-        # scores against, giving the policy a direct signal for that reward
+-        # instead of forcing it to infer orientation purely from joint angles.
++        # Palm orientation relative to torso — same frame reward_palm_normal_up
++        # scores against (via world-Z, but torso-relative gives the policy a
++        # richer signal than the reward alone).
+         palm_orientation_torso = ObsTerm(
+             func=task_mdp.body_quat_relative_to_body,
+             params={
+@@ -495,9 +505,11 @@ class ObservationsCfg:
+             },
+         )
+ 
+-        # NOTE: fingertip_contacts (24-dim) removed for the reach-only phase —
+-        # not needed to reach, and not yet needed until grasp/manipulation
+-        # training, where it can be re-added (see task_mdp.fingertip_contact_forces).
++        last_action = ObsTerm(func=mdp.last_action, params={"action_name": "right_arm"})
++
++        # NOTE: right_hand_pos/vel and fingertip_contacts removed with the
++        # hand action for the reach-only phase. Re-add both when grasp
++        # training starts (task_mdp.fingertip_contact_forces for the latter).
+ 
+         def __post_init__(self):
+             self.enable_corruption = False  # add noise in Phase 3
+@@ -507,75 +519,167 @@ class ObservationsCfg:
+ 
+ @configclass
+ class RewardsCfg:
+-    """Reward terms — curriculum from reach → grasp → lift → place."""
+-
+-    # ── Reach ────────────────────────────────────────────────────────────
+-    reaching = RewTerm(
+-        func=task_mdp.reward_reaching,
++    """Reach-phase reward curriculum.
++
++    Replaces the old 6-term set (reaching / contact / lift / action_penalty /
++    palm_position / palm_orientation). That set had two dead terms (contact,
++    lift — both require a dynamic apple, but AppleGraspSceneCfg.apple is
++    kinematic_enabled=True in this phase), one term that essentially never
++    fired (action_penalty = joint_vel_limits at soft_ratio 0.9, only nonzero
++    above 1.96 rad/s), and a position reward with no gradient beyond ~15 cm
++    (palm_position std=0.05 -> exp(-18) =~ 1.5e-8 at 0.3 m). Orientation was
++    the only term with a usable early gradient, and it also scored a FULL
++    quaternion target (roll/pitch/yaw all pinned), collectable from anywhere
++    in the workspace — so PPO farmed orientation and stopped exploring
++    position. That combination is why position never learned.
++    """
++
++    # ── Position: three scales, so there is gradient at every distance ───
++    reach_progress = RewTerm(
++        func=rr.reward_reach_progress,
++        weight=10.0,
++        params={
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
++            "object_cfg": SceneEntityCfg("apple"),
++            "offset_z": 0.08,
++        },
++    )
++    reach_residual = RewTerm(
++        func=rr.penalty_reach_residual,
++        weight=-0.5,
++        params={
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
++            "object_cfg": SceneEntityCfg("apple"),
++            "offset_z": 0.08,
++        },
++    )
++    reach_coarse = RewTerm(
++        func=rr.reward_reach_gaussian,
+         weight=1.0,
+         params={
+-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_wrist_yaw_link"]),
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
++            "object_cfg": SceneEntityCfg("apple"),
++            "offset_z": 0.08,
++            "std": 0.25,
++        },
++    )
++    reach_fine = RewTerm(
++        func=rr.reward_reach_gaussian,
++        weight=4.0,
++        params={
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+             "object_cfg": SceneEntityCfg("apple"),
+-            "std": 0.15,
++            "offset_z": 0.08,
++            "std": 0.04,
+         },
+     )
+ 
+-    # ── Contact: reward having fingertips touch the apple ─────────────────
+-    contact = RewTerm(
+-        func=task_mdp.reward_fingertip_contact,
+-        weight=2.0,
++    # ── Orientation: palm normal -> world up, yaw and roll of the palm
++    #    around that normal are left FREE (per your spec: fingers can point
++    #    at the horizon or follow the arm's own z-rotation). Gated to zero
++    #    beyond 25 cm so it cannot be farmed from anywhere in the workspace.
++    palm_up = RewTerm(
++        func=rr.reward_palm_normal_up,
++        weight=1.5,
+         params={
+-            "sensor_cfg": SceneEntityCfg("contact_forces"),
+-            "threshold": 0.1,  # N
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
++            "object_cfg": SceneEntityCfg("apple"),
++            "palm_normal_axis": PALM_NORMAL_AXIS,   # verify with play_debug_patch probe
++            "std_rad": 0.5,      # ~29 deg basin
++            "gate_dist": 0.25,   # metres
++            "offset_z": 0.08,
+         },
+     )
+ 
+-    # ── Lift: reward apple height above ITS per-episode spawn height ───────
+-    # Note: with the apple kinematic (reach-only phase, see AppleGraspSceneCfg
+-    # .apple), it physically cannot move, so this correctly stays at 0 for
+-    # now — it becomes meaningful again once the apple is a real dynamic body
+-    # for grasp/lift training.
+-    lift = RewTerm(
+-        func=task_mdp.reward_lift,
+-        weight=5.0,
++    # ── Reason to stop moving once at the target ──────────────────────────
++    hold = RewTerm(
++        func=rr.reward_reach_hold,
++        weight=3.0,
+         params={
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+             "object_cfg": SceneEntityCfg("apple"),
+-            "lift_height": 0.10,  # 10 cm lift
++            "pos_tol": 0.04,
++            "ori_tol_rad": 0.30,
++            "offset_z": 0.08,
++            "palm_normal_axis": PALM_NORMAL_AXIS,
+         },
+     )
+ 
+-    # ── Action penalty: discourage large jerky actions ────────────────────
+-    action_penalty = RewTerm(
+-        func=mdp.joint_vel_limits,
+-        weight=-0.01,
+-        params={"asset_cfg": SceneEntityCfg("robot"), "soft_ratio": 0.9},
++    # ── g1_arm_env's R_success (its largest term by far, 700 vs O(1-40)
++    #    elsewhere) — one-time bonus paired with the reach_success termination
++    #    in TerminationsCfg below (same pos_tol/ori_tol_rad/hold_time there).
++    #    hold_time=0.5s at 50 Hz control = 25 steps, so a policy sitting in the
++    #    hold neighbourhood the whole time earns 25*3.0=75 from `hold` alone
++    #    before this fires — weight=75.0 roughly doubles that on success,
++    #    mirroring g1_arm_env's ratio. Tune from the training curve.
++    reach_success_bonus = RewTerm(
++        func=rr.reward_reach_success,
++        weight=75.0,
+     )
+ 
+-    # Reaching the apple pos
+-    palm_position = RewTerm(
+-        func=task_mdp.reward_palm_below_apple,
+-        weight=1.5,
++    # ── Smoothness / anti-vibration ───────────────────────────────────────
++    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.15)
++    action_jerk = RewTerm(func=rr.penalty_action_jerk, weight=-0.05)
++    arm_vel = RewTerm(
++        func=mdp.joint_vel_l2,
++        weight=-0.002,
++        params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
++                                            preserve_order=True)},
++    )
++    brake = RewTerm(
++        func=rr.penalty_near_goal_velocity,
++        weight=-0.02,
+         params={
++            "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
++                                        preserve_order=True),
+             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+             "object_cfg": SceneEntityCfg("apple"),
++            "brake_dist": 0.15,
+             "offset_z": 0.08,
+-            "std": 0.05,
+         },
+     )
+ 
+-    palm_orientation = RewTerm(
+-        func=task_mdp.reward_palm_orientation,
+-        weight=1.0,
++    # ── Posture ─────────────────────────────────────────────────────────
++    # Sign-agnostic pull toward home on shoulders + elbow, wrists free —
++    # discourages both "elbow to the sky" and "shoulder rolled across the
++    # chest" without needing to know which sign of which joint produces
++    # them. Weights lifted from g1_arm_policies/config_right.yaml's
++    # excursion_weights.
++    home_excursion = RewTerm(
++        func=rr.penalty_joint_deviation_weighted,
++        weight=-0.05,
+         params={
+-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+-            "torso_cfg": SceneEntityCfg("robot", body_names=["torso_link"]),
+-            "target_roll_deg": 90.0,   # confirm with orient_tune.py first
+-            "target_pitch_deg": 0.0,
+-            "target_yaw_deg": 0.0,
+-            "std_rad": 0.3,
++            "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
++                                        preserve_order=True),
++            "weights": [1.0, 1.0, 0.5, 1.0, 0.0, 0.0, 0.0],
++        },
++    )
++
++    # DISABLED (weight=0.0) until you have read the bad pose off
++    # play_debug_patch.py's readout and know which joint to box in. Then set
++    # the offending entry in `upper` (or `lower`) just inside the angle you
++    # want to forbid and raise weight to about -2.0. Joint order:
++    #   [shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
++    #    wrist_roll, wrist_pitch, wrist_yaw]
++    # Current bounds are just the hardware soft limits (no-op).
++    posture_box = RewTerm(
++        func=rr.penalty_joint_range_box,
++        weight=0.0,
++        params={
++            "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
++                                        preserve_order=True),
++            "lower": [-3.09, -2.25, -2.62, -1.05, -1.97, -1.61, -1.61],
++            "upper": [ 2.67,  1.59,  2.62,  2.09,  1.97,  1.61,  1.61],
+         },
+     )
+ 
++    joint_limits = RewTerm(
++        func=mdp.joint_pos_limits,
++        weight=-1.0,
++        params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS,
++                                            preserve_order=True)},
++    )
++
+ 
+ @configclass
+ class TerminationsCfg:
+@@ -593,8 +697,27 @@ class TerminationsCfg:
+         },
+     )
+ 
+-    # (Phase 2+) Success: apple lifted and held
+-    # Uncomment after grasp is working:
++    # Reach success: palm held in the success neighbourhood for hold_time.
++    # Params MUST match reach_rewards.reward_reach_success's RewardsCfg entry
++    # (reach_success_bonus below) — same pos_tol/ori_tol_rad/offset_z/
++    # palm_normal_axis/hold_time — since that reward reads the bool this
++    # termination caches on env._reach_success rather than recomputing it.
++    # (apple_lifted_success below is unrelated — a grasp/lift-phase criterion,
++    # kept for later, not currently wired to anything.)
++    reach_success = DoneTerm(
++        func=task_mdp.reach_success,
++        params={
++            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
++            "object_cfg": SceneEntityCfg("apple"),
++            "pos_tol": 0.04,
++            "ori_tol_rad": 0.30,
++            "offset_z": 0.08,
++            "palm_normal_axis": PALM_NORMAL_AXIS,
++            "hold_time": 0.5,
++        },
++    )
++
++    # (Phase 2+) Success: apple lifted and held — grasp/lift phase, unused now.
+     # success = DoneTerm(
+     #     func=task_mdp.apple_lifted_success,
+     #     params={"object_cfg": SceneEntityCfg("apple"),
+@@ -604,28 +727,49 @@ class TerminationsCfg:
+ 
+ @configclass
+ class EventsCfg:
+-    # Reset robot to default joint positions (with small noise)
+-    reset_robot = EventTerm(
++    """Event terms run in DECLARATION ORDER within a mode.
++
++    Split from the old single reset_robot term into two, both mode="reset":
++      1. reset_all_exact  — every joint (legs/waist/left-arm/right-arm/hand)
++         to EXACT default, EXACT zero velocity. Runs first.
++      2. reset_arm_jitter — then scatter ONLY the trained right arm by
++         +-0.20 rad (was +-0.05 on ALL joints, and velocity noise was
++         +-0.01 instead of exactly 0).
++
++    The old single term was not actually the source of the "arm always
++    collapses into the same bad pose" symptom — reset_joints_by_offset with
++    no joint_names DOES write every joint back to default+-0.05 every
++    episode. That pose is a LEARNED ATTRACTOR: the policy slams to the same
++    saturated command within a few hundred ms of every episode start,
++    because it never had to learn otherwise (see the reward rewrite above).
++    Verify this with play_debug_patch.py's reset printout rather than
++    trusting the comment — expect q ~= default +-0.20 rad and |dq| < 0.05
++    immediately after every reset.
++
++    The wider +-0.20 rad start scatter (vs the old +-0.05) also matters on
++    its own: a narrow start distribution let the policy memorise one
++    trajectory from one starting state instead of learning a mapping.
++    """
++
++    reset_all_exact = EventTerm(
+         func=mdp.reset_joints_by_offset,
+         mode="reset",
+         params={
+             "asset_cfg": SceneEntityCfg("robot"),
+-            "position_range": (-0.05, 0.05),   # ±0.05 rad noise
+-            "velocity_range": (-0.01, 0.01),
++            "position_range": (0.0, 0.0),
++            "velocity_range": (0.0, 0.0),
+         },
+     )
+ 
+-    """reset_apple = EventTerm(
+-        func=task_mdp.reset_apple_pose,
++    reset_arm_jitter = EventTerm(
++        func=mdp.reset_joints_by_offset,
+         mode="reset",
+         params={
+-            "object_cfg": SceneEntityCfg("apple"),
+-            "pos_range_x": (-0.06, 0.06),
+-            "pos_range_y": (-0.06, 0.06),
+-            "pos_range_z": (-0.03, 0.03),
+-            "base_pos": APPLE_INIT_POS,
++            "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS),
++            "position_range": (-0.20, 0.20),
++            "velocity_range": (0.0, 0.0),
+         },
+-    )"""
++    )
+ 
+     # ── Fixed once per env, at prestartup (before sim.reset() creates the GPU
+     #    tensor views — raw USD collider resizes are illegal after that point) ──
+@@ -691,7 +835,8 @@ class AppleGraspEnvCfg(ManagerBasedRLEnvCfg):
+     """Phase 1-3 env: proprioception only, no camera."""
+ 
+     scene: AppleGraspSceneCfg = AppleGraspSceneCfg(
+-        num_envs=32,        # safe for RTX 4060 (8 GB)
++        num_envs=64,        # was 32 — measured <3 GB at 32, 64 is safe on
++                            # an 8 GB 4060 and roughly halves wall clock.
+         env_spacing=2.5,    # metres between env origins
+     )
+     observations: ObservationsCfg = ObservationsCfg()
+@@ -703,7 +848,8 @@ class AppleGraspEnvCfg(ManagerBasedRLEnvCfg):
+     def __post_init__(self):
+         self.sim.dt = 0.005          # 200 Hz physics
+         self.decimation = 4          # 50 Hz policy (200 / 4)
+-        self.episode_length_s = 10.0 # 10-second episodes
++        self.episode_length_s = 5.0  # was 10.0 — reach ~1.5s + hold ~2s is
++                                      # plenty; halving doubles episodes/hour
+         self.sim.render_interval = self.decimation
+ 
+         # Disable camera scene asset in Phase 1 (saves VRAM)
+@@ -727,9 +873,23 @@ class AppleGraspEnvCfg_PLAY(AppleGraspEnvCfg):
+         super().__post_init__()
+         self.scene.num_envs = 1
+         self.scene.env_spacing = 2.5
+-        # No randomisation during play
+-        self.events.reset_apple = None
+-        self.events.reset_robot = None
++        # No randomisation during play. reset_robot was split into
++        # reset_all_exact + reset_arm_jitter in EventsCfg above (see block 7
++        # notes) — disable both here, same as the old single reset_robot=None.
++        # reset_apple was already dead (never an assigned EventTerm, just an
++        # inert triple-quoted string in EventsCfg), removed rather than kept
++        # as a no-op assignment.
++        #
++        # NOTE: with both reset terms off AND episode_length_s forced to
++        # 1e6 below, `dones` essentially never fires in play mode (apple is
++        # kinematic so apple_dropped can't trigger either) — so
++        # play_debug_patch.py's reset-verification block ("RESET -> q=...")
++        # will not print here. To actually exercise and verify the reset
++        # path, run play.py against AppleGraspEnvCfg (or AppleGrasp-v0)
++        # instead of the -Play variant, or temporarily comment out these two
++        # lines.
++        self.events.reset_all_exact = None
++        self.events.reset_arm_jitter = None
+ 
+         # AppleGraspEnvCfg.__post_init__ sets episode_length_s = 10.0, meant for
+         # short RL training rollouts. run_env.py (the interactive viewer used with
+diff --git a/envs/mdp/__init__.py b/envs/mdp/__init__.py
+index 2c27c88..a6fcd20 100644
+--- a/envs/mdp/__init__.py
++++ b/envs/mdp/__init__.py
+@@ -2,11 +2,22 @@
+ """
+ Task-specific MDP functions.
+ 
++Save as:  envs/mdp/__init__.py   (complete replacement)
++
+ Import everything here so env_cfg can do:
+     from . import mdp as task_mdp
+     task_mdp.joint_pos_selected(...)
++
++Reach-phase reward terms live in reach_rewards.py and are imported as a
++module rather than flattened into this namespace, so the env cfg can do:
++    from .mdp import reach_rewards as rr
++    rr.reward_reach_progress(...)
++That keeps the new reach terms visibly separate from the grasp/lift/place
++terms in rewards.py, which are unchanged.
+ """
+ 
++from . import reach_rewards
++
+ from .observations import (
+     joint_pos_selected,
+     joint_vel_selected,
+@@ -28,14 +39,15 @@ from .rewards import (
+     reward_place,
+     penalty_joint_limits,
+     penalty_action_rate,
+-    reward_palm_below_apple,     
+-    reward_palm_orientation, 
++    reward_palm_below_apple,
++    reward_palm_orientation,
+ )
+ 
+ from .terminations_and_events import (
+     apple_dropped,
+     apple_lifted_success,
+     apple_placed_success,
++    reach_success,
+     reset_apple_pose,
+ )
+ 
+diff --git a/envs/mdp/__pycache__/__init__.cpython-310.pyc b/envs/mdp/__pycache__/__init__.cpython-310.pyc
+index 5f475b7..e321d2b 100644
+Binary files a/envs/mdp/__pycache__/__init__.cpython-310.pyc and b/envs/mdp/__pycache__/__init__.cpython-310.pyc differ
+diff --git a/envs/mdp/__pycache__/terminations_and_events.cpython-310.pyc b/envs/mdp/__pycache__/terminations_and_events.cpython-310.pyc
+index 8f94f40..d6815f8 100644
+Binary files a/envs/mdp/__pycache__/terminations_and_events.cpython-310.pyc and b/envs/mdp/__pycache__/terminations_and_events.cpython-310.pyc differ
+diff --git a/envs/mdp/terminations_and_events.py b/envs/mdp/terminations_and_events.py
+index 61c87c3..3bf84b5 100644
+--- a/envs/mdp/terminations_and_events.py
++++ b/envs/mdp/terminations_and_events.py
+@@ -58,6 +58,56 @@ def apple_lifted_success(
+     return env._hold_counter >= hold_steps
+ 
+ 
++def reach_success(
++    env: ManagerBasedRLEnv,
++    robot_cfg: SceneEntityCfg,
++    object_cfg: SceneEntityCfg,
++    pos_tol: float = 0.04,
++    ori_tol_rad: float = 0.30,
++    offset_z: float = 0.08,
++    palm_normal_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
++    hold_time: float = 0.5,
++) -> torch.Tensor:
++    """Terminate once the palm has held within [pos_tol, ori_tol_rad] of the
++    grasp point for `hold_time` continuous seconds — the same neighbourhood
++    check as reach_rewards.reward_reach_hold's per-step bonus, counted here
++    toward a one-time terminal success instead. Mirrors g1_arm_env's
++    hold-to-succeed / R_success design (config_right.yaml: hold.time=0.5,
++    R_success=700).
++
++    IsaacLab computes terminations BEFORE rewards each step (see
++    ManagerBasedRLEnv.step: termination_manager.compute() then
++    reward_manager.compute()), so this caches the result on env._reach_success
++    for reach_rewards.reward_reach_success to read the same step it fires —
++    that reward function must NOT recompute the check itself, or a policy
++    could see the bonus without this termination also firing (or vice versa).
++
++    Shape: [num_envs]  bool
++    """
++    from .reach_rewards import _palm_target_dist, _palm_normal_angle
++
++    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z)
++    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
++    in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
++
++    if not hasattr(env, "_reach_hold_counter") or env._reach_hold_counter.shape != d.shape:
++        env._reach_hold_counter = torch.zeros_like(d)
++
++    # Episode boundary: don't carry a stale count into a fresh episode.
++    env._reach_hold_counter = torch.where(
++        env.episode_length_buf <= 1, torch.zeros_like(env._reach_hold_counter), env._reach_hold_counter
++    )
++    env._reach_hold_counter = torch.where(
++        in_neighbourhood, env._reach_hold_counter + 1, torch.zeros_like(env._reach_hold_counter)
++    )
++
++    hold_steps_required = max(1, round(hold_time / env.step_dt))
++    success = env._reach_hold_counter >= hold_steps_required
++
++    env._reach_success = success   # read by reach_rewards.reward_reach_success
++    return success
++
++
+ def apple_placed_success(
+     env: ManagerBasedRLEnv,
+     object_cfg: SceneEntityCfg,
+diff --git a/scripts/__pycache__/calibrate_reach_apple_curobo.cpython-312.pyc b/scripts/__pycache__/calibrate_reach_apple_curobo.cpython-312.pyc
+index f3e08ff..90f2330 100644
+Binary files a/scripts/__pycache__/calibrate_reach_apple_curobo.cpython-312.pyc and b/scripts/__pycache__/calibrate_reach_apple_curobo.cpython-312.pyc differ
+diff --git a/scripts/__pycache__/reach_apple_curobo.cpython-312.pyc b/scripts/__pycache__/reach_apple_curobo.cpython-312.pyc
+index a566a25..173a0fa 100644
+Binary files a/scripts/__pycache__/reach_apple_curobo.cpython-312.pyc and b/scripts/__pycache__/reach_apple_curobo.cpython-312.pyc differ
+diff --git a/scripts/calibrate_reach_apple_curobo.py b/scripts/calibrate_reach_apple_curobo.py
+index 8e40cb4..6ac81c3 100644
+--- a/scripts/calibrate_reach_apple_curobo.py
++++ b/scripts/calibrate_reach_apple_curobo.py
+@@ -332,7 +332,11 @@ def main():
+         result = motion_gen.plan_single(
+             start_state=start_state,
+             goal_pose=goal_pose,
+-            plan_config=MotionGenPlanConfig(enable_finetune_trajopt=False, max_attempts=10, num_trajopt_seeds=12),
++            # See reach_apple_curobo.py's comment on this: enable_finetune_trajopt=False
++            # is only guaranteed collision-free/within-limits, NOT guaranteed to actually
++            # hit the goal pose — exactly the huge position/orientation error you'd be
++            # calibrating (i.e. curve-fitting) against otherwise.
++            plan_config=MotionGenPlanConfig(enable_finetune_trajopt=True, max_attempts=10, num_trajopt_seeds=12),
+         )
+         if not result.success.item():
+             print(f"  ❌ planning failed ({result.status}) — skipping point")
+diff --git a/scripts/calibration_results.json b/scripts/calibration_results.json
+index 9fd2bf0..959d5e2 100644
+--- a/scripts/calibration_results.json
++++ b/scripts/calibration_results.json
+@@ -2,92 +2,92 @@
+   "summary": {
+     "n_points": 10,
+     "n_success": 1,
+-    "pos_error_mean_m": 0.5365387797355652,
++    "pos_error_mean_m": 0.19749082624912262,
+     "pos_error_std_m": 0.0,
+-    "pos_error_max_m": 0.5365387797355652,
+-    "orient_error_mean_deg": 91.81941463520782,
++    "pos_error_max_m": 0.19749082624912262,
++    "orient_error_mean_deg": 115.32669228653312,
+     "orient_error_std_deg": 0.0,
+-    "orient_error_max_deg": 91.81941463520782,
++    "orient_error_max_deg": 115.32669228653312,
+     "mean_bias_pos_local_m": [
+-      -0.524979829788208,
+-      -0.03057602047920227,
+-      0.10646659135818481
++      -0.03550564497709274,
++      -0.023298896849155426,
++      0.19287078082561493
+     ],
+     "mean_bias_rot_local_rotvec": [
+-      0.2294870913028717,
+-      0.416086882352829,
+-      1.5304827690124512
++      0.2882116734981537,
++      -0.9991254210472107,
++      1.7234179973602295
+     ]
+   },
+   "points": [
+     {
+       "index": 0,
++      "success": false,
++      "status": "MotionGenStatus.IK_FAIL"
++    },
++    {
++      "index": 1,
++      "success": false,
++      "status": "MotionGenStatus.IK_FAIL"
++    },
++    {
++      "index": 2,
++      "success": false,
++      "status": "MotionGenStatus.IK_FAIL"
++    },
++    {
++      "index": 3,
+       "success": true,
+       "goal_pos_local": [
+-        0.35697126388549805,
+-        -0.216379314661026,
+-        0.4050312042236328
++        0.07622465491294861,
++        -0.11443125456571579,
++        -0.0004008763353340328
+       ],
+       "goal_quat_local": [
+-        0.7054760456085205,
+-        0.7003106474876404,
+-        -0.09780102968215942,
+-        0.04799467325210571
++        0.6952948570251465,
++        0.6980686783790588,
++        -0.11269505321979523,
++        0.12870533764362335
+       ],
+       "actual_pos_local": [
+-        -0.16800858080387115,
+-        -0.24695533514022827,
+-        0.5114977955818176
++        0.040719009935855865,
++        -0.13773015141487122,
++        0.19246990978717804
+       ],
+       "actual_quat_local": [
+-        0.40415143966674805,
+-        0.4837941527366638,
+-        -0.4119257926940918,
+-        0.6579680442810059
++        0.14708064496517181,
++        0.42996159195899963,
++        -0.8413219451904297,
++        0.292707622051239
+       ],
+       "goal_pos_world": [
+-        0.39038655161857605,
+-        -0.2152700573205948,
+-        1.2063853740692139
++        0.0695263147354126,
++        -0.11571159958839417,
++        0.8271868228912354
+       ],
+       "actual_pos_world": [
+-        -0.12188649922609329,
+-        -0.2453761100769043,
+-        1.363049864768982
++        0.051951829344034195,
++        -0.14236649870872498,
++        1.0220798254013062
+       ],
+       "actual_quat_world": [
+-        0.4243292808532715,
+-        0.5143415927886963,
+-        -0.3909924030303955,
+-        0.6344465017318726
++        0.18538253009319305,
++        0.4365764558315277,
++        -0.8404335975646973,
++        0.26211756467819214
+       ],
+       "pos_error_vec_local": [
+-        -0.524979829788208,
+-        -0.03057602047920227,
+-        0.10646659135818481
++        -0.03550564497709274,
++        -0.023298896849155426,
++        0.19287078082561493
+       ],
+-      "pos_error_m": 0.5365387797355652,
++      "pos_error_m": 0.19749082624912262,
+       "orient_error_rotvec_local": [
+-        0.2294870913028717,
+-        0.416086882352829,
+-        1.5304827690124512
++        0.2882116734981537,
++        -0.9991254210472107,
++        1.7234179973602295
+       ],
+-      "orient_error_deg": 91.81941463520782
+-    },
+-    {
+-      "index": 1,
+-      "success": false,
+-      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+-    },
+-    {
+-      "index": 2,
+-      "success": false,
+-      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
+-    },
+-    {
+-      "index": 3,
+-      "success": false,
+-      "status": "MotionGenStatus.INVALID_START_STATE_JOINT_LIMITS"
++      "orient_error_deg": 115.32669228653312
+     },
+     {
+       "index": 4,
+diff --git a/scripts/play.py b/scripts/play.py
+index 7c99451..e132786 100644
+--- a/scripts/play.py
++++ b/scripts/play.py
+@@ -186,6 +186,69 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     # reset environment
+     obs = env.get_observations()
+     timestep = 0
++
++    # ─────────────────────────────────────────────────────────────────────
++    #  DIAGNOSTICS — palm-axis probe, per-episode pose readout, reset check
++    #
++    #  (A) prints the local X/Y/Z axes of right_hand_palm_link in world
++    #      coordinates for the CURRENT pose, so you can read off which local
++    #      axis is the palm normal and set PALM_NORMAL_AXIS in
++    #      apple_grasp_env_cfg.py accordingly (whichever axis has world-Z
++    #      component nearest +1 in a palm-up pose; negate if nearest -1).
++    #  (B) every 2s, prints the 7 arm joint angles + palm-to-target distance,
++    #      so you can read the collapsed/bad pose off a live checkpoint and
++    #      fill in RewardsCfg.posture_box's lower/upper bounds.
++    #  (C) on every episode reset, prints q and |dq| right after the reset —
++    #      expect q ~= default +-0.20 rad, |dq| < 0.05. Anything else means
++    #      the problem is in default_joint_pos, not in the reset event.
++    #
++    #  NOTE: AppleGraspEnvCfg_PLAY disables both reset event terms and sets
++    #  episode_length_s = 1e6, so `dones` will essentially never fire here
++    #  and (C) will not print. To exercise the reset path, run this script
++    #  against AppleGrasp-v0 (the non-Play task) instead, or temporarily
++    #  re-enable the reset events in AppleGraspEnvCfg_PLAY.__post_init__.
++    # ─────────────────────────────────────────────────────────────────────
++    from isaaclab.utils.math import matrix_from_quat as _mfq
++
++    _ARM_NAMES = [
++        "right_shoulder_pitch_joint",
++        "right_shoulder_roll_joint",
++        "right_shoulder_yaw_joint",
++        "right_elbow_joint",
++        "right_wrist_roll_joint",
++        "right_wrist_pitch_joint",
++        "right_wrist_yaw_joint",
++    ]
++    _robot = env.unwrapped.scene["robot"]
++    _apple = env.unwrapped.scene["apple"]
++    _jids = [_robot.data.joint_names.index(n) for n in _ARM_NAMES]
++    _palm_bid = _robot.data.body_names.index("right_hand_palm_link")
++
++    def _fmt(v):
++        return [round(float(x), 3) for x in v]
++
++    def _probe_palm_axes():
++        q = _robot.data.body_quat_w[0:1, _palm_bid, :]
++        R = _mfq(q)[0]  # [3,3], columns are local X/Y/Z axes in world frame
++        print("\n─── PALM AXIS PROBE (local axis -> world vector) ───")
++        for name, i in (("local X", 0), ("local Y", 1), ("local Z", 2)):
++            ax = R[:, i]
++            print(f"  {name} -> world {_fmt(ax)}    (world-Z component = {float(ax[2]): .3f})")
++        print("  Pick the axis whose world-Z component is nearest +1 in a")
++        print("  palm-up pose; negate it if it is nearest -1.")
++        print("────────────────────────────────────────────────────\n")
++
++    _probe_palm_axes()
++    print("default arm q :", _fmt(_robot.data.default_joint_pos[0, _jids]))
++    print("apple world   :", _fmt(_apple.data.root_pos_w[0]))
++    print("palm  world   :", _fmt(_robot.data.body_pos_w[0, _palm_bid]))
++    print("SANITY: apple z should match TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS")
++    print("        from params/env.yaml of the run you are loading. If it does")
++    print("        NOT, train.py and this script rolled different scene")
++    print("        layouts (check SCENE_SEED is set the same for both).\n")
++
++    _step_i = 0
++
+     # simulate environment
+     while simulation_app.is_running():
+         start_time = time.time()
+@@ -197,6 +260,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+             obs, _, dones, _ = env.step(actions)
+             # reset recurrent states for episodes that have terminated
+             policy_nn.reset(dones)
++
++            _step_i += 1
++
++            # (B) periodic pose / distance readout
++            if _step_i % 100 == 0:
++                _q = _robot.data.joint_pos[0, _jids]
++                _dq = _robot.data.joint_vel[0, _jids]
++                _palm = _robot.data.body_pos_w[0, _palm_bid]
++                _tgt = _apple.data.root_pos_w[0].clone()
++                _tgt[2] -= 0.08
++                _d = float(torch.norm(_tgt - _palm))
++
++                _Rp = _mfq(_robot.data.body_quat_w[0:1, _palm_bid, :])[0]
++                # change the column index below (0/1/2) to match your
++                # PALM_NORMAL_AXIS once the probe above tells you which one it is
++                _up = float(_Rp[:, 2][2])
++
++                print(f"[{_step_i:5d}] d={_d*100:6.1f} cm  palm_up_cos={_up:+.2f}  "
++                      f"|dq|={float(torch.norm(_dq)):5.2f}")
++                print(f"         q  = {_fmt(_q)}")
++                print(f"         dq = {_fmt(_dq)}")
++
++            # (C) reset verification
++            if dones.any():
++                _q = _robot.data.joint_pos[0, _jids]
++                _dq = _robot.data.joint_vel[0, _jids]
++                print(f"  RESET -> q={_fmt(_q)}  |dq|={float(torch.norm(_dq)):.4f}")
++
+         if args_cli.video:
+             timestep += 1
+             # Exit the play loop after recording one video
+@@ -216,4 +307,4 @@ if __name__ == "__main__":
+     # run the main function
+     main()
+     # close sim app
+-    simulation_app.close()
++    simulation_app.close()
+\ No newline at end of file
+diff --git a/scripts/reach_apple_curobo.py b/scripts/reach_apple_curobo.py
+index 4d93863..e763c54 100644
+--- a/scripts/reach_apple_curobo.py
++++ b/scripts/reach_apple_curobo.py
+@@ -349,7 +349,12 @@ def main():
+     result = motion_gen.plan_single(
+         start_state=start_state,
+         goal_pose=goal_pose,
+-        plan_config=MotionGenPlanConfig(enable_finetune_trajopt=False, max_attempts=10, num_trajopt_seeds=12),
++        # enable_finetune_trajopt defaults to True in cuRobo for a reason — its own
++        # docstring warns that with it off, the plan is only guaranteed collision-free
++        # and within joint limits, NOT guaranteed to actually hit the goal pose. That
++        # was silently producing "successful" plans hundreds of mm / tens of degrees
++        # off target.
++        plan_config=MotionGenPlanConfig(enable_finetune_trajopt=True, max_attempts=10, num_trajopt_seeds=12),
+     )
+ 
+     if not result.success.item():
+diff --git a/scripts/reach_apple_ik.py b/scripts/reach_apple_ik.py
+index 7a2e246..dd3bb16 100644
+--- a/scripts/reach_apple_ik.py
++++ b/scripts/reach_apple_ik.py
+@@ -207,11 +207,11 @@ APPROACH_Z_OFFSET = -APPLE_RADIUS * 3.0  # goal sits below the apple centre, cup
+ 
+ # Same palm orientation convention as reach_apple_curobo.py.
+ ROLL_DEG, PITCH_DEG, YAW_DEG = 90.0, 0.0, 0.0
+-ROTATION_THRESHOLD = 0.15   # rad — looser than MotionGen's: a single IK solve
++ROTATION_THRESHOLD = 0.25   # rad — looser than MotionGen's: a single IK solve
+                              # doesn't need to discriminate between whole arm
+                              # branches the way a trajectory does, so this can
+                              # relax a bit. Tighten if the palm angle matters.
+-POSITION_THRESHOLD = 0.005  # 5 mm
++POSITION_THRESHOLD = 0.05  # 5 cm
+ 
+ # Both OFF by default for max speed, per your "no collision aware" ask. Flip
+ # either on later if the solved pose needs to dodge the apple/torso/tree.

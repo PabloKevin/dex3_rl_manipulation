@@ -186,6 +186,69 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  DIAGNOSTICS — palm-axis probe, per-episode pose readout, reset check
+    #
+    #  (A) prints the local X/Y/Z axes of right_hand_palm_link in world
+    #      coordinates for the CURRENT pose, so you can read off which local
+    #      axis is the palm normal and set PALM_NORMAL_AXIS in
+    #      apple_grasp_env_cfg.py accordingly (whichever axis has world-Z
+    #      component nearest +1 in a palm-up pose; negate if nearest -1).
+    #  (B) every 2s, prints the 7 arm joint angles + palm-to-target distance,
+    #      so you can read the collapsed/bad pose off a live checkpoint and
+    #      fill in RewardsCfg.posture_box's lower/upper bounds.
+    #  (C) on every episode reset, prints q and |dq| right after the reset —
+    #      expect q ~= default +-0.20 rad, |dq| < 0.05. Anything else means
+    #      the problem is in default_joint_pos, not in the reset event.
+    #
+    #  NOTE: AppleGraspEnvCfg_PLAY disables both reset event terms and sets
+    #  episode_length_s = 1e6, so `dones` will essentially never fire here
+    #  and (C) will not print. To exercise the reset path, run this script
+    #  against AppleGrasp-v0 (the non-Play task) instead, or temporarily
+    #  re-enable the reset events in AppleGraspEnvCfg_PLAY.__post_init__.
+    # ─────────────────────────────────────────────────────────────────────
+    from isaaclab.utils.math import matrix_from_quat as _mfq
+
+    _ARM_NAMES = [
+        "right_shoulder_pitch_joint",
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_wrist_yaw_joint",
+    ]
+    _robot = env.unwrapped.scene["robot"]
+    _apple = env.unwrapped.scene["apple"]
+    _jids = [_robot.data.joint_names.index(n) for n in _ARM_NAMES]
+    _palm_bid = _robot.data.body_names.index("right_hand_palm_link")
+
+    def _fmt(v):
+        return [round(float(x), 3) for x in v]
+
+    def _probe_palm_axes():
+        q = _robot.data.body_quat_w[0:1, _palm_bid, :]
+        R = _mfq(q)[0]  # [3,3], columns are local X/Y/Z axes in world frame
+        print("\n─── PALM AXIS PROBE (local axis -> world vector) ───")
+        for name, i in (("local X", 0), ("local Y", 1), ("local Z", 2)):
+            ax = R[:, i]
+            print(f"  {name} -> world {_fmt(ax)}    (world-Z component = {float(ax[2]): .3f})")
+        print("  Pick the axis whose world-Z component is nearest +1 in a")
+        print("  palm-up pose; negate it if it is nearest -1.")
+        print("────────────────────────────────────────────────────\n")
+
+    _probe_palm_axes()
+    print("default arm q :", _fmt(_robot.data.default_joint_pos[0, _jids]))
+    print("apple world   :", _fmt(_apple.data.root_pos_w[0]))
+    print("palm  world   :", _fmt(_robot.data.body_pos_w[0, _palm_bid]))
+    print("SANITY: apple z should match TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS")
+    print("        from params/env.yaml of the run you are loading. If it does")
+    print("        NOT, train.py and this script rolled different scene")
+    print("        layouts (check SCENE_SEED is set the same for both).\n")
+
+    _step_i = 0
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -197,6 +260,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+
+            _step_i += 1
+
+            # (B) periodic pose / distance readout
+            if _step_i % 100 == 0:
+                _q = _robot.data.joint_pos[0, _jids]
+                _dq = _robot.data.joint_vel[0, _jids]
+                _palm = _robot.data.body_pos_w[0, _palm_bid]
+                _tgt = _apple.data.root_pos_w[0].clone()
+                _tgt[2] -= 0.08
+                _d = float(torch.norm(_tgt - _palm))
+
+                _Rp = _mfq(_robot.data.body_quat_w[0:1, _palm_bid, :])[0]
+                # change the column index below (0/1/2) to match your
+                # PALM_NORMAL_AXIS once the probe above tells you which one it is
+                _up = float(_Rp[:, 2][2])
+
+                print(f"[{_step_i:5d}] d={_d*100:6.1f} cm  palm_up_cos={_up:+.2f}  "
+                      f"|dq|={float(torch.norm(_dq)):5.2f}")
+                print(f"         q  = {_fmt(_q)}")
+                print(f"         dq = {_fmt(_dq)}")
+
+            # (C) reset verification
+            if dones.any():
+                _q = _robot.data.joint_pos[0, _jids]
+                _dq = _robot.data.joint_vel[0, _jids]
+                print(f"  RESET -> q={_fmt(_q)}  |dq|={float(torch.norm(_dq)):.4f}")
+
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

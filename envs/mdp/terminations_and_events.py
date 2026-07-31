@@ -58,6 +58,56 @@ def apple_lifted_success(
     return env._hold_counter >= hold_steps
 
 
+def reach_success(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    pos_tol: float = 0.04,
+    ori_tol_rad: float = 0.30,
+    offset_z: float = 0.08,
+    palm_normal_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    hold_time: float = 0.5,
+) -> torch.Tensor:
+    """Terminate once the palm has held within [pos_tol, ori_tol_rad] of the
+    grasp point for `hold_time` continuous seconds — the same neighbourhood
+    check as reach_rewards.reward_reach_hold's per-step bonus, counted here
+    toward a one-time terminal success instead. Mirrors g1_arm_env's
+    hold-to-succeed / R_success design (config_right.yaml: hold.time=0.5,
+    R_success=700).
+
+    IsaacLab computes terminations BEFORE rewards each step (see
+    ManagerBasedRLEnv.step: termination_manager.compute() then
+    reward_manager.compute()), so this caches the result on env._reach_success
+    for reach_rewards.reward_reach_success to read the same step it fires —
+    that reward function must NOT recompute the check itself, or a policy
+    could see the bonus without this termination also firing (or vice versa).
+
+    Shape: [num_envs]  bool
+    """
+    from .reach_rewards import _palm_target_dist, _palm_normal_angle
+
+    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z)
+    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
+    in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
+
+    if not hasattr(env, "_reach_hold_counter") or env._reach_hold_counter.shape != d.shape:
+        env._reach_hold_counter = torch.zeros_like(d)
+
+    # Episode boundary: don't carry a stale count into a fresh episode.
+    env._reach_hold_counter = torch.where(
+        env.episode_length_buf <= 1, torch.zeros_like(env._reach_hold_counter), env._reach_hold_counter
+    )
+    env._reach_hold_counter = torch.where(
+        in_neighbourhood, env._reach_hold_counter + 1, torch.zeros_like(env._reach_hold_counter)
+    )
+
+    hold_steps_required = max(1, round(hold_time / env.step_dt))
+    success = env._reach_hold_counter >= hold_steps_required
+
+    env._reach_success = success   # read by reach_rewards.reward_reach_success
+    return success
+
+
 def apple_placed_success(
     env: ManagerBasedRLEnv,
     object_cfg: SceneEntityCfg,

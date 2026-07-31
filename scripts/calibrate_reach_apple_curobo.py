@@ -332,7 +332,11 @@ def main():
         result = motion_gen.plan_single(
             start_state=start_state,
             goal_pose=goal_pose,
-            plan_config=MotionGenPlanConfig(enable_finetune_trajopt=False, max_attempts=10, num_trajopt_seeds=12),
+            # See reach_apple_curobo.py's comment on this: enable_finetune_trajopt=False
+            # is only guaranteed collision-free/within-limits, NOT guaranteed to actually
+            # hit the goal pose — exactly the huge position/orientation error you'd be
+            # calibrating (i.e. curve-fitting) against otherwise.
+            plan_config=MotionGenPlanConfig(enable_finetune_trajopt=True, max_attempts=10, num_trajopt_seeds=12),
         )
         if not result.success.item():
             print(f"  ❌ planning failed ({result.status}) — skipping point")

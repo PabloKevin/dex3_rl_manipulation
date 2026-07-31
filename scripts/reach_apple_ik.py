@@ -207,11 +207,11 @@ APPROACH_Z_OFFSET = -APPLE_RADIUS * 3.0  # goal sits below the apple centre, cup
 
 # Same palm orientation convention as reach_apple_curobo.py.
 ROLL_DEG, PITCH_DEG, YAW_DEG = 90.0, 0.0, 0.0
-ROTATION_THRESHOLD = 0.15   # rad — looser than MotionGen's: a single IK solve
+ROTATION_THRESHOLD = 0.25   # rad — looser than MotionGen's: a single IK solve
                              # doesn't need to discriminate between whole arm
                              # branches the way a trajectory does, so this can
                              # relax a bit. Tighten if the palm angle matters.
-POSITION_THRESHOLD = 0.005  # 5 mm
+POSITION_THRESHOLD = 0.05  # 5 cm
 
 # Both OFF by default for max speed, per your "no collision aware" ask. Flip
 # either on later if the solved pose needs to dodge the apple/torso/tree.
