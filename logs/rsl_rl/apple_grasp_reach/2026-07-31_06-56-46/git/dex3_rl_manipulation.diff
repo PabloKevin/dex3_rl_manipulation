@@ -1,0 +1,71 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/apple_grasp_env_cfg.py
+	modified:   logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/exported/
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_06-56-46/
+	outputs/2026-07-31/06-37-16/
+	outputs/2026-07-31/06-56-46/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index be6e227..984fca5 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index 3b4fafd..f1f417c 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -88,7 +88,7 @@ def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
+  
+ APPLE_RADIUS    = _jitter(0.04)
+ APPLE_MASS      = _jitter(0.15)
+-TREE_POS        = (_jitter(0.60), _jitter(-0.55), 0.0)
++TREE_POS        = (_jitter(0.55), _jitter(-0.5), 0.0)
+ TREE_HEIGHT     = _jitter(1.25)
+ BRANCH_LENGTH   = _jitter(0.50)
+ BRANCH_RADIUS   = _jitter(0.04)
+@@ -114,9 +114,9 @@ BRANCH_ROTATION = _jitter(140.0)
+ # the workspace, narrow it (or watch play.py) if the arm still saturates
+ # near the arc's edges.
+ REACH_MIN = 0.30
+-REACH_MAX = 0.42
++REACH_MAX = 0.62 #0.42
+ REACH_AZIMUTH_CENTER_DEG = -45.0
+-REACH_AZIMUTH_SPAN_DEG = 70.0
++REACH_AZIMUTH_SPAN_DEG = 65.0
+ 
+ APPLE_STEM_BREAK_FORCE  = _jitter(2.5)
+ APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
+@@ -142,7 +142,7 @@ RIGHT_ARM_JOINTS = [
+ # the true palm normal. The earlier (0,1,0) setting is why the trained palm
+ # normal pointed sideways (toward the left arm) instead of up: the reward
+ # was rewarding the wrong local axis for facing the sky.
+-PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
++PALM_NORMAL_AXIS = (0.0, 0.0, 1.0)
+ 
+ # Grasp reference point, in right_hand_palm_link's OWN local frame. The link
+ # origin sits back near the wrist; probed empirically (probe_palm_offset.py,
+@@ -169,7 +169,7 @@ PALM_LOCAL_OFFSET = (0.14, 0.0, 0.0)
+ # clear: thumb's own protrusion + the apple's radius + the worst-case slack
+ # a converged policy can sit at (anywhere within pos_tol=0.04 of the target
+ # still counts as "reached") + a small margin.
+-_THUMB_UP_LOCAL_OFFSET = 0.065   # measured via probe_palm_offset.py
++_THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
+ GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS + 0.04 + 0.02
+ 
+ # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
+diff --git a/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0 b/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0
+index eb26fef..6d239e8 100644
+Binary files a/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0 and b/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0 differ

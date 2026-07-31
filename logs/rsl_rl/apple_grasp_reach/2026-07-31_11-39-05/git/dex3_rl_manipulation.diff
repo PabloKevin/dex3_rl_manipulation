@@ -1,0 +1,113 @@
+--- git status ---
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+	modified:   envs/apple_grasp_env_cfg.py
+	modified:   logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/exported/
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_06-56-46/
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_08-11-55/
+	logs/rsl_rl/apple_grasp_reach/2026-07-31_11-39-05/
+	outputs/2026-07-31/06-37-16/
+	outputs/2026-07-31/06-56-46/
+	outputs/2026-07-31/07-50-00/
+	outputs/2026-07-31/08-00-56/
+	outputs/2026-07-31/08-11-55/
+	outputs/2026-07-31/11-18-51/
+	outputs/2026-07-31/11-39-05/
+	scripts/eval_utils.py
+	scripts/plot_style.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc
+index be6e227..c50f152 100644
+Binary files a/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc and b/envs/__pycache__/apple_grasp_env_cfg.cpython-310.pyc differ
+diff --git a/envs/apple_grasp_env_cfg.py b/envs/apple_grasp_env_cfg.py
+index 3b4fafd..5d62985 100644
+--- a/envs/apple_grasp_env_cfg.py
++++ b/envs/apple_grasp_env_cfg.py
+@@ -88,7 +88,7 @@ def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
+  
+ APPLE_RADIUS    = _jitter(0.04)
+ APPLE_MASS      = _jitter(0.15)
+-TREE_POS        = (_jitter(0.60), _jitter(-0.55), 0.0)
++TREE_POS        = (_jitter(0.55), _jitter(-0.5), 0.0)
+ TREE_HEIGHT     = _jitter(1.25)
+ BRANCH_LENGTH   = _jitter(0.50)
+ BRANCH_RADIUS   = _jitter(0.04)
+@@ -114,9 +114,21 @@ BRANCH_ROTATION = _jitter(140.0)
+ # the workspace, narrow it (or watch play.py) if the arm still saturates
+ # near the arc's edges.
+ REACH_MIN = 0.30
+-REACH_MAX = 0.42
++# Was pushed to 0.62 for wider generalisation, but the arm's measured
++# physical reach (probe_arm_reach.py: shoulder->elbow->wrist->palm chain)
++# is a HARD ~0.42 m ceiling, not a style knob. Above that, episodes
++# routinely spawn the apple out of reach; the arm maxes out its extension
++# chasing an unreachable target (reach_progress rewards ANY distance
++# reduction, even short of zero), leaving little wrist DOF budget left over
++# for orientation — this reproduces EXACTLY the symptom reported (palm
++# pointing the same wrong way regardless of which axis PALM_NORMAL_AXIS
++# targets, plus a consistent z-undershoot) because it's a kinematic
++# infeasibility problem, not a reward-shaping or axis-choice one. Don't
++# raise this past ~0.45 (small margin over the measured 0.42) without
++# re-running probe_arm_reach.py to confirm the arm/USD hasn't changed.
++REACH_MAX = 0.62
+ REACH_AZIMUTH_CENTER_DEG = -45.0
+-REACH_AZIMUTH_SPAN_DEG = 70.0
++REACH_AZIMUTH_SPAN_DEG = 65.0
+ 
+ APPLE_STEM_BREAK_FORCE  = _jitter(2.5)
+ APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
+@@ -169,7 +181,7 @@ PALM_LOCAL_OFFSET = (0.14, 0.0, 0.0)
+ # clear: thumb's own protrusion + the apple's radius + the worst-case slack
+ # a converged policy can sit at (anywhere within pos_tol=0.04 of the target
+ # still counts as "reached") + a small margin.
+-_THUMB_UP_LOCAL_OFFSET = 0.065   # measured via probe_palm_offset.py
++_THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
+ GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS + 0.04 + 0.02
+ 
+ # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
+@@ -647,16 +659,26 @@ class RewardsCfg:
+     # ── Orientation: palm normal -> world up, yaw and roll of the palm
+     #    around that normal are left FREE (per your spec: fingers can point
+     #    at the horizon or follow the arm's own z-rotation). Gated to zero
+-    #    beyond 25 cm so it cannot be farmed from anywhere in the workspace.
++    #    beyond gate_dist so it cannot be farmed from anywhere in the
++    #    workspace instead of reaching.
++    #    weight raised 1.5->3.0 and gate_dist loosened 0.25->0.40: at the old
++    #    values this term was small next to reach_coarse/fine (1.0/4.0) AND
++    #    gave literally zero orientation gradient until the palm was already
++    #    within 25 cm of the target -- i.e. the policy had to almost finish
++    #    reaching before it got any signal to also orient correctly, on top
++    #    of REACH_MAX previously allowing unreachable targets (see REACH_MAX
++    #    above) that made orientation kinematically impossible regardless.
++    #    Re-tighten gate_dist if this starts getting farmed away from the
++    #    target instead of reaching once REACH_MAX is respected.
+     palm_up = RewTerm(
+         func=rr.reward_palm_normal_up,
+-        weight=1.5,
++        weight=3.0,
+         params={
+             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+             "object_cfg": SceneEntityCfg("apple"),
+             "palm_normal_axis": PALM_NORMAL_AXIS,   # verify with play_debug_patch probe
+             "std_rad": 0.5,      # ~29 deg basin
+-            "gate_dist": 0.25,   # metres
++            "gate_dist": 0.40,   # metres
+             "offset_z": GRASP_OFFSET_Z,
+             "palm_local_offset": PALM_LOCAL_OFFSET,
+         },
+diff --git a/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0 b/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0
+index eb26fef..6d239e8 100644
+Binary files a/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0 and b/logs/rsl_rl/apple_grasp_reach/2026-07-31_05-42-13/events.out.tfevents.1785487337.humble-box.Apolo-Nitro-PK.217194.0 differ
