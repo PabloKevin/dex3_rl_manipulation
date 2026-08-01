@@ -55,6 +55,18 @@ parser.add_argument("--debug_pose",     action="store_true",
                      help="Print the palm's local-axis-to-world-Z probe once at start (to find "
                           "PALM_NORMAL_AXIS), plus a periodic joint-pose/distance readout and a "
                           "post-reset pose printout.")
+parser.add_argument("--no_proximity_stop", action="store_true",
+                     help="Disable the quintic proximity-stop safety controller (see "
+                          "proximity_stop.py). Only relevant with --policy; ignored otherwise. "
+                          "On by default: once the palm stays near the apple for --stop_dwell "
+                          "seconds, control hands off from the RL policy to a smooth quintic "
+                          "deceleration instead of letting the policy keep moving near the object.")
+parser.add_argument("--stop_dist",     type=float, default=0.06,
+                     help="Proximity-stop trigger distance, palm to apple centre (metres).")
+parser.add_argument("--stop_dwell",    type=float, default=1.0,
+                     help="Seconds the palm must stay within --stop_dist before the stop triggers.")
+parser.add_argument("--stop_duration", type=float, default=0.8,
+                     help="Seconds the quintic deceleration takes to bring the arm to rest.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -71,6 +83,7 @@ import envs  # registers gym tasks
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY
+from proximity_stop import QuinticStopController, QuinticStopConfig
 
 # Must match ActionsCfg.right_arm.joint_names order in apple_grasp_env_cfg.py
 RIGHT_ARM_JOINT_NAMES = [
@@ -381,6 +394,39 @@ def main():
 
     palm_bid = robot.data.body_names.index("right_hand_palm_link")
 
+    # ── Proximity-stop safety controller (see proximity_stop.py) ────────────
+    # Only meaningful while a policy is actually driving the arm. Reads
+    # ActionsCfg.right_arm's own scale/offset from the live action term
+    # rather than hardcoding them, so it stays correct if those are retuned.
+    stop_ctrl = None
+    if policy_module is not None and not args_cli.no_proximity_stop:
+        right_arm_term = env.action_manager.get_term("right_arm")
+        _arm_scale = right_arm_term._scale
+        _arm_offset = right_arm_term._offset
+        stop_ctrl = QuinticStopController(
+            num_joints=len(arm_joint_idx),
+            cfg=QuinticStopConfig(
+                stop_dist=args_cli.stop_dist,
+                dwell_time=args_cli.stop_dwell,
+                stop_duration=args_cli.stop_duration,
+            ),
+            device=env.device,
+        )
+        print(f"[ProximityStop] armed — stop_dist={args_cli.stop_dist*100:.1f}cm, "
+              f"dwell={args_cli.stop_dwell:.2f}s, stop_duration={args_cli.stop_duration:.2f}s "
+              f"(disable with --no_proximity_stop)")
+
+        def _q_to_raw_action(q_cmd: torch.Tensor) -> torch.Tensor:
+            """Inverse of JointAction.process_actions' affine transform
+            (offset + scale*raw_action), so a direct joint-position target
+            can be sent through the normal env.step(actions) path — this
+            keeps the built-in RateLimitedJointPositionAction's own
+            velocity/accel caps as an extra safety net under the quintic
+            command too, rather than writing to the sim directly."""
+            offset = _arm_offset[0] if isinstance(_arm_offset, torch.Tensor) else _arm_offset
+            scale = _arm_scale if isinstance(_arm_scale, float) else _arm_scale[0]
+            return (q_cmd - offset) / scale
+
     def _fmt(v):
         return [round(float(x), 3) for x in v]
 
@@ -445,6 +491,8 @@ def main():
                     _hand_targets = None
 
                 step = 0
+                if stop_ctrl is not None:
+                    stop_ctrl.reset()
                 print("\n>>> SIMULACIÓN Y ROBOT RESETEADOS A POSE INICIAL <<<\n")
 
                 if args_cli.debug_pose:
@@ -455,6 +503,24 @@ def main():
         with torch.inference_mode():
             if policy_module is not None:
                 actions = policy_module(obs["policy"])
+
+                if stop_ctrl is not None:
+                    _t = step * env.step_dt
+                    _palm_now = robot.data.body_pos_w[0, palm_bid]
+                    _dist_now = float(torch.norm(apple.data.root_pos_w[0] - _palm_now))
+                    _q_now  = robot.data.joint_pos[0, arm_joint_idx]
+                    _dq_now = robot.data.joint_vel[0, arm_joint_idx]
+                    stop_ctrl.update_state(_t, _dist_now, _q_now, _dq_now)
+
+                    # Scoped to env 0 only, matching the rest of this
+                    # script's single-env-focused debug/publish logic — with
+                    # --num_envs > 1 the override only ever applies to env 0's
+                    # action row, other envs keep taking the raw policy output.
+                    overridden, q_cmd = stop_ctrl.get_command(_t, _q_now)
+                    if overridden:
+                        actions[0, :len(arm_joint_idx)] = _q_to_raw_action(q_cmd)
+                        if step % 100 == 0:
+                            print(f"  [ProximityStop] {stop_ctrl.state} — overriding policy actions")
             elif args_cli.random_actions:
                 raw     = env.action_space.sample()
                 actions = torch.tensor(raw, device=env.device, dtype=torch.float32)
