@@ -9,6 +9,12 @@ deceleration that brings the arm's current joint velocity smoothly to zero
 it could damage, or instantly freezing the joints (a velocity/acceleration
 discontinuity -- exactly the "bad jerk" this is meant to avoid).
 
+A second, independent trigger (QuinticStopConfig.watchdog_time) fires the
+SAME smooth stop after a fixed time since the current attempt started,
+regardless of whether the palm ever got near the apple at all -- a safety
+fallback for a policy that diverges or oscillates and never satisfies the
+proximity condition on its own.
+
 Threading model: PhysX/Isaac Sim tensors may only safely be touched from the
 main simulation thread. QuinticStopController's background thread NEVER
 calls into the sim -- it only runs a state machine + a free-running clock
@@ -44,8 +50,17 @@ class QuinticStopConfig:
     stop_dist: float = 0.09        # metres: palm-to-apple distance that arms the trigger
     dwell_time: float = 0.6        # seconds: must stay within stop_dist this long before it fires
     stop_duration: float = 0.4     # seconds: duration of the quintic deceleration
-    resume_margin: float = 0.12    # metres: hysteresis -- must clear stop_dist+margin to hand control back
+    resume_margin: float = 0.12    # metres: hysteresis on the dwell-timer arming check (see IDLE
+                                    # branch in _loop) -- NOT a "resume policy control" threshold;
+                                    # HOLDING only ever exits via reset(), see its comment below
     poll_interval: float = 0.01    # seconds: background thread tick rate (cheap; just a clock+FSM)
+    watchdog_time: float | None = 2.5
+    """Seconds since the current attempt started (episode reset, or
+    controller construction) before the stop triggers UNCONDITIONALLY, even
+    if the palm never got within stop_dist. Independent safety fallback for
+    a policy that diverges/oscillates and never satisfies the proximity
+    condition on its own -- the arm still gets a smooth quintic stop instead
+    of running indefinitely. Set to None (or <= 0) to disable."""
 
 
 class QuinticStopController:
@@ -71,6 +86,8 @@ class QuinticStopController:
 
         self._state = self.IDLE
         self._near_since: float | None = None
+        self._episode_start_t: float = 0.0
+        self.last_trigger_reason: str | None = None   # "proximity" or "watchdog", for logging
 
         # Latest readings pushed by the main thread.
         self._t = 0.0
@@ -91,13 +108,18 @@ class QuinticStopController:
     def close(self):
         self._alive = False
 
-    def reset(self) -> None:
+    def reset(self, t: float = 0.0) -> None:
         """Call after an env reset -- goes back to IDLE so a stale q0/target
-        captured before the reset can't leak into a command post-reset."""
+        captured before the reset can't leak into a command post-reset, and
+        restarts the watchdog clock. `t` should be the sim-time the reset
+        actually happened at (e.g. 0.0 right after `step` is reset to 0),
+        so watchdog_time is measured from the new attempt's actual start."""
         with self._lock:
             self._state = self.IDLE
             self._near_since = None
             self._dist = None
+            self._episode_start_t = t
+            self.last_trigger_reason = None
 
     # ── Called every control step from the main thread ──────────────────────
 
@@ -155,13 +177,29 @@ class QuinticStopController:
                             self._near_since = t
                     elif dist > release_dist:
                         self._near_since = None
-                    elif t - self._near_since >= self.cfg.dwell_time:
+
+                    dwell_fired = (
+                        self._near_since is not None
+                        and t - self._near_since >= self.cfg.dwell_time
+                    )
+                    # Independent of proximity entirely: fires purely on
+                    # elapsed time since this attempt started, so a policy
+                    # that never gets within stop_dist still gets stopped
+                    # smoothly instead of running forever.
+                    watchdog_fired = (
+                        self.cfg.watchdog_time is not None
+                        and self.cfg.watchdog_time > 0.0
+                        and t - self._episode_start_t >= self.cfg.watchdog_time
+                    )
+
+                    if dwell_fired or watchdog_fired:
                         with self._lock:
                             self._q0 = q.clone()
                             self._v0 = dq.clone()
                             self._q1 = self._q0 + self._v0 * self.cfg.stop_duration / 2.0
                             self._stop_start_t = t
                             self._state = self.STOPPING
+                            self.last_trigger_reason = "proximity" if dwell_fired else "watchdog"
 
                 elif state == self.STOPPING:
                     if t - self._stop_start_t >= self.cfg.stop_duration:
@@ -169,11 +207,15 @@ class QuinticStopController:
                             self._hold_target = self._quintic_sample(self.cfg.stop_duration)
                             self._state = self.HOLDING
 
-                elif state == self.HOLDING:
-                    if dist > self.cfg.stop_dist + self.cfg.resume_margin:
-                        with self._lock:
-                            self._state = self.IDLE
-                            self._near_since = None
+                # HOLDING has no auto-exit back to IDLE on its own -- this is
+                # a safety stop, not a pause. Silently handing control back
+                # to the policy the instant distance ticks past some
+                # threshold defeats the point (and was actively buggy for a
+                # watchdog-triggered stop: dist was never close to begin
+                # with, so the old dist>release_dist check fired the very
+                # next tick, bouncing STOPPING<->HOLDING forever). Only
+                # reset() (called on an actual env reset, manual or
+                # --auto_reset_on_success) leaves HOLDING now.
 
             time.sleep(self.cfg.poll_interval)
 

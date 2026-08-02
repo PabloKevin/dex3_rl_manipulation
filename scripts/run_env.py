@@ -70,6 +70,11 @@ parser.add_argument("--stop_dwell",    type=float, default=None,
 parser.add_argument("--stop_duration", type=float, default=None,
                      help="Seconds the quintic deceleration takes to bring the arm to rest. "
                           "Defaults to QuinticStopConfig.stop_duration if not given.")
+parser.add_argument("--stop_watchdog", type=float, default=None,
+                     help="Seconds since the current attempt started before the stop triggers "
+                          "UNCONDITIONALLY, even if the palm never got near the apple. Pass 0 "
+                          "or a negative number to disable. Defaults to QuinticStopConfig."
+                          "watchdog_time if not given.")
 parser.add_argument("--auto_reset_on_success", action="store_true",
                      help="By default this script suppresses the env's own reach_success "
                           "termination so it never auto-resets on its own — only 'r'+Enter "
@@ -435,15 +440,19 @@ def main():
             _stop_kwargs["dwell_time"] = args_cli.stop_dwell
         if args_cli.stop_duration is not None:
             _stop_kwargs["stop_duration"] = args_cli.stop_duration
+        if args_cli.stop_watchdog is not None:
+            _stop_kwargs["watchdog_time"] = args_cli.stop_watchdog
         stop_cfg = QuinticStopConfig(**_stop_kwargs)
         stop_ctrl = QuinticStopController(
             num_joints=len(arm_joint_idx),
             cfg=stop_cfg,
             device=env.device,
         )
+        _wd = stop_cfg.watchdog_time
+        _wd_str = f"{_wd:.2f}s" if (_wd is not None and _wd > 0.0) else "disabled"
         print(f"[ProximityStop] armed — stop_dist={stop_cfg.stop_dist*100:.1f}cm, "
               f"dwell={stop_cfg.dwell_time:.2f}s, stop_duration={stop_cfg.stop_duration:.2f}s, "
-              f"resume_margin={stop_cfg.resume_margin*100:.1f}cm "
+              f"resume_margin={stop_cfg.resume_margin*100:.1f}cm, watchdog={_wd_str} "
               f"(disable with --no_proximity_stop)")
 
         def _q_to_raw_action(q_cmd: torch.Tensor) -> torch.Tensor:
@@ -530,7 +539,7 @@ def main():
 
                 step = 0
                 if stop_ctrl is not None:
-                    stop_ctrl.reset()
+                    stop_ctrl.reset(t=step * env.step_dt)
                 _success_since = None
                 print("\n>>> SIMULACIÓN Y ROBOT RESETEADOS A POSE INICIAL <<<\n")
 
@@ -559,7 +568,8 @@ def main():
                     if overridden:
                         actions[0, :len(arm_joint_idx)] = _q_to_raw_action(q_cmd)
                         if step % 100 == 0:
-                            print(f"  [ProximityStop] {stop_ctrl.state} — overriding policy actions")
+                            print(f"  [ProximityStop] {stop_ctrl.state} "
+                                  f"(trigger={stop_ctrl.last_trigger_reason}) — overriding policy actions")
             elif args_cli.random_actions:
                 raw     = env.action_space.sample()
                 actions = torch.tensor(raw, device=env.device, dtype=torch.float32)
