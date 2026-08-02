@@ -197,7 +197,7 @@ PALM_LOCAL_OFFSET = (0.08, 0.0, 0.0)  # grasp reference point in the palm link's
 # published over DDS (same limitation reach_apple_ik.py's APPLE_RADIUS=0.04
 # already has) -- a few-mm error here is well inside pos_tol=0.04.
 APPLE_RADIUS_NOMINAL = 0.04
-GRASP_OFFSET_Z_DEFAULT = APPLE_RADIUS_NOMINAL * 1.75  # matches GRASP_OFFSET_Z formula, _THUMB_UP_LOCAL_OFFSET=0
+GRASP_OFFSET_Z_DEFAULT = 0.0 
 
 # Must match apple_grasp_env_cfg.py's ActionsCfg.right_arm.scale.
 ARM_SCALE = 0.5
@@ -363,6 +363,43 @@ class CasadiIK:
 # 6. Main control loop
 # ─────────────────────────────────────────────────────────────────────────
 
+def _grasp_diag(state: dict, grasp_offset_z: float) -> dict:
+    """Ground-truth reach-quality diagnostics computed directly from the
+    published sim state (ee_pos/ee_quat/apple_pos) -- NOT from this script's
+    own FK model -- so they're trustworthy even if the analytic FK chain
+    somehow drifted from the real USD kinematics.
+
+    Returns raw wrist-to-apple distance (the same metric the proximity-stop
+    and the periodic tick log use, run_env.py's own convention), the TRUE
+    grasp-point distance (palm + PALM_LOCAL_OFFSET, vs apple - offset_z --
+    the actual metric reach_rewards.py/terminations_and_events.py score
+    against, pos_tol=0.04), the palm-up orientation residual, and the raw
+    (dx,dy,dz) world-frame gap for axis attribution.
+    """
+    ee_pos = torch.tensor(state["ee_pos"], dtype=torch.float32)
+    ee_quat = torch.tensor(state["ee_quat"], dtype=torch.float32)  # wxyz
+    apple_pos = torch.tensor(state["apple_pos"], dtype=torch.float32)
+
+    delta = apple_pos - ee_pos
+    raw_dist = float(torch.norm(delta))
+
+    local_offset_world = quat_rotate(ee_quat, torch.tensor(PALM_LOCAL_OFFSET, dtype=torch.float32))
+    grasp_point = ee_pos + local_offset_world
+    target = apple_pos.clone()
+    target[2] -= grasp_offset_z
+    grasp_dist = float(torch.norm(target - grasp_point))
+
+    normal_world = quat_rotate(ee_quat, torch.tensor(PALM_NORMAL_AXIS, dtype=torch.float32))
+    theta_deg = math.degrees(math.acos(float(normal_world[2].clamp(-1.0, 1.0))))
+
+    return {
+        "raw_dist": raw_dist,
+        "grasp_dist": grasp_dist,
+        "theta_deg": theta_deg,
+        "dxyz": tuple(float(v) for v in delta),
+    }
+
+
 def _selftest():
     """--selftest: solve IK for a known reachable point with no DDS/run_env
     involved, and confirm the FK of the solution lands within 1 cm."""
@@ -399,7 +436,12 @@ def main():
     parser.add_argument("--stop_dist", type=float, default=None, help="Proximity-stop trigger distance, palm to apple centre (m). Default: QuinticStopConfig.stop_dist.")
     parser.add_argument("--stop_dwell", type=float, default=None, help="Seconds within --stop_dist before the stop triggers. Default: QuinticStopConfig.dwell_time.")
     parser.add_argument("--stop_duration", type=float, default=None, help="Seconds the quintic deceleration takes. Default: QuinticStopConfig.stop_duration.")
-    parser.add_argument("--stop_watchdog", type=float, default=None, help="Seconds since episode start before an unconditional stop. Default: QuinticStopConfig.watchdog_time.")
+    parser.add_argument("--stop_watchdog", type=float, default=5.0,
+                         help="Seconds since episode start before an unconditional stop. Defaults to 5.0s here "
+                              "(vs run_env.py --policy's 2.5s, QuinticStopConfig.watchdog_time) because the IK "
+                              "controller's closed-loop convergence + IPOPT re-solves legitimately take longer "
+                              "to settle near the apple than the trained policy's forward pass. Pass 0 or a "
+                              "negative number to disable.")
     parser.add_argument("--selftest", action="store_true", help="Solve one IK problem with no DDS/run_env and exit.")
     args = parser.parse_args()
 
@@ -452,6 +494,7 @@ def main():
 
     q_target = list(q_prev)  # last commanded IK solution / stop-override target
     tick = 0
+    prev_stop_state = "IDLE"
 
     print("\n" + "=" * 60)
     print("CASADI IK REACHER — driving the right arm via DDS")
@@ -528,6 +571,25 @@ def main():
                     if tick % 100 == 0:
                         print(f"  [ProximityStop] {stop_ctrl.state} "
                               f"(trigger={stop_ctrl.last_trigger_reason}) — overriding IK target")
+                # One-shot diagnostic the instant a stop actually triggers: how
+                # far (m, joint-space rad) the arm still was from the IK
+                # target at that moment -- if this is large, the stop fired
+                # mid-approach (watchdog/dwell too tight), not because the IK
+                # solution itself was wrong. Compare against the reach errors
+                # this script logs -- if THIS gap correlates with your ~15cm
+                # discrepancy, it's a timing issue, not a kinematics one.
+                if stop_ctrl.state != "IDLE" and prev_stop_state == "IDLE":
+                    joint_gap = float(torch.norm(torch.tensor(q_target, dtype=torch.float32) - q_now))
+                    diag = _grasp_diag(state, args.grasp_offset_z)
+                    print(f"\n>>> [ProximityStop] {stop_ctrl.last_trigger_reason} stop TRIGGERED at "
+                          f"t_ep={t_ep:.2f}s — |q_target - q_now|={joint_gap:.3f} rad "
+                          f"(0 = arm had fully converged)\n"
+                          f"    raw wrist->apple   = {diag['raw_dist']*100:5.1f}cm  "
+                          f"dxyz(cm)={tuple(round(v*100,1) for v in diag['dxyz'])}\n"
+                          f"    TRUE grasp_point dist (matches reach_success pos_tol=4cm) "
+                          f"= {diag['grasp_dist']*100:5.1f}cm\n"
+                          f"    palm-up residual   = {diag['theta_deg']:5.1f} deg <<<\n")
+                prev_stop_state = stop_ctrl.state
 
             # ── Publish ────────────────────────────────────────────────
             raw_arm = [(c - d) / ARM_SCALE for c, d in zip(q_cmd, default_arm_pos)]
@@ -535,8 +597,10 @@ def main():
 
             tick += 1
             if tick % 100 == 0:
-                dist = float(torch.norm(torch.tensor(apple_pos, dtype=torch.float32) - torch.tensor(state["ee_pos"], dtype=torch.float32)))
-                print(f"  tick={tick:6d}  d(ee,apple)={dist*100:5.1f}cm  q={[round(v,3) for v in q_cmd]}")
+                diag = _grasp_diag(state, args.grasp_offset_z)
+                print(f"  tick={tick:6d}  d(ee,apple)={diag['raw_dist']*100:5.1f}cm  "
+                      f"d(grasp_point,target)={diag['grasp_dist']*100:5.1f}cm  "
+                      f"palm_up_err={diag['theta_deg']:4.1f}deg  q={[round(v,3) for v in q_cmd]}")
 
             elapsed = time.perf_counter() - loop_t0
             sleep_t = STEP_DT - elapsed
