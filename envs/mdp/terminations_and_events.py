@@ -106,6 +106,17 @@ def reach_success(
     success = env._reach_hold_counter >= hold_steps_required
 
     env._reach_success = success   # read by reach_rewards.reward_reach_success
+
+    # env._suppress_reach_success_termination is never set during training --
+    # this getattr is a no-op there, success terminates/auto-resets exactly
+    # as before. run_env.py sets it so it can own reset timing itself
+    # (manual 'r', or its own delayed auto-reset) instead of
+    # ManagerBasedRLEnv.step() instantly resetting the moment this fires --
+    # env._reach_success above is still computed/cached either way, so
+    # anything watching it (the reward bonus, run_env.py itself) still sees
+    # success the instant it happens even when the termination is suppressed.
+    if getattr(env, "_suppress_reach_success_termination", False):
+        return torch.zeros_like(success)
     return success
 
 

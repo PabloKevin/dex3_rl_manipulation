@@ -56,6 +56,7 @@ J = 7 actuated arm joints:
 from __future__ import annotations
 
 import json
+import warnings
 from types import SimpleNamespace
 from typing import Sequence
 
@@ -238,7 +239,10 @@ def masked_percentile(x: np.ndarray, mask: np.ndarray, q: Sequence[float],
     mask = np.asarray(mask, dtype=bool)
     xm = np.where(mask, x, np.nan)
     n_valid = mask.sum(axis=0)
-    with np.errstate(all="ignore"):
+    # Timesteps past the longest episode are all-NaN by construction; numpy
+    # warns and returns NaN, which is exactly what we want to plot as a gap.
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
         out = np.nanpercentile(xm, list(q), axis=0)
     out = np.atleast_2d(out)
     out[:, n_valid < min_count] = np.nan

@@ -61,12 +61,25 @@ parser.add_argument("--no_proximity_stop", action="store_true",
                           "On by default: once the palm stays near the apple for --stop_dwell "
                           "seconds, control hands off from the RL policy to a smooth quintic "
                           "deceleration instead of letting the policy keep moving near the object.")
-parser.add_argument("--stop_dist",     type=float, default=0.06,
-                     help="Proximity-stop trigger distance, palm to apple centre (metres).")
-parser.add_argument("--stop_dwell",    type=float, default=1.0,
-                     help="Seconds the palm must stay within --stop_dist before the stop triggers.")
-parser.add_argument("--stop_duration", type=float, default=0.8,
-                     help="Seconds the quintic deceleration takes to bring the arm to rest.")
+parser.add_argument("--stop_dist",     type=float, default=None,
+                     help="Proximity-stop trigger distance, palm to apple centre (metres). "
+                          "Defaults to QuinticStopConfig.stop_dist (proximity_stop.py) if not given.")
+parser.add_argument("--stop_dwell",    type=float, default=None,
+                     help="Seconds the palm must stay within --stop_dist before the stop triggers. "
+                          "Defaults to QuinticStopConfig.dwell_time if not given.")
+parser.add_argument("--stop_duration", type=float, default=None,
+                     help="Seconds the quintic deceleration takes to bring the arm to rest. "
+                          "Defaults to QuinticStopConfig.stop_duration if not given.")
+parser.add_argument("--auto_reset_on_success", action="store_true",
+                     help="By default this script suppresses the env's own reach_success "
+                          "termination so it never auto-resets on its own — only 'r'+Enter "
+                          "resets, so you can actually watch the arm sitting stopped at the "
+                          "target. Pass this to opt back into an automatic reset once "
+                          "reach_success fires, delayed by --auto_reset_delay seconds (NOT "
+                          "instant like the default IsaacLab behaviour).")
+parser.add_argument("--auto_reset_delay", type=float, default=2.0,
+                     help="Seconds to wait after reach_success fires before auto-resetting. "
+                          "Only used with --auto_reset_on_success.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -323,6 +336,11 @@ def main():
         cfg.scene.num_envs = args_cli.num_envs
 
     env      = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
+    # This script owns reset timing itself (manual 'r', or --auto_reset_on_success
+    # below) instead of letting ManagerBasedRLEnv.step() instantly auto-reset the
+    # moment reach_success fires — see terminations_and_events.reach_success.
+    # Never set during training, so this has zero effect there.
+    env._suppress_reach_success_termination = True
     obs, _   = env.reset()
 
     from envs.mdp.tree_utils import StemManager
@@ -403,17 +421,29 @@ def main():
         right_arm_term = env.action_manager.get_term("right_arm")
         _arm_scale = right_arm_term._scale
         _arm_offset = right_arm_term._offset
+        # Only pass fields the user actually gave on the CLI -- omitting a
+        # field (rather than passing None) is what lets QuinticStopConfig's
+        # own dataclass defaults apply. Passing args_cli.stop_dist
+        # unconditionally here was the previous bug: argparse always fills
+        # in a default too, so it was ALWAYS passed explicitly, silently
+        # shadowing any edit made to QuinticStopConfig's defaults in
+        # proximity_stop.py -- editing that file had zero effect.
+        _stop_kwargs = {}
+        if args_cli.stop_dist is not None:
+            _stop_kwargs["stop_dist"] = args_cli.stop_dist
+        if args_cli.stop_dwell is not None:
+            _stop_kwargs["dwell_time"] = args_cli.stop_dwell
+        if args_cli.stop_duration is not None:
+            _stop_kwargs["stop_duration"] = args_cli.stop_duration
+        stop_cfg = QuinticStopConfig(**_stop_kwargs)
         stop_ctrl = QuinticStopController(
             num_joints=len(arm_joint_idx),
-            cfg=QuinticStopConfig(
-                stop_dist=args_cli.stop_dist,
-                dwell_time=args_cli.stop_dwell,
-                stop_duration=args_cli.stop_duration,
-            ),
+            cfg=stop_cfg,
             device=env.device,
         )
-        print(f"[ProximityStop] armed — stop_dist={args_cli.stop_dist*100:.1f}cm, "
-              f"dwell={args_cli.stop_dwell:.2f}s, stop_duration={args_cli.stop_duration:.2f}s "
+        print(f"[ProximityStop] armed — stop_dist={stop_cfg.stop_dist*100:.1f}cm, "
+              f"dwell={stop_cfg.dwell_time:.2f}s, stop_duration={stop_cfg.stop_duration:.2f}s, "
+              f"resume_margin={stop_cfg.resume_margin*100:.1f}cm "
               f"(disable with --no_proximity_stop)")
 
         def _q_to_raw_action(q_cmd: torch.Tensor) -> torch.Tensor:
@@ -451,6 +481,14 @@ def main():
         _probe_palm_axes()
 
     global _reset_requested, _arm_targets, _hand_targets
+
+    # Tracks how long env._reach_success[0] has been continuously True, for
+    # --auto_reset_on_success's delay. None = not currently in a success
+    # streak. Cleared on any reset (manual or delayed-auto) and the instant
+    # _reach_success drops back False (e.g. the arm drifts back out of
+    # tolerance) -- requires CONTINUOUS success for auto_reset_delay
+    # seconds, not "was true at some point that long ago".
+    _success_since = None
 
     while simulation_app.is_running():
         # Verificar si el usuario solicitó reset por terminal
@@ -493,6 +531,7 @@ def main():
                 step = 0
                 if stop_ctrl is not None:
                     stop_ctrl.reset()
+                _success_since = None
                 print("\n>>> SIMULACIÓN Y ROBOT RESETEADOS A POSE INICIAL <<<\n")
 
                 if args_cli.debug_pose:
@@ -545,6 +584,26 @@ def main():
                     _arm_targets = None
                     _hand_targets = None
                 print("\n>>> Episode auto-reset (time_out/termination) — cleared stale DDS targets <<<\n")
+
+            # reach_success's own termination is suppressed (env._suppress_
+            # reach_success_termination, set above) so it never auto-resets
+            # on its own — env._reach_success is still cached fresh every
+            # step regardless, this is what --auto_reset_on_success watches
+            # instead, with an actual delay rather than IsaacLab's instant
+            # reset-inside-step() behaviour.
+            _reach_success = getattr(env, "_reach_success", None)
+            if _reach_success is not None and bool(_reach_success[0]):
+                if _success_since is None:
+                    _success_since = step * env.step_dt
+                elif args_cli.auto_reset_on_success:
+                    elapsed = step * env.step_dt - _success_since
+                    if elapsed >= args_cli.auto_reset_delay:
+                        with _reset_lock:
+                            _reset_requested = True
+                        print(f"\n>>> reach_success held {elapsed:.2f}s — "
+                              f"auto-resetting (--auto_reset_on_success) <<<\n")
+            else:
+                _success_since = None
 
             if step % 100 == 0:
                 apple_z = apple.data.root_pos_w[0, 2].item()

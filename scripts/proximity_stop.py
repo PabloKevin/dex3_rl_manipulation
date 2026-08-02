@@ -41,10 +41,10 @@ import torch
 
 @dataclass
 class QuinticStopConfig:
-    stop_dist: float = 0.06        # metres: palm-to-apple distance that arms the trigger
-    dwell_time: float = 1.0        # seconds: must stay within stop_dist this long before it fires
-    stop_duration: float = 0.8     # seconds: duration of the quintic deceleration
-    resume_margin: float = 0.03    # metres: hysteresis -- must clear stop_dist+margin to hand control back
+    stop_dist: float = 0.09        # metres: palm-to-apple distance that arms the trigger
+    dwell_time: float = 0.6        # seconds: must stay within stop_dist this long before it fires
+    stop_duration: float = 0.4     # seconds: duration of the quintic deceleration
+    resume_margin: float = 0.12    # metres: hysteresis -- must clear stop_dist+margin to hand control back
     poll_interval: float = 0.01    # seconds: background thread tick rate (cheap; just a clock+FSM)
 
 
@@ -140,18 +140,28 @@ class QuinticStopController:
 
             if dist is not None:
                 if state == self.IDLE:
-                    if dist <= self.cfg.stop_dist:
-                        if self._near_since is None:
+                    # dist <= stop_dist ARMS the dwell timer; once armed, only
+                    # a excursion past stop_dist+resume_margin resets it --
+                    # NOT crossing back over the bare stop_dist line. Small
+                    # residual motion near the target (the whole reason this
+                    # controller exists) was ticking a hair above stop_dist
+                    # every few steps, resetting _near_since to None each
+                    # time and preventing dwell_time from EVER accumulating
+                    # continuously. Same tolerance already used to leave
+                    # HOLDING below, now applied consistently on the way in.
+                    release_dist = self.cfg.stop_dist + self.cfg.resume_margin
+                    if self._near_since is None:
+                        if dist <= self.cfg.stop_dist:
                             self._near_since = t
-                        elif t - self._near_since >= self.cfg.dwell_time:
-                            with self._lock:
-                                self._q0 = q.clone()
-                                self._v0 = dq.clone()
-                                self._q1 = self._q0 + self._v0 * self.cfg.stop_duration / 2.0
-                                self._stop_start_t = t
-                                self._state = self.STOPPING
-                    else:
+                    elif dist > release_dist:
                         self._near_since = None
+                    elif t - self._near_since >= self.cfg.dwell_time:
+                        with self._lock:
+                            self._q0 = q.clone()
+                            self._v0 = dq.clone()
+                            self._q1 = self._q0 + self._v0 * self.cfg.stop_duration / 2.0
+                            self._stop_start_t = t
+                            self._state = self.STOPPING
 
                 elif state == self.STOPPING:
                     if t - self._stop_start_t >= self.cfg.stop_duration:

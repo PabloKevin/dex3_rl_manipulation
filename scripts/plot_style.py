@@ -208,25 +208,33 @@ def hairline_grid(ax, axis: str = "y") -> None:
 
 
 def threshold(ax, value: float, orientation: str = "h", label: str | None = None,
-              label_x: float = 0.985, label_y_pad: float = 0.0) -> None:
+              label_x: float = 0.985, label_y_pad: float = 0.0,
+              halo: bool = False) -> None:
     """Draw a tolerance/threshold rule: neutral gray, dashed, annotated.
 
     Dashed is reserved for thresholds and for the second series in a paired
     comparison -- never for gridlines -- so a dashed line in these figures
     always means "this carries information".
+
+    `halo` puts a semi-opaque background behind the label, for rules that cross
+    dense scatter where the text would otherwise be unreadable.
     """
+    bbox = (dict(facecolor="white", edgecolor="none", alpha=0.82, pad=0.8)
+            if halo else None)
     if orientation == "h":
         ax.axhline(value, color=TOL_LINE, linewidth=0.7, linestyle=(0, (3, 2)), zorder=1)
         if label:
             ax.annotate(label, xy=(label_x, value), xycoords=("axes fraction", "data"),
                         ha="right", va="bottom", fontsize=6.5, color=INK_MUTED,
-                        xytext=(0, 1.5 + label_y_pad), textcoords="offset points")
+                        xytext=(0, 1.5 + label_y_pad), textcoords="offset points",
+                        bbox=bbox, zorder=6)
     else:
         ax.axvline(value, color=TOL_LINE, linewidth=0.7, linestyle=(0, (3, 2)), zorder=1)
         if label:
             ax.annotate(label, xy=(value, 0.98), xycoords=("data", "axes fraction"),
                         ha="left", va="top", fontsize=6.5, color=INK_MUTED,
-                        xytext=(2, 0), textcoords="offset points")
+                        xytext=(2, 0), textcoords="offset points",
+                        bbox=bbox, zorder=6)
 
 
 def label_end(ax, x, y, text: str, color: str = INK_2, dx: float = 3.0,

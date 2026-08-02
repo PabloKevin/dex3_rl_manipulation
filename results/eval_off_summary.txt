@@ -1,0 +1,28 @@
+==============================================================================
+checkpoint     : /home/pablo_kevin/dex3_rl_manipulation/logs/rsl_rl/apple_grasp_reach/2026-07-31_20-13-43/model_4500.pt
+task / envs    : AppleGrasp-v0  x64
+rate limiter   : off (v_max=1000000000.0, a_max=1000000000.0)
+seed / scene   : 1 / 12345
+------------------------------------------------------------------------------
+episodes           : 704
+SUCCESS RATE       : 0.000  (0/704, 95% CI [0.000, 0.005])
+  reached tol      : 0.000   (entered the ball at least once)
+  position only    : 0.027   (d_min < pos_tol, ignoring orientation)
+  orientation only : 0.493   (theta_min < ori_tol, ignoring position)
+  timed out        : 704
+------------------------------------------------------------------------------
+metric                                     mean   median      std      p95    n
+final position error [mm], all          359.648  359.411   80.412  483.703  704
+min position error [mm], all            178.641  184.864   70.941  282.748  704
+final orientation error [deg], all       39.117   33.865   21.108   80.247  704
+min orientation error [deg], all         20.894   17.977   14.401   44.617  704
+episode duration [s]                      5.000    5.000    0.000    5.000  704
+joint jerk RMS [rad/s^3]              362858.629364170.08220564.547401650.974  704
+joint jerk p95 [rad/s^3]              384296.171387628.79819811.132414749.629  704
+joint jerk max [rad/s^3]              402880.277405326.52924115.912436921.416  704
+peak |dq| [rad/s]                        42.459   42.489    3.439   49.606  704
+RMS |dq| [rad/s]                         36.504   36.601    2.021   40.339  704
+------------------------------------------------------------------------------
+CHECK commanded |dq| max : 300.000 rad/s   OK
+CHECK commanded |ddq| max: 30000.001 rad/s^2 OK
+==============================================================================
