@@ -26,7 +26,10 @@ rt/arm_tune/state    (publish)    {"torso_pos": [x,y,z], "torso_quat": [w,x,y,z]
 "apple_pos": [x,y,z],
 "ee_pos": [x,y,z],
 "jacobian": [21 floats] (3x7 pos-Jacobian, row-major),
-"default_arm_pos": [7 floats]}
+"default_arm_pos": [7 floats],
+"obs_policy": [28 floats] (flat AppleGrasp policy obs vector --
+lets an external client replay policy.pt via
+scripts/reach_apple_hybrid.py)}
 All positions are WORLD frame, env-origin already
 subtracted (irrelevant for single-env but kept for
 correctness if you scale to --num_envs > 1 later —
@@ -281,9 +284,16 @@ def _get_actions(device, action_shape):
 
 def _publish_state(robot: Articulation, apple: RigidObject,
                    torso_idx: int, arm_joint_idx: list,
-                   ik_extractor: IKStateExtractor):
+                   ik_extractor: IKStateExtractor, obs_policy: list | None = None):
     """Publish current torso pose (world), right-arm joint angles, apple position (world),
-    and IK-relevant data (ee_pos, jacobian, default_arm_pos)."""
+    IK-relevant data (ee_pos, jacobian, default_arm_pos), and the flat policy observation
+    vector (obs_policy). The latter is what lets an external DDS client (e.g.
+    reach_apple_hybrid.py) replay the SAME exported policy.pt outside this process: the
+    exported JIT module already bakes in the observation normalizer, so feeding it this raw
+    obs vector reproduces exactly what policy_module(obs["policy"]) would output in-process
+    for --policy. Always published (even when this script isn't itself in --policy mode) so
+    an external RL-driven client can consume it -- obs is computed by env.step()/reset()
+    regardless of who supplies the actions."""
     if not _dds_ok or _state_publisher is None:
         return
     try:
@@ -302,6 +312,7 @@ def _publish_state(robot: Articulation, apple: RigidObject,
             "arm_joint_pos": arm_pos,
             "apple_pos": apple_pos,
             **ik_state,   # ee_pos, jacobian, default_arm_pos
+            "obs_policy": obs_policy,
         }
         _state_publisher.Write(String_(data=json.dumps(payload)))
     except Exception as e:
@@ -579,7 +590,8 @@ def main():
             obs, reward, terminated, truncated, info = env.step(actions)
             stem.update(env)
 
-            _publish_state(robot, apple, torso_idx, arm_joint_idx, ik_extractor)
+            _publish_state(robot, apple, torso_idx, arm_joint_idx, ik_extractor,
+                           obs_policy=obs["policy"][0].tolist())
 
             step += 1
             if terminated.any() or truncated.any():
