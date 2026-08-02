@@ -44,6 +44,8 @@ import json
 # ── Isaac Lab app must be set up BEFORE any omni/isaacsim imports ────────────
 from isaaclab.app import AppLauncher
 
+BASE_DIR =  "/home/pablo_kevin/dex3_rl_manipulation"
+
 parser = argparse.ArgumentParser(description="Apple Grasp Environment Viewer")
 parser.add_argument("--num_envs",       type=int,  default=1,    help="Number of parallel envs")
 parser.add_argument("--debug_links",    action="store_true",      help="Print all robot link names and exit")
@@ -325,7 +327,7 @@ def _find_last_policy():
     "PytorchStreamReader failed locating file constants.pkl"). The exported
     file only exists once play.py has been run against that run at least
     once (play.py is what calls export_policy_as_jit)."""
-    base_dir = "/home/pablo_kevin/dex3_rl_manipulation/logs/rsl_rl/apple_grasp_reach"
+    base_dir = BASE_DIR + "/logs/rsl_rl/apple_grasp_reach"
     # Get the newest folder (alphabetical order works for YYYY-MM-DD_HH-MM-SS)
     latest_folder = max(os.listdir(base_dir))
     exported_path = os.path.join(base_dir, latest_folder, "exported", "policy.pt")
@@ -421,6 +423,8 @@ def main():
     if args_cli.policy:
         if args_cli.policy == "last":
             policy_path = _find_last_policy()
+        elif args_cli.policy == "best":
+            policy_path = BASE_DIR + "/envs/agents/best_weights/reach_apple.pt"
         else:
             policy_path = args_cli.policy
         policy_module = torch.jit.load(policy_path, map_location=env.device).eval()

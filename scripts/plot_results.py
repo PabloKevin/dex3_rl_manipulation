@@ -286,7 +286,7 @@ def fig_smooth(res, res_abl, outdir: str) -> tuple[str, int]:
 #  RL vs CasADi commanded-trajectory comparison
 # ═════════════════════════════════════════════════════════════════════════
 
-def fig_compare(res, traj_path: str, outdir: str) -> tuple[str, int]:
+def fig_compare(res, traj_path: str, outdir: str, hybrid_path: str | None = None) -> tuple[str, int]:
     """Two-row comparison: learned policy (top) vs CasADi IK (bottom).
 
     Both rows show the COMMANDED joint trajectory, which is the only quantity
@@ -338,13 +338,28 @@ def fig_compare(res, traj_path: str, outdir: str) -> tuple[str, int]:
     # trace simply ends where its episode terminated on success.
     t_lim = (0.0, float(max(t_rl[-1], t_ca[-1])))
 
-    fig, axes = ps.figure("double", height=3.6, nrows=2, ncols=4)
-    rows = [("Learned policy", t_rl, td_rl, q_rl, v_rl, a_rl, ee_rl),
-            ("CasADi IK", t_ca, td_ca, q_ca, v_ca, a_ca, ee_ca)]
+    rows = [("Learned policy", t_rl, td_rl, q_rl, v_rl, a_rl, ee_rl, None),
+            ("CasADi IK", t_ca, td_ca, q_ca, v_ca, a_ca, ee_ca, None)]
+
+    hand_t = None
+    if hybrid_path and os.path.exists(hybrid_path):
+        with np.load(hybrid_path, allow_pickle=False) as z:
+            hy = {k: z[k] for k in z.files}
+        hmeta = json.loads(str(hy["meta_json"]))
+        q_hy = hy["q"]
+        v_hy, a_hy = derivs(q_hy)
+        t_hy = np.arange(q_hy.shape[0]) * dt
+        hand_t = hmeta["handoff_tick"] * dt
+        rows.append(("Hybrid", t_hy, t_hy[SKIP:], q_hy, v_hy, a_hy, hy["ee"], hand_t))
+        t_lim = (0.0, float(max(t_lim[1], t_hy[-1])))
+    else:
+        print(f"[warn] no hybrid trajectory at {hybrid_path}; comparison stays two-row")
+
+    fig, axes = ps.figure("double", height=1.45 * len(rows), nrows=len(rows), ncols=4)
     v_max = float(res.meta.get("max_velocity", 2.0))
     a_max = float(res.meta.get("max_acceleration", 15.0))
 
-    for r, (name, t, td, q, v, a, ee) in enumerate(rows):
+    for r, (name, t, td, q, v, a, ee, hmark) in enumerate(rows):
         for k in range(7):
             c = ps.JOINT_RAMP[k % len(ps.JOINT_RAMP)]
             axes[r, 0].plot(t, q[:, k], color=c, lw=0.9)
@@ -364,7 +379,10 @@ def fig_compare(res, traj_path: str, outdir: str) -> tuple[str, int]:
         for c_i in range(4):
             ps.hairline_grid(axes[r, c_i])
             axes[r, c_i].set_xlim(*t_lim)
-            if r == 1:
+            if hmark is not None:
+                ps.threshold(axes[r, c_i], hmark, "v",
+                             "handoff" if c_i == 0 else None)
+            if r == len(rows) - 1:
                 axes[r, c_i].set_xlabel("time [s]")
         axes[r, 1].set_ylim(-1.35 * v_max, 1.35 * v_max)
         axes[r, 2].set_ylim(-1.45 * a_max, 1.45 * a_max)
@@ -373,7 +391,9 @@ def fig_compare(res, traj_path: str, outdir: str) -> tuple[str, int]:
     # two thirds of that axes is empty and the legend covers no data.
     ps.joint_key(axes[1, 0], [str(s) for s in res.joint_names], loc="center right", ncol=2)
     axes[0, 3].legend(loc="lower right", ncol=3, fontsize=6)
-    for a_, tag in zip(axes.ravel(), ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)"]):
+    tags = ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)",
+            "(i)", "(j)", "(k)", "(l)"]
+    for a_, tag in zip(axes.ravel(), tags):
         ps.panel_tag(a_, tag, x=-0.30, y=1.02)
     return ps.finish(fig, os.path.join(outdir, "fig_compare.pdf")), ep
 
@@ -461,7 +481,8 @@ def fig_geometry(res, outdir: str) -> str:
 #  Macros
 # ═════════════════════════════════════════════════════════════════════════
 
-def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = None) -> str:
+def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = None,
+                hyb: dict | None = None) -> str:
     def md(st, fmt="{:.1f}"):
         return fmt.format(st["median"]) if st and st.get("n", 0) else r"\PLACEHOLDER"
 
@@ -524,6 +545,23 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = 
             f"\\newcommand{{\\RLspeedup}}{{{cs['solve_ms_median']/rl_ms:.0f}$\\times$}}",
             "",
         ]
+    if hyb:
+        h = hyb["summary"]
+        L += [
+            "% --- hybrid RL -> CasADi ---",
+            f"\\newcommand{{\\HYBsuccess}}{{{100*h['within_tol_rate']:.1f}\\%}}",
+            f"\\newcommand{{\\HYBpos}}{{{100*h['pos_within_rate']:.1f}\\%}}",
+            f"\\newcommand{{\\HYBori}}{{{100*h['ori_within_rate']:.1f}\\%}}",
+            f"\\newcommand{{\\HYBdfinal}}{{{h['d_final_mm_median']:.2f}}}",
+            f"\\newcommand{{\\HYBtheta}}{{{h['theta_deg_median']:.2f}}}",
+            f"\\newcommand{{\\HYBttotal}}{{{h['t_total_s_median']:.2f}}}",
+            f"\\newcommand{{\\HYBcompute}}{{{h['compute_ms_per_episode_median']:.0f}}}",
+            f"\\newcommand{{\\HYBhandoff}}{{{h['handoff_time_s_median']:.2f}}}",
+            f"\\newcommand{{\\HYBbyprox}}{{{100*h['handoff_by_proximity']:.0f}\\%}}",
+            f"\\newcommand{{\\HYBpeakvel}}{{{h['peak_vel_median']:.2f}}}",
+            f"\\newcommand{{\\HYBjerk}}{{{h['jerk_rms_median']:.0f}}}",
+            "",
+        ]
     with open(path, "w") as f:
         f.write("\n".join(L))
     return path
@@ -544,6 +582,8 @@ def main() -> None:
     p.add_argument("--emit-macros", default=os.path.join(repo, "paper", "results_macros.tex"))
     p.add_argument("--casadi-bench", default=os.path.join(repo, "results", "casadi_bench.npz"))
     p.add_argument("--casadi-traj", default=os.path.join(repo, "results", "casadi_traj.npz"))
+    p.add_argument("--hybrid-bench", default=os.path.join(repo, "results", "hybrid_bench.npz"))
+    p.add_argument("--hybrid-traj", default=os.path.join(repo, "results", "hybrid_traj.npz"))
     p.add_argument("--only", default=None,
                    help="training | eval | smooth | geometry | compare")
     args = p.parse_args()
@@ -580,7 +620,7 @@ def main() -> None:
     if only in (None, "geometry"):
         made.append(fig_geometry(res, args.outdir))
     if only in (None, "compare"):
-        path, ep = fig_compare(res, args.casadi_traj, args.outdir)
+        path, ep = fig_compare(res, args.casadi_traj, args.outdir, args.hybrid_traj)
         if path:
             made.append(path)
             print(f"[info] trajectory comparison uses episode {ep}")
@@ -592,7 +632,8 @@ def main() -> None:
         s = eu.summarize(res)
         s_abl = eu.summarize(res_abl) if res_abl is not None else None
         cas = _load_casadi_summary(args.casadi_bench)
-        print(f"[info] wrote {emit_macros(args.emit_macros, s, s_abl, res, cas)}")
+        hyb = _load_casadi_summary(args.hybrid_bench)
+        print(f"[info] wrote {emit_macros(args.emit_macros, s, s_abl, res, cas, hyb)}")
 
 
 def _load_casadi_summary(path: str) -> dict | None:
