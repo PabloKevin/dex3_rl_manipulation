@@ -509,6 +509,133 @@ def latex_summary_table(s: dict, s_ablation: dict | None = None,
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  Rate limiter (numpy mirror of envs/mdp/actions.py)
+# ═════════════════════════════════════════════════════════════════════════
+
+def rate_limit_step(q_desired, q_cmd_prev, v_prev, dt, max_velocity, max_acceleration):
+    """One step of RateLimitedJointPositionAction's update law.
+
+        v_des = (q_desired - q_cmd_prev)/dt
+        v     = clip(clip(v_des, +-v_max), v_prev +- a_max*dt)
+        q_cmd = q_cmd_prev + v*dt
+
+    Mirrors envs/mdp/actions.py so an offline replay of a non-RL controller
+    goes through exactly the same interface the policy was trained under.
+    Returns (q_cmd, v).
+    """
+    v_des = (np.asarray(q_desired) - q_cmd_prev) / dt
+    v = np.clip(v_des, -max_velocity, max_velocity)
+    dv = max_acceleration * dt
+    v = np.clip(v, v_prev - dv, v_prev + dv)
+    return q_cmd_prev + v * dt, v
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Forward kinematics (numpy)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Right-arm chain torso_link -> right_hand_palm_link, transcribed from
+# envs/assets/cuRobo/g1_29dof_with_hand_rev_1_0.urdf. These are the SAME
+# numbers scripts/reach_apple_casadi.py builds its symbolic FK from; the two
+# are cross-checked by check_fk_against_casadi() below, which the trajectory
+# tooling calls when casadi is importable.
+#
+# Kept in numpy rather than importing the CasADi module so plot_results.py has
+# no casadi dependency (casadi is installed in the unitree_g1 env, not in the
+# Isaac Lab env the plots run from).
+
+ARM_CHAIN = [
+    ((0.0039563, -0.10021, 0.24778), (-0.27931, 5.4949e-05, 1.9159e-04), (0, 1, 0)),
+    ((0.0, -0.038, -0.013831),       (0.27925, 0.0, 0.0),                (1, 0, 0)),
+    ((0.0, -0.00624, -0.1032),       (0.0, 0.0, 0.0),                    (0, 0, 1)),
+    ((0.015783, 0.0, -0.080518),     (0.0, 0.0, 0.0),                    (0, 1, 0)),
+    ((0.100, -0.00188791, -0.010),   (0.0, 0.0, 0.0),                    (1, 0, 0)),
+    ((0.038, 0.0, 0.0),              (0.0, 0.0, 0.0),                    (0, 1, 0)),
+    ((0.046, 0.0, 0.0),              (0.0, 0.0, 0.0),                    (0, 0, 1)),
+]
+PALM_FIXED_OFFSET = np.array([0.0415, -0.003, 0.0])
+
+
+def _rot_rpy(roll, pitch, yaw):
+    """URDF <origin rpy>: fixed-axis X then Y then Z, i.e. R = Rz @ Ry @ Rx."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def _rot_axis(axis, q):
+    """Rotation of angle q (array) about a basis axis -> (..., 3, 3)."""
+    c, s = np.cos(q), np.sin(q)
+    o, z = np.ones_like(c), np.zeros_like(c)
+    if axis == (1, 0, 0):
+        rows = [[o, z, z], [z, c, -s], [z, s, c]]
+    elif axis == (0, 1, 0):
+        rows = [[c, z, s], [z, o, z], [-s, z, c]]
+    elif axis == (0, 0, 1):
+        rows = [[c, -s, z], [s, c, z], [z, z, o]]
+    else:
+        raise ValueError(f"unsupported axis {axis}")
+    return np.stack([np.stack(r, axis=-1) for r in rows], axis=-2)
+
+
+def forward_kinematics(q: np.ndarray, palm_local_offset=(0.0, 0.0, 0.0)):
+    """Palm grasp-reference position and normal in the torso frame.
+
+    Args:
+        q: (..., 7) joint angles, in RIGHT_ARM_JOINTS order.
+        palm_local_offset: offset in the palm link's own frame out to the
+            scored grasp reference point.
+
+    Returns:
+        (pos (..., 3), normal_axis_matrix (..., 3, 3)) -- the rotation maps
+        palm-local directions to torso frame, so the palm normal for a local
+        axis n is R @ n.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    batch = q.shape[:-1]
+    p = np.zeros(batch + (3,))
+    R = np.broadcast_to(np.eye(3), batch + (3, 3)).copy()
+    for i, (xyz, rpy, axis) in enumerate(ARM_CHAIN):
+        p = p + np.einsum("...ij,j->...i", R, np.asarray(xyz))
+        R = R @ _rot_rpy(*rpy)
+        R = R @ _rot_axis(axis, q[..., i])
+    p = p + np.einsum("...ij,j->...i", R, PALM_FIXED_OFFSET)
+    off = np.asarray(palm_local_offset, dtype=np.float64)
+    if np.any(off):
+        p = p + np.einsum("...ij,j->...i", R, off)
+    return p, R
+
+
+def check_fk_against_casadi(n: int = 25, tol: float = 1e-9, seed: int = 0) -> bool:
+    """Assert this numpy FK matches reach_apple_casadi's symbolic one.
+
+    Returns False (with a printed note) if casadi is unavailable, so callers can
+    treat it as a best-effort guard rather than a hard dependency.
+    """
+    try:
+        import reach_apple_casadi as rac
+    except Exception as e:  # noqa: BLE001
+        print(f"[fk-check] skipped, casadi/reach_apple_casadi unavailable ({e})")
+        return False
+    rng = np.random.default_rng(seed)
+    ik = rac.CasadiIK(w_pos=1.0, w_ori=1.0, w_reg=1.0)
+    worst = 0.0
+    for _ in range(n):
+        q = rng.uniform(-1.0, 1.0, size=7)
+        gp_ca, _ = ik.fk_fn(q.tolist())
+        gp_ca = np.asarray(gp_ca).flatten()
+        gp_np, _ = forward_kinematics(q, rac.PALM_LOCAL_OFFSET)
+        worst = max(worst, float(np.max(np.abs(gp_ca - gp_np))))
+    ok = worst < tol
+    print(f"[fk-check] max |numpy - casadi| = {worst:.3e} m -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Representative-episode selection (for the flagship trajectory figure)
 # ═════════════════════════════════════════════════════════════════════════
 

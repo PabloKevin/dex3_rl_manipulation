@@ -1,0 +1,31 @@
+==============================================================================
+CasADi IK benchmark  --  727 targets, environment geometry
+  palm_local_offset=(0.08, 0.0, 0.0)  offset_z=0.0677
+------------------------------------------------------------------------------
+                            cold start      warm start
+------------------------------------------------------------------------------
+solve time median [ms]             6.1             6.5
+solve time p95 [ms]                7.7             9.5
+solve time max [ms]              218.8            19.1
+pos residual med [mm]             0.32            0.87
+pos residual p95 [mm]            81.74           85.08
+ori residual med [deg]            6.37            6.30
+ori residual p95 [deg]           13.65           17.53
+within both tol                  0.806           0.768
+within pos tol                   0.806           0.784
+within ori tol                   0.986           0.946
+------------------------------------------------------------------------------
+RL policy (closed-loop, 5 s of physics, includes the 0.5 s hold):
+  success rate                0.484
+  position criterion alone    0.968
+  orientation criterion alone 0.938
+  final pos error (succ) [mm] 20.1
+  final ori error (succ) [deg]14.5
+  time to settled success [s] 2.01
+  forward-pass time [ms]      cpu_ms=0.020  cuda_ms=0.048
+------------------------------------------------------------------------------
+NOTE: CasADi residuals are open-loop kinematic error (the arm is never
+      simulated); RL errors are closed-loop realised error after 5 s of
+      physics. Solve time vs forward-pass time is the directly
+      comparable pair; so is 'can this target be satisfied at all'.
+==============================================================================

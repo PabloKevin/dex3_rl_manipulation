@@ -40,10 +40,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import eval_utils as eu
 import plot_style as ps
 
-# Measured rigid-chain length shoulder->elbow->wrist->palm (probe_arm_reach.py),
-# plus PALM_LOCAL_OFFSET out to the grasp reference point. Drawn on the coverage
-# panel because the sampler's r_max exceeds it.
-ARM_REACH_M = 0.42 + 0.14
+# Measured rigid-chain length shoulder->elbow->wrist->palm (probe_arm_reach.py).
+# The grasp reference point sits a further PALM_LOCAL_OFFSET along the palm's
+# local +x, so the reachable radius for the SCORED point is the sum. The offset
+# is read from the run's own metadata rather than hardcoded -- it has changed
+# during development and a stale copy here would mislabel the coverage panel.
+ARM_CHAIN_M = 0.42
+
+
+def arm_reach(res) -> float:
+    return ARM_CHAIN_M + float(np.linalg.norm(res.meta["palm_local_offset"]))
 
 TB_TAGS = [
     "Train/mean_reward",
@@ -182,7 +188,7 @@ def fig_eval(res, outdir: str) -> str:
                       marker="o", edgecolors="white", **common)
     m = res.meta
     ps.threshold(ax_w, m["reach_max"], "h", "sampler $r_{\\max}$", halo=True)
-    ps.threshold(ax_w, ARM_REACH_M, "h", "measured arm reach", label_x=0.62, halo=True)
+    ps.threshold(ax_w, arm_reach(res), "h", "measured arm reach", label_x=0.62, halo=True)
     ax_w.set_xlabel("fruit azimuth [deg]")
     ax_w.set_ylabel("shoulder radius $r_{3D}$ [m]")
     # Neutral legend markers: shape carries the class, not colour (colour is
@@ -277,6 +283,102 @@ def fig_smooth(res, res_abl, outdir: str) -> tuple[str, int]:
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  RL vs CasADi commanded-trajectory comparison
+# ═════════════════════════════════════════════════════════════════════════
+
+def fig_compare(res, traj_path: str, outdir: str) -> tuple[str, int]:
+    """Two-row comparison: learned policy (top) vs CasADi IK (bottom).
+
+    Both rows show the COMMANDED joint trajectory, which is the only quantity
+    both pipelines produce: for the policy it is the rate-limited action term
+    output (traj_u), for CasADi the same limiter applied to its IK solution.
+    Comparing the policy's *measured* joints against CasADi's *commanded* ones
+    would confound controller behaviour with actuator tracking.
+
+    Cartesian end-effector paths are reconstructed by applying the same numpy
+    forward kinematics to both joint sequences, so the two are in one frame and
+    one model.
+    """
+    if not os.path.exists(traj_path):
+        print(f"[warn] no CasADi trajectory at {traj_path}; skipping the comparison figure")
+        return "", -1
+
+    with np.load(traj_path, allow_pickle=False) as z:
+        cas = {k: z[k] for k in z.files}
+    cmeta = json.loads(str(cas["meta_json"]))
+    ep = int(cmeta["episode_index"])
+    dt = float(res.dt)
+    palm_off = res.meta["palm_local_offset"]
+
+    n_rl = int(res.traj_mask[ep].sum())
+    q_rl = res.traj_u[ep, :n_rl]                     # commanded joint targets
+    q_ca = cas["q"]
+    n_ca = q_ca.shape[0]
+
+    # Drop the first two samples before differentiating: both controllers
+    # re-anchor their command buffer to the measured joint state at t=0, so the
+    # opening sample is a bookkeeping step rather than commanded motion and
+    # would show up as a spurious acceleration spike past the configured bound.
+    SKIP = 2
+
+    def derivs(q):
+        v = np.gradient(q, dt, axis=0)
+        a = np.gradient(v, dt, axis=0)
+        return v[SKIP:], a[SKIP:]
+
+    v_rl, a_rl = derivs(q_rl)
+    v_ca, a_ca = derivs(q_ca)
+    ee_rl, _ = eu.forward_kinematics(q_rl, palm_off)
+    ee_ca = cas["ee"]
+
+    t_rl = np.arange(n_rl) * dt
+    t_ca = np.arange(n_ca) * dt
+    td_rl, td_ca = t_rl[SKIP:], t_ca[SKIP:]
+    # One shared time axis so the two rows are visually comparable; the policy
+    # trace simply ends where its episode terminated on success.
+    t_lim = (0.0, float(max(t_rl[-1], t_ca[-1])))
+
+    fig, axes = ps.figure("double", height=3.6, nrows=2, ncols=4)
+    rows = [("Learned policy", t_rl, td_rl, q_rl, v_rl, a_rl, ee_rl),
+            ("CasADi IK", t_ca, td_ca, q_ca, v_ca, a_ca, ee_ca)]
+    v_max = float(res.meta.get("max_velocity", 2.0))
+    a_max = float(res.meta.get("max_acceleration", 15.0))
+
+    for r, (name, t, td, q, v, a, ee) in enumerate(rows):
+        for k in range(7):
+            c = ps.JOINT_RAMP[k % len(ps.JOINT_RAMP)]
+            axes[r, 0].plot(t, q[:, k], color=c, lw=0.9)
+            axes[r, 1].plot(td, v[:, k], color=c, lw=0.9)
+            axes[r, 2].plot(td, a[:, k], color=c, lw=0.9)
+        ps.threshold(axes[r, 1], v_max, "h")
+        ps.threshold(axes[r, 1], -v_max, "h")
+        ps.threshold(axes[r, 2], a_max, "h")
+        ps.threshold(axes[r, 2], -a_max, "h")
+        for j, lab in enumerate(("x", "y", "z")):
+            axes[r, 3].plot(t, ee[:, j], color=ps.CATEGORICAL[j],
+                            ls=[ps.LS_MAIN, ps.LS_ALT, (0, (1, 1.4))][j], lw=1.0, label=lab)
+        axes[r, 0].set_ylabel(f"{name}\njoint pos. [rad]")
+        axes[r, 1].set_ylabel("joint vel. [rad/s]")
+        axes[r, 2].set_ylabel("joint acc. [rad/s$^2$]")
+        axes[r, 3].set_ylabel("EE position [m]")
+        for c_i in range(4):
+            ps.hairline_grid(axes[r, c_i])
+            axes[r, c_i].set_xlim(*t_lim)
+            if r == 1:
+                axes[r, c_i].set_xlabel("time [s]")
+        axes[r, 1].set_ylim(-1.35 * v_max, 1.35 * v_max)
+        axes[r, 2].set_ylim(-1.45 * a_max, 1.45 * a_max)
+
+    # Key goes in the CasADi position panel: it settles by ~1 s, so the right
+    # two thirds of that axes is empty and the legend covers no data.
+    ps.joint_key(axes[1, 0], [str(s) for s in res.joint_names], loc="center right", ncol=2)
+    axes[0, 3].legend(loc="lower right", ncol=3, fontsize=6)
+    for a_, tag in zip(axes.ravel(), ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)"]):
+        ps.panel_tag(a_, tag, x=-0.30, y=1.02)
+    return ps.finish(fig, os.path.join(outdir, "fig_compare.pdf")), ep
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Geometry schematic (paper Fig. 1d)
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -359,7 +461,7 @@ def fig_geometry(res, outdir: str) -> str:
 #  Macros
 # ═════════════════════════════════════════════════════════════════════════
 
-def emit_macros(path: str, s: dict, s_abl: dict | None, res) -> str:
+def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = None) -> str:
     def md(st, fmt="{:.1f}"):
         return fmt.format(st["median"]) if st and st.get("n", 0) else r"\PLACEHOLDER"
 
@@ -402,6 +504,26 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res) -> str:
         f"\\newcommand{{\\REScmdaccOn}}{{{chk.get('cmd_acc_max', float('nan')):.1f}\\,rad/s$^2$}}",
         "",
     ]
+    if cas:
+        cs, cw, csum = cas["summary"]["cold"], cas["summary"]["warm"], cas["summary"]
+        rl_ms = csum.get("rl_inference", {}).get("cpu_ms", float("nan"))
+        L += [
+            "% --- CasADi IK comparison ---",
+            f"\\newcommand{{\\CASntargets}}{{{cas['n_targets']}}}",
+            f"\\newcommand{{\\CASsolveMed}}{{{cs['solve_ms_median']:.1f}}}",
+            f"\\newcommand{{\\CASsolvePninetyfive}}{{{cs['solve_ms_p95']:.1f}}}",
+            f"\\newcommand{{\\CASsolveMax}}{{{cs['solve_ms_max']:.0f}}}",
+            f"\\newcommand{{\\CASposMed}}{{{cs['pos_err_mm_median']:.2f}}}",
+            f"\\newcommand{{\\CASposPninetyfive}}{{{cs['pos_err_mm_p95']:.0f}}}",
+            f"\\newcommand{{\\CASoriMed}}{{{cs['theta_deg_median']:.1f}}}",
+            f"\\newcommand{{\\CASfeasible}}{{{100*cs['within_tol_rate']:.1f}\\%}}",
+            f"\\newcommand{{\\CASposfeasible}}{{{100*cs['pos_within_rate']:.1f}\\%}}",
+            f"\\newcommand{{\\CASorifeasible}}{{{100*cs['ori_within_rate']:.1f}\\%}}",
+            f"\\newcommand{{\\CASwarmMed}}{{{cw['solve_ms_median']:.1f}}}",
+            f"\\newcommand{{\\RLforward}}{{{rl_ms:.3f}}}",
+            f"\\newcommand{{\\RLspeedup}}{{{cs['solve_ms_median']/rl_ms:.0f}$\\times$}}",
+            "",
+        ]
     with open(path, "w") as f:
         f.write("\n".join(L))
     return path
@@ -420,7 +542,10 @@ def main() -> None:
     p.add_argument("--run-control", default="2026-07-31_05-42-13")
     p.add_argument("--outdir", default=os.path.join(repo, "paper", "figures"))
     p.add_argument("--emit-macros", default=os.path.join(repo, "paper", "results_macros.tex"))
-    p.add_argument("--only", default=None, help="training | eval | smooth | geometry")
+    p.add_argument("--casadi-bench", default=os.path.join(repo, "results", "casadi_bench.npz"))
+    p.add_argument("--casadi-traj", default=os.path.join(repo, "results", "casadi_traj.npz"))
+    p.add_argument("--only", default=None,
+                   help="training | eval | smooth | geometry | compare")
     args = p.parse_args()
 
     ps.apply_ieee_style()
@@ -454,6 +579,11 @@ def main() -> None:
               f"t_success={res.t_success[idx]:.2f}s, r3d={res.r3d_target[idx]:.3f}m)")
     if only in (None, "geometry"):
         made.append(fig_geometry(res, args.outdir))
+    if only in (None, "compare"):
+        path, ep = fig_compare(res, args.casadi_traj, args.outdir)
+        if path:
+            made.append(path)
+            print(f"[info] trajectory comparison uses episode {ep}")
 
     for f in made:
         print(f"[info] wrote {f}")
@@ -461,7 +591,16 @@ def main() -> None:
     if args.emit_macros and only is None:
         s = eu.summarize(res)
         s_abl = eu.summarize(res_abl) if res_abl is not None else None
-        print(f"[info] wrote {emit_macros(args.emit_macros, s, s_abl, res)}")
+        cas = _load_casadi_summary(args.casadi_bench)
+        print(f"[info] wrote {emit_macros(args.emit_macros, s, s_abl, res, cas)}")
+
+
+def _load_casadi_summary(path: str) -> dict | None:
+    if not os.path.exists(path):
+        print(f"[warn] no CasADi benchmark at {path}; its macros stay as placeholders")
+        return None
+    with np.load(path, allow_pickle=False) as z:
+        return json.loads(str(z["meta_json"]))
 
 
 if __name__ == "__main__":

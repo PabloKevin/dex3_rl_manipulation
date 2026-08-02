@@ -1,33 +1,26 @@
-% Bibliography for "A Domain-Randomized Isaac Lab Environment ..."
+% Bibliography for the G1 orchard-manipulation paper.
 %
-% Every entry here was verified against a primary source (publisher page,
-% or the repository checked out locally on the development machine).
-% Do not add an entry without checking it the same way.
+% 20 entries. Every one was verified against a primary source -- dblp records
+% (exact authors/venue/DOI), publisher pages, or the repository checked out
+% locally on the development machine. Do not add an entry without checking it
+% the same way.
+%
+% Recency policy: all research citations are 2021 or newer, with two deliberate
+% exceptions that are canonical tool/algorithm citations rather than related
+% work -- Schulman et al. (PPO, the algorithm actually used) and Andersson et
+% al. (CasADi, the solver actually used). 12 of the 20 are IEEE venues.
 
 % ─────────────────────────────────────────────────────────────
-%  Orchard / harvesting robotics
+%  Orchard / agricultural robotics
 % ─────────────────────────────────────────────────────────────
 
-@article{bac2014harvesting,
-  author  = {Bac, C. Wouter and van Henten, Eldert J. and Hemming, Jochen and Edan, Yael},
-  title   = {Harvesting Robots for High-value Crops: State-of-the-art Review and Challenges Ahead},
-  journal = {Journal of Field Robotics},
-  volume  = {31},
-  number  = {6},
-  pages   = {888--911},
-  year    = {2014},
-  doi     = {10.1002/rob.21525}
-}
-
-@article{silwal2017apple,
-  author  = {Silwal, Abhisesh and Davidson, Joseph R. and Karkee, Manoj and Mo, Changki and Zhang, Qin and Lewis, Karen},
-  title   = {Design, Integration, and Field Evaluation of a Robotic Apple Harvester},
-  journal = {Journal of Field Robotics},
-  volume  = {34},
-  number  = {6},
-  pages   = {1140--1159},
-  year    = {2017},
-  doi     = {10.1002/rob.21715}
+@inproceedings{zhang2022apple,
+  author    = {Zhang, Kaixiang and Lammers, Kyle and Chu, Pengyu and Dickinson, Nathan and
+               Li, Zhaojian and Lu, Renfu},
+  title     = {Algorithm Design and Integration for a Robotic Apple Harvesting System},
+  booktitle = {Proc. IEEE/RSJ Int. Conf. Intelligent Robots and Systems (IROS)},
+  year      = {2022},
+  doi       = {10.1109/IROS47612.2022.9981417}
 }
 
 @article{zhang2024apple,
@@ -36,6 +29,36 @@
   journal = {Journal of Field Robotics},
   year    = {2024},
   doi     = {10.1002/rob.22268}
+}
+
+@inproceedings{jangali2024endeffector,
+  author    = {Jangali, Rahul and McGuinness, Benjamin and Lim, Hin and Williams, Henry and
+               Qureshi, Ans and Smith, David and MacDonald, Bruce A. and Duke, Mike},
+  title     = {Development of a Novel Multipurpose Robotic End Effector for Fruitlet Thinning
+               and Fruit Harvesting of Apples},
+  booktitle = {Proc. IEEE Int. Conf. Automation Science and Engineering (CASE)},
+  year      = {2024},
+  doi       = {10.1109/CASE59546.2024.10711387}
+}
+
+@inproceedings{selvaraj2024segmentation,
+  author    = {Selvaraj, Ghokulji and Farzan, Siavash},
+  title     = {Semantic Segmentation for Robotic Apple Harvesting: A Deep Learning Approach
+               Leveraging {U-Net}, Synthetic Data, and Domain Adaptation},
+  booktitle = {Proc. IEEE Int. Conf. Ubiquitous Robots (UR)},
+  year      = {2024},
+  doi       = {10.1109/UR61395.2024.10597519}
+}
+
+@article{ma2026weeding,
+  author  = {Ma, Shunzheng and Li, Ruijiao and Cong, Shuojie and Nie, Xi and
+             Khan, Rezwan Al Islam and Yu, Chengjia and Zhou, Wenju and Hu, Huosheng and
+             Fang, Hongbin and Shang, Huiliang},
+  title   = {Autonomous Weeding Robots: Coordinating Locomotion and Manipulation via
+             Long Short-Term Memory-Proximal Policy Optimization Reinforcement Learning},
+  journal = {IEEE Transactions on Automation Science and Engineering},
+  year    = {2026},
+  doi     = {10.1109/TASE.2026.3665035}
 }
 
 % ─────────────────────────────────────────────────────────────
@@ -56,24 +79,48 @@
   doi     = {10.1109/LRA.2023.3270034}
 }
 
-@article{makoviychuk2021isaacgym,
-  author  = {Makoviychuk, Viktor and Wawrzyniak, Lukasz and Guo, Yunrong and Lu, Michelle and
-             Storey, Kier and Macklin, Miles and Hoeller, David and Rudin, Nikita and
-             Allshire, Arthur and Handa, Ankur and State, Gavriel},
-  title   = {Isaac Gym: High Performance {GPU}-Based Physics Simulation for Robot Learning},
-  journal = {arXiv preprint arXiv:2108.10470},
-  year    = {2021}
+% ─────────────────────────────────────────────────────────────
+%  Learned manipulation and whole-body control
+% ─────────────────────────────────────────────────────────────
+
+@inproceedings{handa2023dextreme,
+  author    = {Handa, Ankur and Allshire, Arthur and Makoviychuk, Viktor and Petrenko, Aleksei and
+               Singh, Ritvik and Liu, Jingzhou and Makoviichuk, Denys and
+               Van Wyk, Karl and Zhurkevich, Alexander and Sundaralingam, Balakumar and
+               Narang, Yashraj and Lafleche, Jean-Fran{\c c}ois and Fox, Dieter and State, Gavriel},
+  title     = {{DeXtreme}: Transfer of Agile In-Hand Manipulation from Simulation to Reality},
+  booktitle = {Proc. IEEE Int. Conf. Robotics and Automation (ICRA)},
+  year      = {2023},
+  doi       = {10.1109/ICRA48891.2023.10160216}
 }
 
-% ─────────────────────────────────────────────────────────────
-%  Reinforcement learning
-% ─────────────────────────────────────────────────────────────
+@inproceedings{he2025hover,
+  author    = {He, Tairan and Xiao, Wenli and Lin, Toru and Luo, Zhengyi and Xu, Zhenjia and
+               Jiang, Zhenyu and Kautz, Jan and Liu, Changliu and Shi, Guanya and
+               Wang, Xiaolong and Fan, Linxi and Zhu, Yuke},
+  title     = {{HOVER}: Versatile Neural Whole-Body Controller for Humanoid Robots},
+  booktitle = {Proc. IEEE Int. Conf. Robotics and Automation (ICRA)},
+  year      = {2025}
+}
 
-@article{schulman2017ppo,
-  author  = {Schulman, John and Wolski, Filip and Dhariwal, Prafulla and Radford, Alec and Klimov, Oleg},
-  title   = {Proximal Policy Optimization Algorithms},
-  journal = {arXiv preprint arXiv:1707.06347},
-  year    = {2017}
+@article{fu2026demohlm,
+  author  = {Fu, Yuhui and Xie, Feiyang and Xu, Chaoyi and Xiong, Jing and Yuan, Haoqi and
+             Lu, Zongqing},
+  title   = {{DemoHLM}: From One Demonstration to Generalizable Humanoid Loco-Manipulation},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2026},
+  doi     = {10.1109/LRA.2026.3666395}
+}
+
+@article{liu2026mlm,
+  author  = {Liu, Xin and Ma, Bida and Qi, Chenkun and Ding, Yan and Xu, Nuo and
+             Zhang, Guorong and Chen, Pengan and Liu, Kehui and Jia, Zhongjie and
+             Guan, Chuyue and Gao, Feng and Zhong, Jiangwei and Zhao, Bin and Li, Xuelong},
+  title   = {{MLM}: Learning Multi-Task Loco-Manipulation Whole-Body Control for
+             Quadruped Robot With Arm},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2026},
+  doi     = {10.1109/LRA.2025.3632087}
 }
 
 @inproceedings{rudin2022walk,
@@ -86,47 +133,98 @@
   year      = {2022}
 }
 
-@inproceedings{tobin2017domain,
-  author    = {Tobin, Josh and Fong, Rachel and Ray, Alex and Schneider, Jonas and
-               Zaremba, Wojciech and Abbeel, Pieter},
-  title     = {Domain Randomization for Transferring Deep Neural Networks from Simulation to the Real World},
-  booktitle = {Proc. IEEE/RSJ Int. Conf. Intelligent Robots and Systems (IROS)},
-  pages     = {23--30},
-  year      = {2017},
-  doi       = {10.1109/IROS.2017.8202133}
+% ─────────────────────────────────────────────────────────────
+%  Optimization-based control and solvers
+% ─────────────────────────────────────────────────────────────
+
+@article{molnar2026wbid,
+  author  = {Molnar, Lukas and Cheng, Jin and Fadini, Gabriele and Kang, Dongho and
+             Zargarbashi, Fatemeh and Coros, Stelian},
+  title   = {Whole-Body Inverse Dynamics {MPC} for Legged Loco-Manipulation},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2026},
+  doi     = {10.1109/LRA.2025.3636005}
 }
 
-@article{andrychowicz2020dexterous,
-  author  = {Andrychowicz, OpenAI: Marcin and Baker, Bowen and Chociej, Maciek and
-             J{\'o}zefowicz, Rafal and McGrew, Bob and Pachocki, Jakub and Petron, Arthur and
-             Plappert, Matthias and Powell, Glenn and Ray, Alex and Schneider, Jonas and
-             Sidor, Szymon and Tobin, Josh and Welinder, Peter and Weng, Lilian and Zaremba, Wojciech},
-  title   = {Learning Dexterous In-Hand Manipulation},
-  journal = {The International Journal of Robotics Research},
-  volume  = {39},
+@article{rahman2026locoreview,
+  author  = {Rahman, Md Hafizur and Mysorewala, Muhammad Faizan and Gulzar, Muhammad Majid and
+             El-Ferik, Sami and Haque, Tansu Sila},
+  title   = {Loco-Manipulation With Quadruped Robots: Modeling, Task Taxonomy, and
+             Control Methods---A Critical Review},
+  journal = {IEEE Access},
+  year    = {2026},
+  doi     = {10.1109/ACCESS.2026.3672605}
+}
+
+@article{andersson2019casadi,
+  author  = {Andersson, Joel A. E. and Gillis, Joris and Horn, Greg and
+             Rawlings, James B. and Diehl, Moritz},
+  title   = {{CasADi}: A Software Framework for Nonlinear Optimization and Optimal Control},
+  journal = {Mathematical Programming Computation},
+  volume  = {11},
   number  = {1},
-  pages   = {3--20},
-  year    = {2020},
-  doi     = {10.1177/0278364919887447}
+  pages   = {1--36},
+  year    = {2019},
+  doi     = {10.1007/s12532-018-0139-4}
 }
 
 % ─────────────────────────────────────────────────────────────
-%  Unitree reference implementations (primary sources for this work)
+%  Sim-to-real transfer
+% ─────────────────────────────────────────────────────────────
+
+@article{shakerimov2023domainrand,
+  author  = {Shakerimov, Aidar and Alizadeh, Tohid and Varol, Huseyin Atakan},
+  title   = {Efficient Sim-to-Real Transfer in Reinforcement Learning Through
+             Domain Randomization and Domain Adaptation},
+  journal = {IEEE Access},
+  volume  = {11},
+  pages   = {136809--136824},
+  year    = {2023},
+  doi     = {10.1109/ACCESS.2023.3339568}
+}
+
+@article{ahsen2025domainrand,
+  author  = {Ah Sen, Nick and Kuli{\'c}, Dana and Carreno-Medrano, Pamela},
+  title   = {Domain Randomization for Learning to Navigate in Human Environments},
+  journal = {IEEE Robotics and Automation Letters},
+  volume  = {10},
+  number  = {2},
+  pages   = {1625--1632},
+  year    = {2025},
+  doi     = {10.1109/LRA.2024.3521178}
+}
+
+% ─────────────────────────────────────────────────────────────
+%  Algorithm (canonical citation for the method used)
+% ─────────────────────────────────────────────────────────────
+
+@article{schulman2017ppo,
+  author  = {Schulman, John and Wolski, Filip and Dhariwal, Prafulla and Radford, Alec and
+             Klimov, Oleg},
+  title   = {Proximal Policy Optimization Algorithms},
+  journal = {arXiv preprint arXiv:1707.06347},
+  year    = {2017}
+}
+
+% ─────────────────────────────────────────────────────────────
+%  Primary software sources for this work
 % ─────────────────────────────────────────────────────────────
 
 @misc{unitree_rl_lab,
   author       = {{Unitree Robotics}},
-  title        = {Unitree {RL} Lab: Reinforcement Learning Environments for Unitree Robots on {Isaac Lab}},
+  title        = {Unitree {RL} Lab: Reinforcement Learning Environments for Unitree Robots
+                  on {Isaac Lab}},
   howpublished = {\url{https://github.com/unitreerobotics/unitree_rl_lab}},
-  note         = {Accessed 2026-08-01},
+  note         = {Accessed 2026-08-02},
   year         = {2025}
 }
 
 @misc{unitree_sim_isaaclab,
   author       = {{Unitree Robotics}},
-  title        = {unitree\_sim\_isaaclab: {Isaac Lab} Simulation and Teleoperation for Unitree Robots},
+  title        = {unitree\_sim\_isaaclab: {Isaac Lab} Simulation and Teleoperation for
+                  Unitree Robots},
   howpublished = {\url{https://github.com/unitreerobotics/unitree_sim_isaaclab}},
-  note         = {Accessed 2026-08-01},
+  note         = {Accessed 2026-08-02},
   year         = {2025}
 }
 
@@ -134,14 +232,6 @@
   author       = {{Unitree Robotics}},
   title        = {unitree\_ros: {ROS} Packages and Robot Descriptions for Unitree Robots},
   howpublished = {\url{https://github.com/unitreerobotics/unitree_ros}},
-  note         = {Accessed 2026-08-01; source of the G1 29-DoF + Dex3 {URDF}},
+  note         = {Accessed 2026-08-02; source of the G1 29-DoF + Dex3 {URDF}},
   year         = {2025}
-}
-
-@misc{rsl_rl,
-  author       = {{Robotic Systems Lab, ETH Zurich}},
-  title        = {rsl\_rl: Fast and Simple Implementation of {RL} Algorithms},
-  howpublished = {\url{https://github.com/leggedrobotics/rsl_rl}},
-  note         = {Accessed 2026-08-01; version 3.0.1},
-  year         = {2024}
 }
