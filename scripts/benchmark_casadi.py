@@ -356,8 +356,15 @@ def _summarize(out, res, rl_t, n, pos_tol, ori_tol) -> dict:
             "solve_ms_p95": float(np.nanpercentile(out[f"{regime}_solve_ms"], 95)),
             "solve_ms_max": float(np.nanmax(out[f"{regime}_solve_ms"])),
             "pos_err_mm_median": float(np.nanmedian(out[f"{regime}_pos_err"]) * 1e3),
+            # rms, not median: residuals are strongly bimodal (a converged
+            # majority near zero, a badly-off tail from targets outside the
+            # workspace), and the median sits inside the converged cluster
+            # and reports it as if it were the whole population. Squaring
+            # before averaging weights the tail the way it actually matters.
+            "pos_err_mm_rms": float(np.sqrt(np.nanmean(out[f"{regime}_pos_err"] ** 2)) * 1e3),
             "pos_err_mm_p95": float(np.nanpercentile(out[f"{regime}_pos_err"], 95) * 1e3),
             "theta_deg_median": float(np.degrees(np.nanmedian(out[f"{regime}_theta_err"]))),
+            "theta_deg_rms": float(np.degrees(np.sqrt(np.nanmean(out[f"{regime}_theta_err"] ** 2)))),
             "theta_deg_p95": float(np.degrees(np.nanpercentile(out[f"{regime}_theta_err"], 95))),
             "within_tol_rate": float(out[f"{regime}_ok"].mean()),
             "pos_within_rate": float((out[f"{regime}_pos_err"] < pos_tol).mean()),
@@ -386,8 +393,10 @@ def _format(s, which, palm_offset, offset_z) -> str:
             ("solve time p95 [ms]", "solve_ms_p95", "{:.1f}"),
             ("solve time max [ms]", "solve_ms_max", "{:.1f}"),
             ("pos residual med [mm]", "pos_err_mm_median", "{:.2f}"),
+            ("pos residual rms [mm]", "pos_err_mm_rms", "{:.2f}"),
             ("pos residual p95 [mm]", "pos_err_mm_p95", "{:.2f}"),
             ("ori residual med [deg]", "theta_deg_median", "{:.2f}"),
+            ("ori residual rms [deg]", "theta_deg_rms", "{:.2f}"),
             ("ori residual p95 [deg]", "theta_deg_p95", "{:.2f}"),
             ("within both tol", "within_tol_rate", "{:.3f}"),
             ("within pos tol", "pos_within_rate", "{:.3f}"),

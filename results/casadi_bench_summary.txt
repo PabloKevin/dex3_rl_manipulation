@@ -1,28 +1,30 @@
 ==============================================================================
-CasADi IK benchmark  --  64 targets, environment geometry
+CasADi IK benchmark  --  848 targets, environment geometry
   palm_local_offset=(0.08, 0.0, 0.0)  offset_z=0.0700
 ------------------------------------------------------------------------------
                             cold start      warm start
 ------------------------------------------------------------------------------
-solve time median [ms]             6.1             6.0
-solve time p95 [ms]                8.1             8.2
-solve time max [ms]              211.1            13.3
-pos residual med [mm]             1.12            5.65
-pos residual p95 [mm]            86.41           86.40
-ori residual med [deg]            7.71            7.54
-ori residual p95 [deg]           22.17           22.61
-within both tol                  0.672           0.594
-within pos tol                   0.734           0.719
-within ori tol                   0.844           0.766
+solve time median [ms]             5.8             5.2
+solve time p95 [ms]                7.5             8.1
+solve time max [ms]              223.5            13.9
+pos residual med [mm]             0.68           44.82
+pos residual rms [mm]            30.90          100.49
+pos residual p95 [mm]            80.97          204.93
+ori residual med [deg]            7.18           15.27
+ori residual rms [deg]           10.53           19.78
+ori residual p95 [deg]           21.74           34.52
+within both tol                  0.785           0.399
+within pos tol                   0.821           0.475
+within ori tol                   0.903           0.567
 ------------------------------------------------------------------------------
 RL policy (closed-loop, 5 s of physics, includes the 0.5 s hold):
-  success rate                0.312
-  position criterion alone    0.688
-  orientation criterion alone 0.734
-  final pos error (succ) [mm] 29.6
-  final ori error (succ) [deg]14.9
-  time to settled success [s] -1.00
-  forward-pass time [ms]      cpu_ms=0.028  cuda_ms=0.048
+  success rate                0.395
+  position criterion alone    0.817
+  orientation criterion alone 0.847
+  final pos error (succ) [mm] 22.6
+  final ori error (succ) [deg]13.0
+  time to settled success [s] 2.10
+  forward-pass time [ms]      cpu_ms=0.020  cuda_ms=0.049
 ------------------------------------------------------------------------------
 NOTE: CasADi residuals are open-loop kinematic error (the arm is never
       simulated); RL errors are closed-loop realised error after 5 s of

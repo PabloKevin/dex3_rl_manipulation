@@ -476,6 +476,9 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = 
     def md(st, fmt="{:.1f}"):
         return fmt.format(st["median"]) if st and st.get("n", 0) else r"\PLACEHOLDER"
 
+    def rms(st, fmt="{:.1f}"):
+        return fmt.format(st["rms"]) if st and st.get("n", 0) else r"\PLACEHOLDER"
+
     lo, hi = s["success_ci95"]
     chk = s.get("rate_limit_check", {})
     jerk_on = s.get("jerk_rms", {}).get("median")
@@ -503,8 +506,8 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = 
         f"\\newcommand{{\\RESfinalpose}}{{{100*s['final_pose_rate']:.1f}\\%}}",
         f"\\newcommand{{\\RESbestpose}}{{{100*s['best_pose_rate']:.1f}\\%}}",
         "",
-        f"\\newcommand{{\\RESdfinal}}{{{md(s.get('d_final_mm_succ'))}}}",
-        f"\\newcommand{{\\RESthetafinal}}{{{md(s.get('theta_final_deg_succ'))}}}",
+        f"\\newcommand{{\\RESdfinal}}{{{rms(s.get('d_final_mm_succ'))}}}",
+        f"\\newcommand{{\\RESthetafinal}}{{{rms(s.get('theta_final_deg_succ'))}}}",
         f"\\newcommand{{\\REStreach}}{{{md(s.get('t_first_reach_s'), '{:.2f}')}}}",
         f"\\newcommand{{\\REStsuccess}}{{{md(s.get('t_success_s'), '{:.2f}')}}}",
         "",
@@ -526,9 +529,11 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = 
             f"\\newcommand{{\\CASsolveMed}}{{{cs['solve_ms_median']:.1f}}}",
             f"\\newcommand{{\\CASsolvePninetyfive}}{{{cs['solve_ms_p95']:.1f}}}",
             f"\\newcommand{{\\CASsolveMax}}{{{cs['solve_ms_max']:.0f}}}",
-            f"\\newcommand{{\\CASposMed}}{{{cs['pos_err_mm_median']:.2f}}}",
+            f"\\newcommand{{\\CASposRMS}}{{{cs['pos_err_mm_rms']:.2f}}}",
+            f"\\newcommand{{\\CASposMedian}}{{{cs['pos_err_mm_median']:.2f}}}",
             f"\\newcommand{{\\CASposPninetyfive}}{{{cs['pos_err_mm_p95']:.0f}}}",
-            f"\\newcommand{{\\CASoriMed}}{{{cs['theta_deg_median']:.1f}}}",
+            f"\\newcommand{{\\CASoriRMS}}{{{cs['theta_deg_rms']:.1f}}}",
+            f"\\newcommand{{\\CASoriMedian}}{{{cs['theta_deg_median']:.1f}}}",
             f"\\newcommand{{\\CASfeasible}}{{{100*cs['within_tol_rate']:.1f}\\%}}",
             f"\\newcommand{{\\CASposfeasible}}{{{100*cs['pos_within_rate']:.1f}\\%}}",
             f"\\newcommand{{\\CASorifeasible}}{{{100*cs['ori_within_rate']:.1f}\\%}}",
@@ -544,8 +549,8 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = 
             f"\\newcommand{{\\HYBsuccess}}{{{100*h['within_tol_rate']:.1f}\\%}}",
             f"\\newcommand{{\\HYBpos}}{{{100*h['pos_within_rate']:.1f}\\%}}",
             f"\\newcommand{{\\HYBori}}{{{100*h['ori_within_rate']:.1f}\\%}}",
-            f"\\newcommand{{\\HYBdfinal}}{{{h['d_final_mm_median']:.2f}}}",
-            f"\\newcommand{{\\HYBtheta}}{{{h['theta_deg_median']:.2f}}}",
+            f"\\newcommand{{\\HYBdfinal}}{{{h['d_final_mm_rms']:.2f}}}",
+            f"\\newcommand{{\\HYBtheta}}{{{h['theta_deg_rms']:.2f}}}",
             f"\\newcommand{{\\HYBttotal}}{{{h['t_total_s_median']:.2f}}}",
             f"\\newcommand{{\\HYBcompute}}{{{h['compute_ms_per_episode_median']:.0f}}}",
             f"\\newcommand{{\\HYBhandoff}}{{{h['handoff_time_s_median']:.2f}}}",

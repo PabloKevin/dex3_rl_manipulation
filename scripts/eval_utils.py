@@ -341,13 +341,21 @@ def wilson_ci(k: int, n: int, z: float = 1.959963985) -> tuple[float, float]:
 
 
 def _stats(x: np.ndarray) -> dict:
+    """rms is the point estimate to quote for error MAGNITUDES (distances,
+    angles) whose population mixes a well-converged majority with a
+    badly-off tail (e.g. targets outside the reach envelope): the median
+    sits inside the converged cluster and reports it as if it were the whole
+    population, while squaring before averaging weights the tail the same
+    way the tail actually hurts a deployment. mean/median/p95 are kept too
+    since they answer different questions (typical case vs spread)."""
     x = np.asarray(x, dtype=np.float64)
     x = x[np.isfinite(x)]
     if x.size == 0:
-        return {k: float("nan") for k in ("mean", "median", "std", "p95", "n")} | {"n": 0}
+        return {k: float("nan") for k in ("mean", "median", "rms", "std", "p95", "n")} | {"n": 0}
     return {
         "mean": float(x.mean()),
         "median": float(np.median(x)),
+        "rms": float(np.sqrt(np.mean(x ** 2))),
         "std": float(x.std(ddof=1)) if x.size > 1 else 0.0,
         "p95": float(np.percentile(x, 95)),
         "n": int(x.size),

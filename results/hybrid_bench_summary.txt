@@ -1,21 +1,23 @@
 ======================================================================
-Hybrid RL->CasADi reacher  --  64 episodes
+Hybrid RL->CasADi reacher  --  848 episodes
   switch at 10 cm or 2.5 s
 ----------------------------------------------------------------------
 handoff time, median [s]        2.50
-handoff triggered by proximity  0.203
-within both tolerances          0.672
-  position only                 0.719
-  orientation only              0.844
+handoff triggered by proximity  0.183
+within both tolerances          0.783
+  position only                 0.816
+  orientation only              0.903
 final pos error, median [mm]    0.00
-final pos error, p95 [mm]       86.4
-final ori error, median [deg]   1.29
+final pos error, rms [mm]       31.90
+final pos error, p95 [mm]       81.2
+final ori error, median [deg]   0.42
+final ori error, rms [deg]      8.78
 total time, median [s]          4.50
-peak |dq| median [rad/s]        4.94
-peak |ddq| median [rad/s^2]     48.5
-jerk RMS median [rad/s^3]       608
+peak |dq| median [rad/s]        4.95
+peak |ddq| median [rad/s^2]     48.2
+jerk RMS median [rad/s^3]       595
 ----------------------------------------------------------------------
-compute per episode, median [ms] 238.8
+compute per episode, median [ms] 229.6
   RL forward pass [ms]           0.020
-  CasADi solve [ms]              2.38
+  CasADi solve [ms]              2.28
 ======================================================================

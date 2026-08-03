@@ -233,8 +233,13 @@ def main() -> None:
         "pos_within_rate": float((d_final < pos_tol).mean()),
         "ori_within_rate": float((th_final < ori_tol).mean()),
         "d_final_mm_median": float(np.median(d_final) * 1e3),
+        # rms, not median -- see benchmark_casadi.py's _summarize: this
+        # population mixes solved and unreachable targets, and the median
+        # sits inside the solved cluster and understates the tail.
+        "d_final_mm_rms": float(np.sqrt(np.mean(d_final ** 2)) * 1e3),
         "d_final_mm_p95": float(np.percentile(d_final, 95) * 1e3),
         "theta_deg_median": float(np.degrees(np.median(th_final))),
+        "theta_deg_rms": float(np.degrees(np.sqrt(np.mean(th_final ** 2)))),
         "t_total_s_median": float(np.median(t_total)),
         "peak_vel_median": float(np.median(peak_v)),
         "peak_acc_median": float(np.median(peak_a)),
@@ -287,8 +292,10 @@ def _format(s: dict) -> str:
          f"  position only                 {s['pos_within_rate']:.3f}",
          f"  orientation only              {s['ori_within_rate']:.3f}",
          f"final pos error, median [mm]    {s['d_final_mm_median']:.2f}",
+         f"final pos error, rms [mm]       {s['d_final_mm_rms']:.2f}",
          f"final pos error, p95 [mm]       {s['d_final_mm_p95']:.1f}",
          f"final ori error, median [deg]   {s['theta_deg_median']:.2f}",
+         f"final ori error, rms [deg]      {s['theta_deg_rms']:.2f}",
          f"total time, median [s]          {s['t_total_s_median']:.2f}",
          f"peak |dq| median [rad/s]        {s['peak_vel_median']:.2f}",
          f"peak |ddq| median [rad/s^2]     {s['peak_acc_median']:.1f}",
