@@ -398,6 +398,16 @@ def summarize(res: SimpleNamespace) -> dict:
     out["pos_only_rate"] = float((res.d_min < pos_tol).mean())
     out["ori_only_rate"] = float((res.theta_min < ori_tol).mean())
 
+    # Final-pose criterion: both tolerances met at the terminal step, WITHOUT
+    # the 0.5 s hold. This is the quantity an open-loop IK solver is naturally
+    # scored on, so it -- not `success_rate` -- is what may be compared against
+    # the CasADi and hybrid controllers. `success_rate` is strictly harder: it
+    # additionally demands the pose be held, and is measured under physics.
+    out["final_pose_rate"] = float(((res.d_final < pos_tol)
+                                    & (res.theta_final < ori_tol)).mean())
+    out["best_pose_rate"] = float(((res.d_min < pos_tol)
+                                   & (res.theta_min < ori_tol)).mean())
+
     if getattr(res, "has_traces", False):
         out.update({k2: _stats(v) for k2, v in
                     per_episode_jerk_stats(res.traj_dq, res.traj_mask, res.dt).items()})

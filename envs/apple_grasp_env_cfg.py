@@ -86,10 +86,10 @@ def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
     return nominal * _scene_rng.uniform(1.0 - pct, 1.0 + pct)
  
  
-APPLE_RADIUS    = _jitter(0.04)
+APPLE_RADIUS    = 0.04 # _jitter(0.04)
 APPLE_MASS      = _jitter(0.15)
 TREE_POS        = (_jitter(0.55), _jitter(-0.5), 0.0)
-TREE_HEIGHT     = _jitter(1.30, 0.15)
+TREE_HEIGHT     = 1.40 # _jitter(1.30, 0.15)
 BRANCH_LENGTH   = _jitter(0.50)
 BRANCH_RADIUS   = _jitter(0.04)
 BRANCH_ROTATION = _jitter(140.0)

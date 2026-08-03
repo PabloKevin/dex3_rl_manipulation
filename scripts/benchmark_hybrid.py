@@ -56,6 +56,18 @@ def main() -> None:
                    help="Raw palm-to-fruit distance at which the hybrid hands off (m).")
     p.add_argument("--rl_max_time", type=float, default=2.5,
                    help="Unconditional handoff time (s).")
+    p.add_argument("--proximity_stop", type=str, default="on", choices=["on", "off"],
+                   help="Apply the quintic supervisor during the CasADi phase, as "
+                        "reach_apple_hybrid.py does (it arms the stop only after handoff).")
+    # Defaults mirror reach_apple_hybrid.py's own, NOT run_env.py's. The
+    # watchdog in particular must exceed --rl_max_time: it is driven by the
+    # EPISODE clock, so a 2.5 s watchdog with a 2.5 s handoff fires on the very
+    # first CasADi tick and freezes the arm before the solver can move it
+    # (measured: within-tolerance collapses from 77% to 15%).
+    p.add_argument("--stop_dist", type=float, default=0.03)
+    p.add_argument("--stop_dwell", type=float, default=0.3)
+    p.add_argument("--stop_duration", type=float, default=0.3)
+    p.add_argument("--stop_watchdog", type=float, default=5.0)
     p.add_argument("--casadi_steps", type=int, default=100,
                    help="Ticks to run the CasADi phase for after handoff.")
     p.add_argument("--n", type=int, default=None, help="Subsample episodes.")
@@ -92,6 +104,14 @@ def main() -> None:
 
     max_rl_tick = int(round(args.rl_max_time / dt))
     up = [0.0, 0.0, 1.0]
+
+    stop_cfg = None
+    if args.proximity_stop == "on":
+        from proximity_stop_batch import BatchQuinticStop, BatchStopConfig
+        stop_cfg = BatchStopConfig(stop_dist=args.stop_dist, dwell_time=args.stop_dwell,
+                                   stop_duration=args.stop_duration,
+                                   watchdog_time=args.stop_watchdog)
+    stopped_at = np.full(n, np.nan)
 
     hand_tick = np.zeros(n, dtype=np.int32)
     hand_reason = np.zeros(n, dtype=np.int8)          # 0 = proximity, 1 = timeout
@@ -143,14 +163,35 @@ def main() -> None:
         q_ik = list(q_cmd)
         hist = np.zeros((args.casadi_steps, 7))
         tsum = 0.0
+        stop_fired_t = np.nan
+        # reach_apple_hybrid.py arms the supervisor only once the CasADi phase
+        # begins, and drives it with the EPISODE clock (t_ep), not a phase-local
+        # one -- so the watchdog is measured from episode start.
+        stop = BatchQuinticStop(1, 7, cfg=stop_cfg, device="cpu") if stop_cfg else None
+        fruit = goals[e] + np.array([0.0, 0.0, offset_z])
+        import torch
         for s in range(args.casadi_steps):
             t0 = time.perf_counter()
             q_ik = ik.solve(goals[e].tolist(), up, q_ik, lo, hi)
             tsum += (time.perf_counter() - t0) * 1e3
-            q_cmd, v = eu.rate_limit_step(q_ik, q_cmd, v, dt, v_max, a_max)
+            q_des = q_ik
+            if stop is not None:
+                t_now = torch.tensor([(k + s) * dt], dtype=torch.float32)
+                palm, _ = eu.forward_kinematics(q_cmd, (0.0, 0.0, 0.0))
+                d = torch.tensor([float(np.linalg.norm(palm - fruit))], dtype=torch.float32)
+                stop.update(t_now, d,
+                            torch.tensor(q_cmd, dtype=torch.float32).unsqueeze(0),
+                            torch.tensor(v, dtype=torch.float32).unsqueeze(0))
+                ov, qc = stop.command(t_now, torch.tensor(q_des, dtype=torch.float32).unsqueeze(0))
+                if bool(ov[0]):
+                    q_des = qc[0].numpy().tolist()
+                    if np.isnan(stop_fired_t):
+                        stop_fired_t = float((k + s) * dt)
+            q_cmd, v = eu.rate_limit_step(q_des, q_cmd, v, dt, v_max, a_max)
             hist[s] = q_cmd
         n_cas[j] = args.casadi_steps
         solve_ms[j] = tsum / args.casadi_steps
+        stopped_at[j] = stop_fired_t
 
         gp, R = eu.forward_kinematics(hist[-1], palm_off)
         nvec = R @ np.asarray(rac.PALM_NORMAL_AXIS, dtype=float)
@@ -201,6 +242,9 @@ def main() -> None:
         "compute_ms_per_episode_median": float(np.median(compute_ms)),
         "rl_forward_ms": rl_ms,
         "casadi_solve_ms_median": float(np.median(solve_ms)),
+        "proximity_stop": args.proximity_stop,
+        "stop_engaged_rate": float(np.isfinite(stopped_at).mean()),
+        "stop_time_s_median": float(np.nanmedian(stopped_at)) if np.isfinite(stopped_at).any() else float("nan"),
     }
     print(_format(summary))
 

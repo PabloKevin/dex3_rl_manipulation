@@ -17,12 +17,15 @@ Design rules this module encodes (see the paper's figure captions):
     and photocopied in greyscale.
   * Text never wears a series colour; labels use the neutral ink tokens.
 
-Palette provenance: taken verbatim from the data-viz reference palette. The
-first three categorical slots are the ones documented as clearing the
-all-pairs CVD/normal-vision gates in light mode, which is why this file caps
-categorical series at three. Node is not installed in this environment, so
-``validate_palette.js`` could NOT be re-run here -- do not substitute hexes
-without installing node and validating.
+Palette provenance: taken verbatim from the data-viz reference palette, in its
+documented fixed slot order. Scatter/small-multiple forms (all-pairs
+comparison) are capped at the first three slots, the only ones that clear the
+all-pairs CVD/normal-vision gates; line/bar forms use the *adjacent* pairlist,
+which the full eight-slot order clears in both light and dark modes, so
+JOINT_RAMP below uses all seven non-red slots for the 7-DoF joint legend. Node
+is not installed in this environment, so ``validate_palette.js`` could NOT be
+re-run here -- do not substitute hexes without installing node and
+validating.
 """
 
 from __future__ import annotations
@@ -56,18 +59,19 @@ C_ORANGE = "#eb6834"   # slot 2 -- negative control / rate limiter OFF
 C_AQUA = "#1baf7a"     # slot 3 -- third series, used sparingly
 CATEGORICAL = (C_BLUE, C_ORANGE, C_AQUA)
 
-# Ordinal ramp for the 7 arm joints. Proximal -> distal is a REAL order, so an
-# ordinal ramp is the correct encoding here rather than 7 categorical hues
-# (which would blow through the 3-slot all-pairs cap anyway). Light-mode
-# ordinal floor is step 250; nothing below it is used.
+# Categorical hues for the 7 arm joints -- one per joint, maximally
+# distinguishable rather than an ordinal ramp, since with 7 overlapping line
+# traces in one small panel adjacent shades of blue read as noise. Slots 1-7
+# of the reference palette's fixed 8-slot categorical order (slot 8, red, is
+# reserved for threshold/error accents elsewhere and left unused here).
 JOINT_RAMP = (
-    "#86b6ef",  # 250  shoulder_pitch
-    "#5598e7",  # 350  shoulder_roll
-    "#2a78d6",  # 450  shoulder_yaw
-    "#256abf",  # 500  elbow
-    "#1c5cab",  # 550  wrist_roll
-    "#184f95",  # 600  wrist_pitch
-    "#0d366b",  # 700  wrist_yaw
+    "#2a78d6",  # slot 1 blue     shoulder_pitch
+    "#eb6834",  # slot 2 orange   shoulder_roll
+    "#1baf7a",  # slot 3 aqua     shoulder_yaw
+    "#eda100",  # slot 4 yellow   elbow
+    "#e87ba4",  # slot 5 magenta  wrist_roll
+    "#008300",  # slot 6 green    wrist_pitch
+    "#4a3aa7",  # slot 7 violet   wrist_yaw
 )
 
 # Sequential single hue, light->dark, for continuous magnitude (final position
@@ -249,9 +253,16 @@ def label_end(ax, x, y, text: str, color: str = INK_2, dx: float = 3.0,
 
 
 def panel_tag(ax, tag: str, x: float = -0.16, y: float = 1.04) -> None:
-    """Put an (a)/(b)/(c) tag on a subplot, in primary ink."""
-    ax.text(x, y, tag, transform=ax.transAxes, fontsize=8, fontweight="bold",
-            color=INK, ha="left", va="bottom")
+    """Put an (a)/(b)/(c) tag on a subplot, in primary ink.
+
+    Axes3D.text() takes (x, y, z, s), so 3-D panels go through text2D().
+    """
+    if hasattr(ax, "text2D"):
+        ax.text2D(x, y, tag, transform=ax.transAxes, fontsize=8,
+                  fontweight="bold", color=INK, ha="left", va="bottom")
+    else:
+        ax.text(x, y, tag, transform=ax.transAxes, fontsize=8, fontweight="bold",
+                color=INK, ha="left", va="bottom")
 
 
 def joint_key(ax, names: Sequence[str], loc: str = "upper right",
@@ -261,9 +272,12 @@ def joint_key(ax, names: Sequence[str], loc: str = "upper right",
     labels = [_short_joint(n) for n in names] if short else list(names)
     handles = [Line2D([0], [0], color=JOINT_RAMP[i % len(JOINT_RAMP)], lw=1.1)
                for i in range(len(labels))]
+    # Opaque background: this key sits over trajectory curves in the comparison
+    # figure, where a frameless legend is unreadable.
     ax.legend(handles, labels, loc=loc, ncol=ncol, fontsize=6,
               handlelength=1.2, columnspacing=0.8, labelspacing=0.22,
-              borderaxespad=0.2, frameon=False)
+              borderaxespad=0.2, frameon=True, facecolor="white",
+              edgecolor="none", framealpha=0.9, borderpad=0.25).set_zorder(10)
 
 
 def _short_joint(name: str) -> str:

@@ -1,0 +1,34 @@
+==============================================================================
+checkpoint     : /home/pablo_kevin/dex3_rl_manipulation/logs/rsl_rl/apple_grasp_reach/2026-07-31_20-13-43/model_4500.pt
+task / envs    : AppleGrasp-v0  x64
+rate limiter   : on (v_max=2.0, a_max=15.0)
+seed / scene   : 42 / 12345
+------------------------------------------------------------------------------
+episodes           : 259
+SUCCESS RATE       : 0.382  (99/259, 95% CI [0.325, 0.443])
+  reached tol      : 0.691   (entered the ball at least once)
+  position only    : 0.819   (d_min < pos_tol, ignoring orientation)
+  orientation only : 0.834   (theta_min < ori_tol, ignoring position)
+  timed out        : 160
+------------------------------------------------------------------------------
+metric                                     mean   median      std      p95    n
+final position error [mm], all           51.198   38.976   40.422  133.321  259
+final position error [mm], success       23.545   23.630    7.660   36.264   99
+min position error [mm], all             25.297   17.517   23.389   74.511  259
+final orientation error [deg], all       19.915   17.484    9.496   36.478  259
+final orientation error [deg], success   12.004   12.281    3.449   16.247   99
+min orientation error [deg], all          9.201    7.036    7.641   25.842  259
+time to first reach [s]                   1.028    0.960    0.400    1.740  179
+time to settled success [s]               2.070    1.900    0.614    3.164   99
+episode duration [s]                      3.880    5.000    1.476    5.000  259
+fraction in tolerance after entry         0.526    0.614    0.324    1.000  179
+tolerance exits after entry               1.955    2.000    1.184    4.000  179
+joint jerk RMS [rad/s^3]                580.407  504.034  284.823 1169.889  259
+joint jerk p95 [rad/s^3]                879.870  641.454  647.303 2078.937  259
+joint jerk max [rad/s^3]               3978.192 3552.928 2306.047 8500.197  259
+peak |dq| [rad/s]                         4.194    4.229    0.264    4.572  259
+RMS |dq| [rad/s]                          1.937    1.800    0.397    2.630  259
+------------------------------------------------------------------------------
+CHECK commanded |dq| max : 2.000 rad/s   OK
+CHECK commanded |ddq| max: 15.000 rad/s^2 OK
+==============================================================================

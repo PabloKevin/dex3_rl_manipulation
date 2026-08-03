@@ -149,31 +149,16 @@ def _band(ax, t, pct, colour, label=None):
 
 
 def fig_eval(res, outdir: str) -> str:
-    fig, axes = ps.figure("double", height=2.35, nrows=1, ncols=3)
-    ax_d, ax_th, ax_w = axes
+    """Workspace coverage only.
 
-    mask = res.traj_mask
-    t = np.arange(mask.shape[1]) * res.dt
-    n_live = mask.sum(axis=0)
-    # Truncate where too few episodes remain live: successful episodes
-    # terminate early, so the far tail is a handful of failures and the
-    # percentile band there says nothing about typical behaviour.
-    keep = n_live >= max(1, int(0.2 * res.n_episodes))
-    tk = t[keep]
-
-    pct_d, _ = eu.masked_percentile(res.traj_d * 1e3, mask, [10, 25, 50, 75, 90])
-    _band(ax_d, tk, pct_d[:, keep], ps.C_BLUE)
-    ps.threshold(ax_d, float(res.pos_tol) * 1e3, "h", "tolerance")
-    ax_d.set_ylabel("position error [mm]")
-    ax_d.set_xlabel("time [s]")
-
-    pct_th, _ = eu.masked_percentile(np.degrees(res.traj_theta), mask, [10, 25, 50, 75, 90])
-    _band(ax_th, tk, pct_th[:, keep], ps.C_BLUE)
-    # label on the left: the orientation curve rises back toward the rule on the
-    # right, so a right-aligned label would sit on the data
-    ps.threshold(ax_th, np.degrees(float(res.ori_tol_rad)), "h", "tolerance", label_x=0.36)
-    ax_th.set_ylabel("orientation error [deg]")
-    ax_th.set_xlabel("time [s]")
+    The d(t)/theta(t) percentile panels this figure used to carry were dropped
+    for the page budget: their conclusions (position settles below tolerance,
+    orientation oscillates across it) are stated numerically in the text, while
+    the coverage scatter is the only evidence for the reach-envelope argument
+    and cannot be replaced by a sentence. fig_eval_traces() still renders them
+    for slides.
+    """
+    fig, ax_w = ps.figure("single", height=2.5)
 
     succ = res.ep_success.astype(bool)
     err_mm = res.d_final * 1e3
@@ -208,9 +193,7 @@ def fig_eval(res, outdir: str) -> str:
     cb.ax.tick_params(labelsize=6)
     cb.outline.set_visible(False)
 
-    for a, tag in zip(axes, ("(a)", "(b)", "(c)")):
-        ps.hairline_grid(a)
-        ps.panel_tag(a, tag, x=-0.22)
+    ps.hairline_grid(ax_w)
     return ps.finish(fig, os.path.join(outdir, "fig_eval.pdf"))
 
 
@@ -286,18 +269,23 @@ def fig_smooth(res, res_abl, outdir: str) -> tuple[str, int]:
 #  RL vs CasADi commanded-trajectory comparison
 # ═════════════════════════════════════════════════════════════════════════
 
-def fig_compare(res, traj_path: str, outdir: str, hybrid_path: str | None = None) -> tuple[str, int]:
-    """Two-row comparison: learned policy (top) vs CasADi IK (bottom).
+# Velocity/acceleration panels plot only these three of the arm's seven joints
+# -- shoulder-pitch and elbow (the reach DOFs) and wrist-pitch (the dominant
+# orientation DOF, the one theta actually measures) -- since all seven
+# overlaid left the panels unreadable. The position panel keeps all seven: it
+# has enough vertical separation between traces to stay legible.
+COMPARE_JOINTS = (0, 3, 5)
 
-    Both rows show the COMMANDED joint trajectory, which is the only quantity
-    both pipelines produce: for the policy it is the rate-limited action term
+
+def fig_compare(res, traj_path: str, outdir: str, hybrid_path: str | None = None,
+                t_window: float = 3.0) -> tuple[str, int]:
+    """Three-row comparison: learned policy, CasADi IK, hybrid.
+
+    All rows show the COMMANDED joint trajectory, which is the only quantity
+    every pipeline produces: for the policy it is the rate-limited action term
     output (traj_u), for CasADi the same limiter applied to its IK solution.
     Comparing the policy's *measured* joints against CasADi's *commanded* ones
     would confound controller behaviour with actuator tracking.
-
-    Cartesian end-effector paths are reconstructed by applying the same numpy
-    forward kinematics to both joint sequences, so the two are in one frame and
-    one model.
     """
     if not os.path.exists(traj_path):
         print(f"[warn] no CasADi trajectory at {traj_path}; skipping the comparison figure")
@@ -308,7 +296,6 @@ def fig_compare(res, traj_path: str, outdir: str, hybrid_path: str | None = None
     cmeta = json.loads(str(cas["meta_json"]))
     ep = int(cmeta["episode_index"])
     dt = float(res.dt)
-    palm_off = res.meta["palm_local_offset"]
 
     n_rl = int(res.traj_mask[ep].sum())
     q_rl = res.traj_u[ep, :n_rl]                     # commanded joint targets
@@ -328,20 +315,14 @@ def fig_compare(res, traj_path: str, outdir: str, hybrid_path: str | None = None
 
     v_rl, a_rl = derivs(q_rl)
     v_ca, a_ca = derivs(q_ca)
-    ee_rl, _ = eu.forward_kinematics(q_rl, palm_off)
-    ee_ca = cas["ee"]
 
     t_rl = np.arange(n_rl) * dt
     t_ca = np.arange(n_ca) * dt
     td_rl, td_ca = t_rl[SKIP:], t_ca[SKIP:]
-    # One shared time axis so the two rows are visually comparable; the policy
-    # trace simply ends where its episode terminated on success.
-    t_lim = (0.0, float(max(t_rl[-1], t_ca[-1])))
 
-    rows = [("Learned policy", t_rl, td_rl, q_rl, v_rl, a_rl, ee_rl, None),
-            ("CasADi IK", t_ca, td_ca, q_ca, v_ca, a_ca, ee_ca, None)]
+    rows = [("Learned policy", t_rl, td_rl, q_rl, v_rl, a_rl, None),
+            ("CasADi IK", t_ca, td_ca, q_ca, v_ca, a_ca, None)]
 
-    hand_t = None
     if hybrid_path and os.path.exists(hybrid_path):
         with np.load(hybrid_path, allow_pickle=False) as z:
             hy = {k: z[k] for k in z.files}
@@ -350,52 +331,61 @@ def fig_compare(res, traj_path: str, outdir: str, hybrid_path: str | None = None
         v_hy, a_hy = derivs(q_hy)
         t_hy = np.arange(q_hy.shape[0]) * dt
         hand_t = hmeta["handoff_tick"] * dt
-        rows.append(("Hybrid", t_hy, t_hy[SKIP:], q_hy, v_hy, a_hy, hy["ee"], hand_t))
-        t_lim = (0.0, float(max(t_lim[1], t_hy[-1])))
+        rows.append(("Hybrid", t_hy, t_hy[SKIP:], q_hy, v_hy, a_hy, hand_t))
     else:
         print(f"[warn] no hybrid trajectory at {hybrid_path}; comparison stays two-row")
 
-    fig, axes = ps.figure("double", height=1.45 * len(rows), nrows=len(rows), ncols=4)
+    # Clip to the window where anything happens. Everything has settled well
+    # before 3 s, and stretching to the 5 s horizon compressed all the detail
+    # into the left third of every panel.
+    t_lim = (0.0, float(t_window))
+
     v_max = float(res.meta.get("max_velocity", 2.0))
     a_max = float(res.meta.get("max_acceleration", 15.0))
+    nrow = len(rows)
 
-    for r, (name, t, td, q, v, a, ee, hmark) in enumerate(rows):
+    import matplotlib.pyplot as plt
+    fig = plt.figure(figsize=(ps.COL_2, 1.45 * nrow))
+    gs = fig.add_gridspec(nrow, 3, hspace=0.45, wspace=0.35)
+
+    ax_q_ref = None
+    for r, (name, t, td, q, v, a, hmark) in enumerate(rows):
+        ax_q = fig.add_subplot(gs[r, 0])
+        ax_v = fig.add_subplot(gs[r, 1])
+        ax_a = fig.add_subplot(gs[r, 2])
+        if r == min(1, nrow - 1):
+            ax_q_ref = ax_q
+
         for k in range(7):
             c = ps.JOINT_RAMP[k % len(ps.JOINT_RAMP)]
-            axes[r, 0].plot(t, q[:, k], color=c, lw=0.9)
-            axes[r, 1].plot(td, v[:, k], color=c, lw=0.9)
-            axes[r, 2].plot(td, a[:, k], color=c, lw=0.9)
-        ps.threshold(axes[r, 1], v_max, "h")
-        ps.threshold(axes[r, 1], -v_max, "h")
-        ps.threshold(axes[r, 2], a_max, "h")
-        ps.threshold(axes[r, 2], -a_max, "h")
-        for j, lab in enumerate(("x", "y", "z")):
-            axes[r, 3].plot(t, ee[:, j], color=ps.CATEGORICAL[j],
-                            ls=[ps.LS_MAIN, ps.LS_ALT, (0, (1, 1.4))][j], lw=1.0, label=lab)
-        axes[r, 0].set_ylabel(f"{name}\njoint pos. [rad]")
-        axes[r, 1].set_ylabel("joint vel. [rad/s]")
-        axes[r, 2].set_ylabel("joint acc. [rad/s$^2$]")
-        axes[r, 3].set_ylabel("EE position [m]")
-        for c_i in range(4):
-            ps.hairline_grid(axes[r, c_i])
-            axes[r, c_i].set_xlim(*t_lim)
-            if hmark is not None:
-                ps.threshold(axes[r, c_i], hmark, "v",
-                             "handoff" if c_i == 0 else None)
-            if r == len(rows) - 1:
-                axes[r, c_i].set_xlabel("time [s]")
-        axes[r, 1].set_ylim(-1.35 * v_max, 1.35 * v_max)
-        axes[r, 2].set_ylim(-1.45 * a_max, 1.45 * a_max)
+            ax_q.plot(t, q[:, k], color=c, lw=0.9)
+        for k in COMPARE_JOINTS:
+            c = ps.JOINT_RAMP[k % len(ps.JOINT_RAMP)]
+            ax_v.plot(td, v[:, k], color=c, lw=0.9)
+            ax_a.plot(td, a[:, k], color=c, lw=0.9)
+        ps.threshold(ax_v, v_max, "h"); ps.threshold(ax_v, -v_max, "h")
+        ps.threshold(ax_a, a_max, "h"); ps.threshold(ax_a, -a_max, "h")
 
-    # Key goes in the CasADi position panel: it settles by ~1 s, so the right
-    # two thirds of that axes is empty and the legend covers no data.
-    ps.joint_key(axes[1, 0], [str(s) for s in res.joint_names], loc="center right", ncol=2)
-    axes[0, 3].legend(loc="lower right", ncol=3, fontsize=6)
-    tags = ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)",
-            "(i)", "(j)", "(k)", "(l)"]
-    for a_, tag in zip(axes.ravel(), tags):
-        ps.panel_tag(a_, tag, x=-0.30, y=1.02)
-    return ps.finish(fig, os.path.join(outdir, "fig_compare.pdf")), ep
+        ax_q.set_ylabel(f"{name}\njoint pos. [rad]")
+        ax_v.set_ylabel("joint vel. [rad/s]")
+        ax_a.set_ylabel("joint acc. [rad/s$^2$]")
+        for a_, tag in zip((ax_q, ax_v, ax_a), ("a", "b", "c")):
+            ps.hairline_grid(a_)
+            a_.set_xlim(*t_lim)
+            if hmark is not None:
+                ps.threshold(a_, hmark, "v", "handoff" if tag == "a" else None)
+            if r == nrow - 1:
+                a_.set_xlabel("time [s]")
+        ax_v.set_ylim(-1.35 * v_max, 1.35 * v_max)
+        ax_a.set_ylim(-1.45 * a_max, 1.45 * a_max)
+
+        for a_, tag in zip((ax_q, ax_v, ax_a),
+                           [f"({chr(97 + 3 * r + i)})" for i in range(3)]):
+            ps.panel_tag(a_, tag, x=-0.34, y=1.05)
+
+    ps.joint_key(ax_q_ref, [str(s) for s in res.joint_names],
+                 loc="upper right", ncol=2)
+    return ps.finish(fig, os.path.join(outdir, "fig_compare.pdf"), tight_pad=0.4), ep
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -510,6 +500,8 @@ def emit_macros(path: str, s: dict, s_abl: dict | None, res, cas: dict | None = 
         f"\\newcommand{{\\RESreachrate}}{{{100*s['reach_rate']:.1f}\\%}}",
         f"\\newcommand{{\\RESposonly}}{{{100*s['pos_only_rate']:.1f}\\%}}",
         f"\\newcommand{{\\RESorionly}}{{{100*s['ori_only_rate']:.1f}\\%}}",
+        f"\\newcommand{{\\RESfinalpose}}{{{100*s['final_pose_rate']:.1f}\\%}}",
+        f"\\newcommand{{\\RESbestpose}}{{{100*s['best_pose_rate']:.1f}\\%}}",
         "",
         f"\\newcommand{{\\RESdfinal}}{{{md(s.get('d_final_mm_succ'))}}}",
         f"\\newcommand{{\\RESthetafinal}}{{{md(s.get('theta_final_deg_succ'))}}}",

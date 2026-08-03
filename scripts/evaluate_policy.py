@@ -51,6 +51,13 @@ parser.add_argument("--warmup_steps", type=int, default=250,
                     help="Discard episodes completing within this many rollout steps.")
 parser.add_argument("--rate_limit", type=str, default="on", choices=["on", "off"],
                     help="'off' disables the action term's velocity/acceleration limits (ablation).")
+parser.add_argument("--proximity_stop", type=str, default="on", choices=["on", "off"],
+                    help="Run the quintic proximity-stop supervisor on top of the policy, as the "
+                         "deployed system does. 'off' measures the bare policy.")
+parser.add_argument("--stop_dist", type=float, default=0.09)
+parser.add_argument("--stop_dwell", type=float, default=0.6)
+parser.add_argument("--stop_duration", type=float, default=0.4)
+parser.add_argument("--stop_watchdog", type=float, default=2.5)
 parser.add_argument("--out", type=str, default=None, help="Output .npz path.")
 parser.add_argument("--no_traces", action="store_true", help="Skip per-timestep trace arrays.")
 parser.add_argument("--tag", type=str, default="", help="Free-form label stored in the npz metadata.")
@@ -192,12 +199,52 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         args_cli.warmup_steps + (args_cli.n_episodes // max(args_cli.num_envs, 1) + 2) * 300
     )
 
+    # ── proximity-stop supervisor (as deployed) ────────────────────────────
+    u = env.unwrapped
+    stop = None
+    if args_cli.proximity_stop == "on":
+        from proximity_stop_batch import BatchQuinticStop, BatchStopConfig
+        stop = BatchQuinticStop(
+            u.num_envs, len(RIGHT_ARM_JOINTS), device=u.device,
+            cfg=BatchStopConfig(stop_dist=args_cli.stop_dist,
+                                dwell_time=args_cli.stop_dwell,
+                                stop_duration=args_cli.stop_duration,
+                                watchdog_time=args_cli.stop_watchdog))
+        robot = u.scene["robot"]
+        arm_ids = u.termination_manager.get_term_cfg("eval_probe").params["arm_cfg"].joint_ids
+        palm_id = u.termination_manager.get_term_cfg("eval_probe").params["robot_cfg"].body_ids[0]
+        apple = u.scene["apple"]
+        q_def = robot.data.default_joint_pos[:, arm_ids]
+        a_scale = float(env_cfg.actions.right_arm.scale)
+        print(f"[INFO] proximity stop ON  (stop_dist={args_cli.stop_dist:.3f} m, "
+              f"dwell={args_cli.stop_dwell:.2f} s, T={args_cli.stop_duration:.2f} s, "
+              f"watchdog={args_cli.stop_watchdog:.2f} s)")
+    else:
+        print("[INFO] proximity stop OFF (bare controller)")
+
     obs = env.get_observations()
     step = 0
     t0 = time.time()
     with torch.inference_mode():
         while probe.n_done() < args_cli.n_episodes + args_cli.num_envs and step < max_steps:
-            obs, _, dones, _ = env.step(policy(obs))
+            actions = policy(obs)
+            if stop is not None:
+                # Episode time, and FSM reset on episode boundaries. episode_length_buf
+                # is 0 on the first step after a reset.
+                stop.reset_envs(u.episode_length_buf <= 1, t=0.0)
+                # Raw palm-link-origin to fruit distance -- run_env.py's convention.
+                dist = torch.norm(apple.data.root_pos_w
+                                  - robot.data.body_pos_w[:, palm_id, :], dim=-1)
+                q = robot.data.joint_pos[:, arm_ids]
+                dq = robot.data.joint_vel[:, arm_ids]
+                # Per-env episode time: the supervisor's clock is per attempt.
+                t_env = u.episode_length_buf.float() * u.step_dt
+                stop.update(t_env, dist, q, dq)
+                ov, q_cmd = stop.command(t_env, q_def + a_scale * actions)
+                if bool(ov.any()):
+                    actions = torch.where(ov.unsqueeze(-1),
+                                          (q_cmd - q_def) / a_scale, actions)
+            obs, _, dones, _ = env.step(actions)
             policy_nn.reset(dones)
             step += 1
             if step % 250 == 0:
@@ -229,6 +276,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "n_episodes_requested": args_cli.n_episodes,
         "n_episodes": int(n),
         "rate_limit": args_cli.rate_limit,
+        "proximity_stop": args_cli.proximity_stop,
+        "stop_dist": args_cli.stop_dist,
+        "stop_dwell": args_cli.stop_dwell,
+        "stop_duration": args_cli.stop_duration,
+        "stop_watchdog": args_cli.stop_watchdog,
         "max_velocity": v_max,
         "max_acceleration": a_max,
         "seed": agent_cfg.seed,

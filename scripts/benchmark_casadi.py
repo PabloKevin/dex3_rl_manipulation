@@ -130,7 +130,8 @@ def rl_inference_time(checkpoint_dir: str, obs_dim: int = 28, n: int = 2000) -> 
     return out
 
 
-def replay_trajectory(rac, ik, goal, q_start, steps, dt, v_max, a_max, up=(0.0, 0.0, 1.0)):
+def replay_trajectory(rac, ik, goal, q_start, steps, dt, v_max, a_max, up=(0.0, 0.0, 1.0),
+                      stop_cfg=None, offset_z: float = 0.0):
     """Offline replay of the deployed CasADi control loop for one target.
 
     Reproduces reach_apple_casadi.py's architecture: every tick re-solves the
@@ -151,13 +152,37 @@ def replay_trajectory(rac, ik, goal, q_start, steps, dt, v_max, a_max, up=(0.0, 
     q_ik = list(q_start)
     q_hist = np.zeros((steps, 7))
     t_hist = np.zeros(steps)
+
+    stop = _make_stop(stop_cfg)
+    fruit = np.asarray(goal, dtype=float) + np.array([0.0, 0.0, offset_z])
+
     for k in range(steps):
         t0 = time.perf_counter()
         q_ik = ik.solve(list(goal), list(up), q_ik, lo, hi)
         t_hist[k] = (time.perf_counter() - t0) * 1e3
-        q_cmd, v = eu.rate_limit_step(q_ik, q_cmd, v, dt, v_max, a_max)
+        q_des = q_ik
+        if stop is not None:
+            import torch
+            t_now = torch.tensor([k * dt], dtype=torch.float32)
+            palm, _ = eu.forward_kinematics(q_cmd, (0.0, 0.0, 0.0))
+            d = torch.tensor([float(np.linalg.norm(palm - fruit))], dtype=torch.float32)
+            stop.update(t_now, d,
+                        torch.tensor(q_cmd, dtype=torch.float32).unsqueeze(0),
+                        torch.tensor(v, dtype=torch.float32).unsqueeze(0))
+            ov, qc = stop.command(t_now, torch.tensor(q_des, dtype=torch.float32).unsqueeze(0))
+            if bool(ov[0]):
+                q_des = qc[0].numpy().tolist()
+        q_cmd, v = eu.rate_limit_step(q_des, q_cmd, v, dt, v_max, a_max)
         q_hist[k] = q_cmd
     return q_hist, t_hist
+
+
+def _make_stop(cfg):
+    """One-arm BatchQuinticStop, or None when the supervisor is disabled."""
+    if cfg is None:
+        return None
+    from proximity_stop_batch import BatchQuinticStop
+    return BatchQuinticStop(1, 7, cfg=cfg, device="cpu")
 
 
 def main() -> None:
@@ -175,6 +200,15 @@ def main() -> None:
     p.add_argument("--w_pos", type=float, default=200.0)
     p.add_argument("--w_ori", type=float, default=20.0)
     p.add_argument("--w_reg", type=float, default=0.01)
+    p.add_argument("--proximity_stop", type=str, default="on", choices=["on", "off"],
+                   help="Apply the quintic proximity-stop supervisor, as deployed.")
+    p.add_argument("--stop_dist", type=float, default=0.09)
+    p.add_argument("--stop_dwell", type=float, default=0.6)
+    p.add_argument("--stop_duration", type=float, default=0.4)
+    # reach_apple_casadi.py deploys a 5 s watchdog (its help text explains why:
+    # closed-loop IK convergence legitimately takes longer to settle than a
+    # policy forward pass), so mirror that rather than run_env.py's 2.5 s.
+    p.add_argument("--stop_watchdog", type=float, default=5.0)
     p.add_argument("--use-script-offsets", action="store_true",
                    help="Score with reach_apple_casadi.py's own palm offset / grasp offset "
                         "instead of the trained environment's.")
@@ -259,8 +293,15 @@ def main() -> None:
     a_max = float(res.meta.get("max_acceleration", 15.0))
     print(f"[INFO] replaying episode {ep} through the rate-limited loop "
           f"({args.traj_steps} ticks at {1/dt:.0f} Hz)")
+    stop_cfg = None
+    if args.proximity_stop == "on":
+        from proximity_stop_batch import BatchStopConfig
+        stop_cfg = BatchStopConfig(stop_dist=args.stop_dist, dwell_time=args.stop_dwell,
+                                   stop_duration=args.stop_duration,
+                                   watchdog_time=args.stop_watchdog)
     q_traj, t_traj = replay_trajectory(rac, ik, goals_all[ep], q_start,
-                                       args.traj_steps, dt, v_max, a_max)
+                                       args.traj_steps, dt, v_max, a_max,
+                                       stop_cfg=stop_cfg, offset_z=offset_z)
     ee_traj, _ = eu.forward_kinematics(q_traj, palm_offset)
     np.savez_compressed(
         args.traj_out,
