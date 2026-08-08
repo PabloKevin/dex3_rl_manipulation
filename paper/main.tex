@@ -1,4 +1,11 @@
-\documentclass[conference]{IEEEtran}
+\documentclass[conference,a4paper]{IEEEtran}
+\usepackage[
+  a4paper,
+  left=1.57cm,
+  right=1.57cm,
+  top=1.9cm,
+  bottom=2.54cm
+]{geometry}
 \IEEEoverrideCommandLockouts
 \usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
@@ -10,13 +17,13 @@
 \usepackage{siunitx}
 \sisetup{detect-all, per-mode=symbol}
 
-\input{results_macros}
+\input{paper/results_macros.tex}
 
 \newcommand{\vect}[1]{\mathbf{#1}}
 
 \begin{document}
 
-\title{A Domain-Randomized Isaac Lab Environment for Apple Manipulation with the Unitree G1: Learned, Optimization-Based and Hybrid Pre-Grasp Reaching}
+\title{\vspace{-0.95cm}A Domain-Randomized Isaac Lab Environment for Apple Manipulation with the Unitree G1: Learned, Optimization-Based and Hybrid Pre-Grasp Reaching}
 
 \author{\IEEEauthorblockN{1\textsuperscript{st} Pablo Kevin Pereira}
 \IEEEauthorblockA{\textit{Mechatronics Engineering} \\
@@ -59,10 +66,9 @@ inverse-kinematics solver, and a hybrid that hands off from the first to the
 second. Over \RESnepisodes{} randomized episodes the policy is fast
 (\RLforward{}\,ms per decision) and reaches the position tolerance on
 \RESposonly{} of episodes but cannot hold orientation, succeeding on
-\RESsuccess{}; the solver is exact but costs \CASsolveMed{}\,ms with a
+\RESsuccess{}; this was solved implementing a proximity stop thread. The IK solver is precise but costs \CASsolveMed{}\,ms with a
 \CASsolveMax{}\,ms worst case; the hybrid reaches \HYBsuccess{} at
-\HYBcompute{}\,ms per episode. We also report a negative result we consider the
-most transferable: a densely shaped reward with mis-specified grasp geometry
+\HYBcompute{}\,ms per episode. We also report that a densely shaped reward with mis-specified grasp geometry
 converges confidently---position terms saturate, action noise collapses---while
 task success never leaves zero, and no training curve reveals it.
 \end{abstract}
@@ -198,7 +204,7 @@ drops success to \RESablsuccess{}---the policy emits targets that are
 
 A second mechanism handles arrival, since a controller rewarded densely for
 proximity has no incentive to stop moving beside an object it can damage. A
-supervisor monitors palm-to-fruit distance and, once it stays below a
+supervisor (proximity-stop thread) monitors palm-to-fruit distance and, once it stays below a
 threshold for a dwell time, brings the arm to rest on a quintic minimum-jerk
 profile solved for $q(0)=q_0,\dot q(0)=v_0,\ddot q(0)=0$ and
 $q(T)=q_1,\dot q(T)=\ddot q(T)=0$, with $q_1=q_0+v_0T/2$: matching $\dot
@@ -223,7 +229,7 @@ $128$--$128$--$64$ ELU actor/critic over a 28-D observation (joint
 positions/velocities, palm-to-fruit vector, palm quaternion relative to torso,
 previous action), $64$ steps $\times$ $64$ environments per iteration,
 otherwise standard hyperparameters. A $3000$-iteration run is $12.3\times10^6$
-steps, \SI{78}{\minute} on a laptop RTX~4060; the reported policy continues to
+steps, \SI{78}{\minute} on a laptop NVIDIA RTX~4060; the reported policy continues to
 \RESckpt{} iterations.
 
 % ═══════════════════════════════════════════════════════════════
@@ -241,9 +247,7 @@ solution subject to joint limits, warm-started from the last solve, mirroring
 the optimization-based control standard for legged and mobile
 manipulators~\cite{molnar2026wbid,rahman2026locoreview}. The \textbf{hybrid}
 runs the policy until the palm is within \SI{10}{\centi\metre} of the fruit or
-\SI{2.5}{\second} elapse, then hands off: the policy is cheap and generalizes
-but plateaus a few centimetres short, precisely the regime an exact solve
-handles well.
+\SI{2.5}{\second} elapse, then runs the IK solver. The proximity-stop thread is present in the three controllers.
 
 % ═══════════════════════════════════════════════════════════════
 \section{Results}
@@ -267,12 +271,7 @@ for every controller; the numbers below are not the policy's ceiling.
 \begin{table}[t]
 \centering
 \caption{Three controllers on identical targets. The first block is the
-like-for-like criterion---both tolerances met at the final pose---for all
-three; the solver and hybrid are scored kinematically, so their numbers are
-upper bounds, while the policy is the only one evaluated under physics. Error
-rows use RMS, not median, so the bimodal tail from out-of-envelope targets
-(Sec.~\ref{sec:limitations}) is not averaged away: policy RMS is over its
-successful episodes, CasADi's and the hybrid's over \emph{all} targets.}
+like-for-like criterion---both tolerances met at the final pose---for all three.}
 \label{tab:compare}
 \small
 \begin{tabular}{lrrr}
@@ -301,8 +300,7 @@ directly across its three checkpoint-resume segments (iterations 0--3000,
 3000--3500, 3500--\RESckpt{}, coloured yellow/orange/red): the action-jerk and
 arm-velocity penalties shrink through the first segment, then grow noisier on
 each resume; hold and palm-up reward keep rising on average but with widening
-variance; mean return itself dips and re-oscillates after the second resume.
-None of these curves states task success directly.}
+variance; mean return itself dips and re-oscillates after the second resume.}
 \label{fig:training}
 \end{figure}
 
@@ -315,10 +313,6 @@ $\delta_z=\SI{0.164}{\metre}$, more than twice the reported
 well: return climbed to within \SI{20}{\percent} of the working run's, the
 fine-reach reward \emph{saturated higher} ($3.40$ against $2.72$ of a maximum
 $4.0$), and action-noise standard deviation collapsed from $0.50$ to $0.025$.
-Its success rate was exactly zero on all $1830$ iterations. Fig.~\ref{fig:training}
-shows the same blind spot on the reported, \emph{successful} run: none of its
-logged reward components ever encodes task success, so a reader cannot tell a
-converging run from a failing one by inspection alone.
 
 Both runs share the same palm-normal axis, so this is a geometric error, not a
 frame-convention one: a grasp point \SI{0.164}{\metre} below the fruit sits low
@@ -327,7 +321,8 @@ remains for orientation, making the two objectives jointly unsatisfiable. The
 point is the \emph{observability}: nothing in the return, loss or entropy
 curves indicates it---the entropy collapse resembles healthy convergence---and
 only the success termination, defined against the task rather than any reward
-term, reveals it. A shaped-reward manipulation task should carry at least one
+term, reveals it.
+Fig.~\ref{fig:training} shows really informative plots, but none of these curves states task success directly. A shaped-reward manipulation task should carry at least one
 binary, geometrically defined success signal that no reward term contributes
 to.
 
@@ -354,61 +349,56 @@ and the solver's settling.}
 \label{fig:compare}
 \end{figure*}
 
-Table~\ref{tab:compare} and Fig.~\ref{fig:compare} give the comparison, and the
+Table~\ref{tab:compare} and Fig.~\ref{fig:compare} give the comparison. The
 scoring convention matters: an open-loop solver is naturally scored on its
-final pose, while a policy running under physics can additionally be asked to
-\emph{hold} it. Comparing the solver's final-pose rate against a held-pose
-rate would flatter the solver, so Table~\ref{tab:compare}'s first block
-reports final pose for all three. On that basis the policy reaches
-\RESfinalpose{}, and visits a within-tolerance pose at some point in
-\RESbestpose{} of episodes---substantially better reaching than its held-pose
-success rate (\RESsuccess{}) alone suggests.
+final pose, while a policy under physics can additionally be asked to
+\emph{hold} it. Scoring the solver on a held-pose rate would flatter it, so
+Table~\ref{tab:compare}'s first block reports final pose for all three. On
+that basis the policy reaches \RESfinalpose{}, but visits a within-tolerance
+pose at some point in \RESbestpose{} of episodes---substantially better
+reaching than its held-pose rate alone suggests.
 
-What the policy cannot do is stay there. Position error falls below tolerance
-within \SI{1}{\second} and stays, but orientation error oscillates \emph{across}
-its tolerance rather than settling beneath it: episodes that entered the
-tolerance left it a median of three times and spent only \RESfracintol{} of
-post-entry steps inside. The gap between \RESbestpose{} and \RESsuccess{} is the
-whole story of this controller---an unsettled hover, not a miss. Even
-Fig.~\ref{fig:compare}(a--c), one of the successful episodes, shows the
-commanded acceleration repeatedly saturating $a_{\max}$ before the arm settles:
-the corrective micro-motions run close to the rate limit even when the episode
+What the policy cannot do is stay there. Position error falls below
+tolerance within \SI{1}{\second} and stays, but orientation error oscillates
+\emph{across} its tolerance rather than settling beneath it: episodes that
+entered it left a median of three times, spending only \RESfracintol{} of
+post-entry steps inside. The gap between \RESbestpose{} and \RESfinalpose{}
+is the whole story of this controller---an unsettled hover, not a miss. Even
+Fig.~\ref{fig:compare}(a--c), a successful episode, shows commanded
+acceleration repeatedly saturating $a_{\max}$ before the arm settles: the
+corrective micro-motions run close to the rate limit even when the episode
 ultimately holds.
 
-The solver settles where the policy does not: within about a second its
-commanded velocity and acceleration are exactly zero, and where a solution
+The solver settles where the policy does not: commanded velocity and
+acceleration reach exactly zero within about a second, and where a solution
 exists the pose is essentially exact (median \CASposMedian{}\,mm,
-\CASoriMedian{}$^\circ$)---but that median sees only the converged majority.
-Roughly a fifth of targets have no feasible solution at all
-(Sec.~\ref{sec:limitations}), and pooling those large residuals in gives an
-RMS of \CASposRMS{}\,mm, \CASoriRMS{}$^\circ$: the honest figure for what the
-solver achieves over everything it is asked to reach. Its overall
-\CASfeasible{} is higher than the policy's, but not from better reaching: the
-policy meets the \emph{position} tolerance more often (\RESposonly{} against
-\CASposfeasible{}). What the solver wins is orientation and, above all,
-settling.
+\CASoriMedian{}$^\circ$)---but that median covers only the converged
+majority. Roughly a fifth of targets have no feasible solution at all
+(Sec.~\ref{sec:limitations}); pooling those residuals gives the honest
+figure over everything the solver is asked to reach: \CASposRMS{}\,mm,
+\CASoriRMS{}$^\circ$ RMS. Its overall \CASfeasible{} beats the policy's, but
+not from better reaching---the policy meets the \emph{position} tolerance
+more often (\RESposonly{} vs. \CASposfeasible{})---rather from orientation
+and, above all, settling.
 
-Its cost is compute: \CASsolveMed{}\,ms median against \RLforward{}\,ms, with a
-\CASsolveMax{}\,ms worst case an order of magnitude beyond the
-\SI{20}{\milli\second} control period---a missed deadline a classical
-controller needs an explicit fallback for, a network with constant cost does
-not. Its accuracy figures are also upper bounds, being kinematic: no actuator
+Its cost is compute: \CASsolveMed{}\,ms median against \RLforward{}\,ms,
+with a \CASsolveMax{}\,ms worst case an order of magnitude beyond the
+\SI{20}{\milli\second} control period, a missed deadline a classical
+controller needs an explicit fallback for; a network with constant cost
+does not. Its accuracy is also an upper bound: kinematic, with no actuator
 lag, tracking error, or contact.
 
-The hybrid captures both. It reaches \HYBsuccess{}, matching the solver, with
-RMS orientation error \HYBtheta{}$^\circ$ against the policy's
-\RESthetafinal{}$^\circ$---the solver finishes the pose the policy could not
-hold. Its advantage over the solver is cost, not accuracy: \HYBcompute{}\,ms
-per episode against roughly \SI{1.5}{\second} if IPOPT ran all 250 ticks,
-since the policy covers the easy far field for the price of a forward pass.
-Smoothness does not suffer at the switch: jerk RMS is \HYBjerk{}\,rad/s$^3$,
-comparable to the policy's own \RESjerkOn{}, since the rate limiter lives in
-the environment and its buffers carry straight through (Fig.~\ref{fig:compare}(g--i)).
-
-Only \HYBbyprox{} of episodes hand off by proximity, since the policy rarely
-closes to \SI{10}{\centi\metre} with the fruit raised above shoulder height;
-the rest hit the \SI{2.5}{\second} timeout (median handoff \HYBhandoff{}\,s)---an
-argument for switching on stagnation rather than distance.
+The hybrid captures both, matching the solver's \HYBsuccess{} with RMS
+orientation error \HYBtheta{}$^\circ$ against the policy's
+\RESthetafinal{}$^\circ$---finishing the pose the policy could not hold---at
+\HYBcompute{}\,ms per episode against roughly \SI{1.5}{\second} if IPOPT ran
+all 250 ticks, since the policy covers the easy far field for the price of a
+forward pass. Jerk RMS is \HYBjerk{}\,rad/s$^3$, comparable to the policy's
+own \RESjerkOn{}, since the rate limiter's buffers carry straight through
+the handoff (Fig.~\ref{fig:compare}(g--i)). Only \HYBbyprox{} of episodes
+hand off by proximity---the rest hit the \SI{2.5}{\second} timeout (median
+\HYBhandoff{}\,s)---an argument for switching on stagnation rather than
+distance.
 
 \subsection{Where this works, and where it does not}
 \label{sec:limitations}
@@ -417,8 +407,7 @@ argument for switching on stagnation rather than distance.
 \centering
 \includegraphics[width=\columnwidth]{figures/fig_eval.pdf}
 \caption{Outcome against where the fruit was sampled, in the randomizer's own
-polar coordinates; colour encodes final position error. Above the measured
-arm-reach rule almost every episode fails, for every controller.}
+polar coordinates; colour encodes final position error.}
 \label{fig:eval}
 \end{figure}
 
@@ -433,10 +422,7 @@ as successes despite not being physically realizable.
 measures about \SI{0.42}{\metre} plus the \SI{0.08}{\metre} palm offset, a
 ceiling near \SI{0.50}{\metre} against the sampler's
 $r_{\max}=\SI{0.62}{\metre}$. Fig.~\ref{fig:eval} shows the consequence: above
-the measured-reach rule almost every episode fails, confirmed independently by
-the solver's strongly bimodal residuals (\CASposMedian{}\,mm median against
-\CASposPninetyfive{}\,mm p95)---full model knowledge still cannot reach targets
-that lie outside the workspace. That ceiling belongs to the sampling envelope,
+the measured-reach rule almost every episode fails. Sometimes the torso natural pitch and roll helps to reach apples further than the measured arm reach. That ceiling belongs to the sampling envelope,
 not to any controller. Finally, the fruit is kinematic, so nothing here
 demonstrates contact behaviour, and orientation accuracy is a claim about
 approach pose only, not grasp stability.
@@ -450,7 +436,7 @@ Unitree G1 with Dex3 hands, and compared a learned policy, an
 optimization-based solver and a hybrid within one bounded action interface.
 The policy is cheap and generalizes but does not settle; the solver is exact
 and settles but is expensive and occasionally misses its deadline; the hybrid
-recovers most of both at a fraction of the solver's cost. Three design choices
+recovers most of both at a fraction of the solver's cost. However, the proximity-stop thread corrects the rl policy problem, and for its cost, this is the better option in general cases. Three design choices
 carried the weight: sampling the fruit in the shoulder's coordinates so
 targets are kinematically meaningful; enforcing smoothness structurally rather
 than through reward shaping; and instrumenting the task with a success signal
@@ -466,18 +452,15 @@ palm-mounted tactile one rather than run both, since the quintic stop needs
 only a trigger instant; the same sensing then serves the grasp phase, for
 which the contact sensors and Dex3 action term are already present.
 
-Three further directions follow: aligning the sampling envelope with the
-arm's measured reach and enabling self-collision, removing both failure
-regions of Sec.~\ref{sec:limitations}; a learned residual on top of the
-solver rather than a hard switch; and a head-camera variant letting a
+Further directions follow: a head-camera letting a
 perception front-end of the kind used for apple
 localisation~\cite{selvaraj2024segmentation} replace the privileged fruit pose
-assumed throughout.
+assumed throughout. 
+Moreover, training for a gentle grip and a trajectory for harvesting the apple.
 
 \section*{Acknowledgment}
 
-The authors thank the Unitree Robotics team for publishing the G1 robot
-description and the Isaac Lab reference environments this work builds on.
+The authors thank the Unitree Robotics team for providing the open-source code and documentation upon which this work builds.
 
 \bibliographystyle{IEEEtran}
 \bibliography{refs}
