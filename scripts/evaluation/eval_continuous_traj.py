@@ -27,7 +27,7 @@ benchmark_hybrid.py / plot_results.py unmodified.
 Usage
 -----
     PY=/home/pablo_kevin/miniconda3/envs/isaaclab_curobo/bin/python
-    $PY scripts/eval_continuous_traj.py --headless --num_envs 64 \
+    $PY scripts/evaluation/eval_continuous_traj.py --headless --num_envs 64 \
         --n_steps 150 --out results/eval_continuous.npz
 """
 
@@ -91,7 +91,7 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from rsl_rl.runners import OnPolicyRunner
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, "scripts"))
 import envs  # noqa: E402,F401

@@ -8,7 +8,7 @@ shoulder-centred polar coordinates -- through scripts/reach_apple_casadi.py's
 solver, and reports solve time and kinematic residual.
 
     PY=/home/pablo_kevin/miniconda3/envs/isaaclab_curobo/bin/python
-    $PY scripts/benchmark_casadi.py --results results/eval_on.npz \\
+    $PY scripts/evaluation/benchmark_casadi.py --results results/eval_on.npz \\
         --out results/casadi_bench.npz
 
 No Isaac Sim and no DDS: this measures the solver, not the closed loop.
@@ -49,8 +49,10 @@ import time
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(_HERE)
+_SCRIPTS = os.path.dirname(_HERE)
+_REPO = os.path.dirname(_SCRIPTS)
 sys.path.insert(0, _HERE)
+sys.path.insert(0, _SCRIPTS)
 sys.path.insert(0, _REPO)
 
 import eval_utils as eu  # noqa: E402

@@ -13,7 +13,7 @@ names were generic per-sphere IDs, not link names, so its ignore-list
 filtering was silently matching nothing).
 
 Usage:
-    ~/IsaacLab/isaaclab.sh -p scripts/visualize_curobo_spheres.py
+    ~/IsaacLab/isaaclab.sh -p scripts/archive/visualize_curobo_spheres.py
 """
 
 import argparse
@@ -34,7 +34,7 @@ import yaml
 import gymnasium as gym
 from omni.isaac.core.objects import VisualSphere
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import envs  # registers gym tasks
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg_PLAY, ROBOT_ROOT_HEIGHT
 

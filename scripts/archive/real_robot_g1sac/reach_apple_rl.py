@@ -20,7 +20,7 @@ FIXES vs the previous version:
      extract_target_rotation() silently fell back to np.eye(3) every call.
      That's an arbitrary, likely-unreachable orientation target. Replaced
      with a fixed, tunable approach orientation (same idea as
-     scripts/orient_tune.py) via --roll-deg/--pitch-deg/--yaw-deg.
+     scripts/calibration/orient_tune.py) via --roll-deg/--pitch-deg/--yaw-deg.
   3. SCALE: ARM_ACTION_SCALE/HAND_ACTION_SCALE now match
      apple_grasp_env_cfg.py's ActionsCfg (scale=1.0), not the old 0.5/0.3.
 

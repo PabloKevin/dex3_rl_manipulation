@@ -19,13 +19,13 @@ Purpose: validate that
   - The apple is lifted (rigid body follows the hand)
 
 Usage:
-    python scripts/move_arm.py
+    python scripts/calibration/move_arm.py
 
     # Slow-motion (physics slower, easier to observe):
-    python scripts/move_arm.py --slow
+    python scripts/calibration/move_arm.py --slow
 
     # Print contact forces during grasp:
-    python scripts/move_arm.py --verbose
+    python scripts/calibration/move_arm.py --verbose
 
 TODO: After running, check the printed "apple_z" during LIFT stage.
       If it does not increase, the grasp is not working — tune Dex3
@@ -51,7 +51,7 @@ simulation_app = app_launcher.app
 import torch
 import gymnasium as gym
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import envs  # registers gym tasks
 
 from isaaclab.assets import Articulation, RigidObject

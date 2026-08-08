@@ -9,7 +9,7 @@ Edit ROLL_DEG / PITCH_DEG / YAW_DEG below, rerun, look at the sim, repeat.
 Much faster than reach_apple_curobo.py's full plan_single() for this purpose.
 
 Usage (run_env.py must already be running):
-    python3 scripts/orient_tune.py
+    python3 scripts/calibration/orient_tune.py
 """
 import json
 import math
@@ -41,7 +41,7 @@ BASE_LINK_NAME = "torso_link"
 # ROBOT_CFG_PATH comment for why (get_robot_configs_path() resolves to
 # cuRobo's package-installed copy, which drifts out of sync with this one).
 ROBOT_CFG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "envs", "assets", "cuRobo", "g1_dex3_right_arm.yml",
 )
 APPLE_RADIUS = 0.04

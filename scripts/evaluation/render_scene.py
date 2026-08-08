@@ -7,7 +7,7 @@ robot settles into its initial pose and the per-env randomization has been
 applied, then writes one PNG per environment plus a stitched contact sheet.
 
     PY=/home/pablo_kevin/miniconda3/envs/isaaclab_curobo/bin/python
-    $PY scripts/render_scene.py --headless --enable_cameras --num_envs 3
+    $PY scripts/evaluation/render_scene.py --headless --enable_cameras --num_envs 3
 
 Needs --enable_cameras; without it Isaac Sim does not create the render product
 and the camera returns empty tensors.
@@ -51,7 +51,7 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.sensors import CameraCfg
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _REPO)
 import envs  # noqa: E402,F401
 
@@ -60,7 +60,7 @@ from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 
 def main() -> None:
-    outdir = args_cli.outdir or os.path.join(_REPO, "paper", "figures")
+    outdir = args_cli.outdir or os.path.join(_REPO, "papers", "reach_apple", "figures")
     os.makedirs(outdir, exist_ok=True)
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)

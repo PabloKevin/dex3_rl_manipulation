@@ -6,7 +6,7 @@ Usage:
 # Basic viewer (holds sim, listens for targets, publishes state):
 ~/IsaacLab/isaaclab.sh -p scripts/run_env.py
 # While sim is running, in a second terminal:
-python3 scripts/reach_apple_curobo.py
+python3 scripts/archive/reach_apple_curobo.py
 # Or the IK-based reacher:
 python3 scripts/reach_apple_ik.py
 # Multiple envs:
@@ -401,7 +401,7 @@ def main():
     print(f"  Action dim : {env.action_space.shape}")
     print(f"  Obs dim    : {obs['policy'].shape}")
     print("="*60)
-    print("  Run  python3 scripts/reach_apple_curobo.py  (cuRobo planner)")
+    print("  Run  python3 scripts/archive/reach_apple_curobo.py  (cuRobo planner)")
     print("   or  python3 scripts/reach_apple_ik.py       (Jacobian IK)")
     print("  in a second terminal to control joints.")
     print("  Without it the robot holds its default pose.")

@@ -19,7 +19,7 @@ It reports mean/std/max position + orientation error, and prints a ready
 
 Usage:
     Terminal 1: ~/IsaacLab/isaaclab.sh -p scripts/run_env.py
-    Terminal 2: python3 scripts/calibrate_reach_apple_curobo.py --n 10
+    Terminal 2: python3 scripts/calibration/calibrate_reach_apple_curobo.py --n 10
 
 Requires the version of run_env.py that publishes "ee_pos"/"ee_quat" on
 rt/arm_tune/state (the one you're already using with reach_apple_curobo.py).
@@ -205,7 +205,7 @@ BASE_LINK_NAME = "torso_link"
 # cuRobo's package-installed copy, which drifts out of sync with this one —
 # calibrating against the wrong file makes the resulting bias meaningless).
 ROBOT_CFG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "envs", "assets", "cuRobo", "g1_dex3_right_arm.yml",
 )
 

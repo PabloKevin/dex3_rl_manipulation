@@ -1,2 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Checkpoints / model weights — keep curated ones explicitly (see envs/agents/best_weights/)
 *.pt
 !*reach_apple.pt
+
+# Training runs, Hydra run dirs, generated evaluation artifacts — all regenerable
+# by re-running train.py / evaluate_policy.py / the benchmark scripts.
+logs/
+outputs/
+results/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store

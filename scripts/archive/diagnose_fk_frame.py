@@ -35,7 +35,7 @@ answers it directly:
 
 Usage:
     Terminal 1: ~/IsaacLab/isaaclab.sh -p scripts/run_env.py
-    Terminal 2: python3 scripts/diagnose_fk_frame.py
+    Terminal 2: python3 scripts/archive/diagnose_fk_frame.py
     (optionally move the arm around with reach_apple_ik.py in a third
     terminal between samples — this script re-samples every 3s so you can
     watch whether the discrepancy stays constant across different poses)
@@ -147,7 +147,7 @@ RIGHT_ARM_JOINT_NAMES = [
 EE_LINK_NAME = "right_hand_palm_link"
 BASE_LINK_NAME = "torso_link"
 ROBOT_CFG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "envs", "assets", "cuRobo", "g1_dex3_right_arm.yml",
 )
 

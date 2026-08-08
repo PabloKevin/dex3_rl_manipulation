@@ -3,7 +3,7 @@
 """Benchmark the hybrid RL->CasADi reacher (scripts/reach_apple_hybrid.py).
 
     PY=/home/pablo_kevin/miniconda3/envs/unitree_g1/bin/python
-    $PY scripts/benchmark_hybrid.py --out results/hybrid_bench.npz
+    $PY scripts/evaluation/benchmark_hybrid.py --out results/hybrid_bench.npz
 
 Method. The hybrid's first phase is the trained policy, which cannot be replayed
 open-loop -- its observations depend on the simulated state. So instead of
@@ -36,8 +36,10 @@ import time
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.dirname(_HERE)
+_SCRIPTS = os.path.dirname(_HERE)
+_REPO = os.path.dirname(_SCRIPTS)
 sys.path.insert(0, _HERE)
+sys.path.insert(0, _SCRIPTS)
 sys.path.insert(0, _REPO)
 
 import eval_utils as eu  # noqa: E402

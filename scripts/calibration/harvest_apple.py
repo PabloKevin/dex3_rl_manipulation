@@ -4,7 +4,7 @@
 Apple harvest state machine — sends joint targets to the running sim via DDS.
 
 Run in a SECOND terminal while run_env.py is already running:
-    python3 scripts/harvest_apple.py
+    python3 scripts/calibration/harvest_apple.py
 
 Harvest motion stages (agronomically correct sequence):
   1. HOME    — neutral ready pose

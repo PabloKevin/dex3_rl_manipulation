@@ -4,7 +4,7 @@
 Interactive joint tuner — sends arm + hand targets to the running sim via DDS.
 
 Run in a SECOND terminal while run_env.py is already running:
-    python3 scripts/tune_arm.py
+    python3 scripts/calibration/tune_arm.py
 
 Controls:
     ↑ / ↓          select joint

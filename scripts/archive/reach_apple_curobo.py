@@ -6,7 +6,7 @@ Does NOT launch Isaac Sim.
 
 Usage:
 1. Terminal 1: ~/IsaacLab/isaaclab.sh -p scripts/run_env.py
-2. Terminal 2: python3 scripts/reach_apple_curobo.py
+2. Terminal 2: python3 scripts/archive/reach_apple_curobo.py
 
 Key changes from the previous version:
   - base_link is overridden to "torso_link" instead of the yml's default "pelvis".
@@ -156,7 +156,7 @@ BASE_LINK_NAME = "torso_link"
 # had silently drifted out of sync with this tracked copy — edits made here
 # were having zero effect on what actually got solved against.
 ROBOT_CFG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "envs", "assets", "cuRobo", "g1_dex3_right_arm.yml",
 )
 

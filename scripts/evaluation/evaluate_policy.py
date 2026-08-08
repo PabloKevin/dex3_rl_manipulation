@@ -25,10 +25,10 @@ Usage
     PY=/home/pablo_kevin/miniconda3/envs/isaaclab_curobo/bin/python
 
     # defaults to the newest run's newest checkpoint
-    $PY scripts/evaluate_policy.py --headless --rate_limit on \
+    $PY scripts/evaluation/evaluate_policy.py --headless --rate_limit on \
         --out results/eval_on.npz
 
-    $PY scripts/evaluate_policy.py --headless --rate_limit off \
+    $PY scripts/evaluation/evaluate_policy.py --headless --rate_limit off \
         --out results/eval_off.npz --seed 1
 """
 
@@ -98,7 +98,7 @@ from isaaclab.utils.assets import retrieve_file_path
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, "scripts"))
 import envs  # noqa: E402,F401
