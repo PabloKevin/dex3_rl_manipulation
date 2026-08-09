@@ -12,6 +12,9 @@ logs/
 outputs/
 results/
 
+# Standard LaTeX boilerplate, not our content — re-obtainable from the template
+IEEEtran.cls
+
 # Editor / OS cruft
 .vscode/
 .idea/
