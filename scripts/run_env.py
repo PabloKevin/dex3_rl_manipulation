@@ -34,6 +34,11 @@ All positions are WORLD frame, env-origin already
 subtracted (irrelevant for single-env but kept for
 correctness if you scale to --num_envs > 1 later —
 note state is only ever published for env 0).
+
+rt/dex3/right/state  (publish)    unitree_hg HandState_ — right-hand tactile
+sensors (press_sensor_state), same message/topic a real Dex3-1 hand
+publishes. See tactile_layout.py for the taxel layout.
+In a second terminal:  python3 scripts/tactile_monitor.py
 """
 import argparse
 import sys
@@ -107,6 +112,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY
 from proximity_stop import QuinticStopController, QuinticStopConfig
+import tactile_layout
 
 # Must match ActionsCfg.right_arm.joint_names order in apple_grasp_env_cfg.py
 RIGHT_ARM_JOINT_NAMES = [
@@ -232,6 +238,9 @@ _arm_targets  = None   # None = hold default pose (zero actions)
 _hand_targets = None
 _dds_ok = False
 _state_publisher = None
+_tactile_ok = False
+_tactile_publisher = None
+_tactile_hand_state = None   # unitree_hg HandState_, reused/mutated in place each step
 
 def _start_dds():
     """Start DDS subscriber (targets) + publisher (state). Non-fatal if unavailable."""
@@ -265,6 +274,33 @@ def _start_dds():
     except Exception as e:
         print(f"[DDS] Unavailable ({e}). Running with zero actions only, no state published.")
         _dds_ok = False
+
+    # Separate, independently-fatal-safe: publishes the right hand's tactile
+    # sensors on the SAME topic/message type real Dex3-1 hardware uses
+    # (unitree_hg HandState_.press_sensor_state), so scripts/tactile_monitor.py
+    # decodes it exactly like it would decode a real hand. See tactile_layout.py.
+    global _tactile_ok, _tactile_publisher, _tactile_hand_state
+    try:
+        from unitree_sdk2py.core.channel import ChannelPublisher
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
+        from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandState_
+
+        _tactile_publisher = ChannelPublisher(tactile_layout.DDS_TOPIC_HAND_STATE_RIGHT, HandState_)
+        _tactile_publisher.Init()
+        _tactile_hand_state = unitree_hg_msg_dds__HandState_()
+        # Only press_sensor_state[0] is ever populated with real data (see
+        # tactile_layout.py); mark the rest as the firmware's own "no data"
+        # sentinel so a real-hardware-style consumer that scans every entry
+        # in the sequence still decodes correctly.
+        for group in _tactile_hand_state.press_sensor_state[1:]:
+            for i in range(tactile_layout.NUM_RAW_SLOTS):
+                group.pressure[i] = tactile_layout.INVALID_RAW
+        _tactile_ok = True
+        print(f"[DDS] Publishing tactile HandState_ on {tactile_layout.DDS_TOPIC_HAND_STATE_RIGHT} — "
+              "scripts/tactile_monitor.py can now connect.")
+    except Exception as e:
+        print(f"[DDS] Tactile publisher unavailable ({e}). Tactile sensors will not be published.")
+        _tactile_ok = False
 
 def _get_actions(device, action_shape):
     """Return action tensor from latest DDS targets, or zeros if none received.
@@ -319,6 +355,49 @@ def _publish_state(robot: Articulation, apple: RigidObject,
         _state_publisher.Write(String_(data=json.dumps(payload)))
     except Exception as e:
         print(f"[DDS] state publish error: {e}")
+
+
+def _resolve_tactile_link_ids(sensor: ContactSensor) -> dict:
+    """Map each taxel in tactile_layout.TAXELS to its body index within
+    `sensor.body_names` (the order sensor.data.net_forces_w is indexed by).
+    Resolved once — missing links (e.g. a differently-named USD) are
+    skipped with a warning rather than crashing the whole viewer."""
+    ids = {}
+    for taxel in tactile_layout.TAXELS:
+        try:
+            ids[taxel.name] = sensor.body_names.index(taxel.link_name)
+        except ValueError:
+            print(f"[Tactile] WARNING: link '{taxel.link_name}' (taxel '{taxel.name}') "
+                  f"not found in contact sensor body_names={sensor.body_names} — "
+                  "that taxel will always read 'no data'.")
+    return ids
+
+
+def _publish_tactile(sensor: ContactSensor, tactile_link_ids: dict):
+    """Read per-link contact force from the existing right-hand ContactSensor,
+    map it onto the real Dex3-1 taxel layout (tactile_layout.py), and publish
+    it as an unitree_hg HandState_.press_sensor_state — the exact message a
+    real Dex3-1 hand would send, so scripts/tactile_monitor.py needs no
+    sim-specific decoding."""
+    if not _tactile_ok or _tactile_publisher is None or sensor is None:
+        return
+    try:
+        # net_forces_w: [num_envs, num_bodies, 3] (world-frame N), env 0 only —
+        # same "state is only ever published for env 0" convention as _publish_state.
+        forces = sensor.data.net_forces_w[0]  # [num_bodies, 3]
+        pressure = _tactile_hand_state.press_sensor_state[0].pressure
+        for i in range(tactile_layout.NUM_RAW_SLOTS):
+            pressure[i] = tactile_layout.INVALID_RAW
+        for taxel in tactile_layout.TAXELS:
+            body_id = tactile_link_ids.get(taxel.name)
+            if body_id is None:
+                continue
+            force_n = torch.norm(forces[body_id]).item()
+            pressure[taxel.raw_index] = tactile_layout.force_to_raw(force_n)
+        _tactile_publisher.Write(_tactile_hand_state)
+    except Exception as e:
+        print(f"[DDS] tactile publish error: {e}")
+
 
 def _find_last_policy():
     """Path to the latest run's JIT-exported policy — NOT the raw model_*.pt
@@ -405,6 +484,8 @@ def main():
     print("   or  python3 scripts/reach_apple_ik.py       (Jacobian IK)")
     print("  in a second terminal to control joints.")
     print("  Without it the robot holds its default pose.")
+    print("  Run  python3 scripts/tactile_monitor.py  in a second terminal")
+    print("  to view the right hand's tactile sensors live.")
     print("  Press 'r' + Enter in this terminal at any time to RESET.")
     print("="*60 + "\n")
 
@@ -414,6 +495,7 @@ def main():
         sensor: ContactSensor = env.scene["contact_forces"]
     except Exception:
         sensor = None
+    tactile_link_ids = _resolve_tactile_link_ids(sensor) if sensor is not None else {}
 
     # ── Optional: drive the arm with a trained policy instead of DDS/zeros ──
     # Reuses THIS script's already-running env — no second gym.make(), so you
@@ -596,6 +678,7 @@ def main():
 
             _publish_state(robot, apple, torso_idx, arm_joint_idx, ik_extractor,
                            obs_policy=obs["policy"][0].tolist())
+            _publish_tactile(sensor, tactile_link_ids)
 
             step += 1
             if terminated.any() or truncated.any():
