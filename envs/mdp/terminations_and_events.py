@@ -120,6 +120,138 @@ def reach_success(
     return success
 
 
+def apple_fell_from_grip(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg,
+    drop_margin: float = 0.08,
+) -> torch.Tensor:
+    """True once the apple has fallen `drop_margin` metres below where the
+    reach->grasp hand-off left it (env._grasp_handoff_apple_pos) -- the real
+    "failed to hold it" signal for the grasp phase.
+
+    Why this exists alongside apple_dropped: apple_dropped's own
+    min_height=-0.1 (an ABSOLUTE world-frame height) was calibrated for the
+    reach phase, where the apple was kinematic and never touched anything.
+    Now that the apple is a real dynamic body, a failed grasp just lets it
+    fall and REST ON THE GROUND at roughly its own radius (~0.04 m) --
+    comfortably above -0.1 m -- so apple_dropped alone never fires on a
+    failed grasp; the episode idles out to time_out with no further
+    learning signal and no real penalty for having failed. (Confirmed
+    empirically during early training: 100% time_out, 0% apple_dropped,
+    episode length pinned at the max every single episode.)
+
+    This measures against the apple's OWN per-episode hand-off height
+    instead (mirrors how grasp_success's lift check is anchored to the same
+    tensor, for the same reason -- an absolute reference doesn't account
+    for per-episode randomized apple height), so it catches a failed or
+    slipping grasp promptly regardless of where the apple ends up (on the
+    ground, rolled aside, wherever) rather than only once it crosses some
+    fixed absolute coordinate. apple_dropped is kept alongside this as a
+    coarse backstop (e.g. the apple somehow ending up far below the scene
+    entirely), not removed.
+
+    Shape: [num_envs] bool
+    """
+    apple: RigidObject = env.scene[object_cfg.name]
+    if not hasattr(env, "_grasp_handoff_apple_pos"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return apple.data.root_pos_w[:, 2] < (env._grasp_handoff_apple_pos[:, 2] - drop_margin)
+
+
+def grasp_success(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    hold_time: float = 0.5,
+    lift_margin: float = 0.03,
+    mu: float = 0.5,
+    contact_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Terminate once force closure (Lynch & Park, 2017, Ch.12 — see
+    grasp_rewards._force_closure_ok for the geometric proxy used) has held
+    for hold_time continuous seconds AND the apple has been lifted
+    lift_margin above its post-hand-off height. Mirrors reach_success's
+    hold-counter idiom exactly (same episode-boundary reset via
+    episode_length_buf, same "cache on env, read by the paired reward"
+    contract as reward_reach_success / reach_success).
+
+    The lift check matters even though force closure alone might look like
+    "grasped": with a 14-DoF action space the arm has enough authority to
+    make a degenerate "palm-as-shelf" solution look stable without the
+    fingers actually gripping. Anchored to env._grasp_handoff_apple_pos
+    (cached by grasp_autoplay.reach_autoplay_handoff at the reach->grasp
+    hand-off) rather than a fixed absolute height, for the same reason
+    rewards.reward_lift anchors to env._stem_anchor_pos — the apple's height
+    at that moment varies per episode.
+
+    IsaacLab computes terminations BEFORE rewards each step (see
+    ManagerBasedRLEnv.step), so this caches env._force_closure_ok (read by
+    grasp_rewards.reward_grasp_hold) and env._grasp_success (read by
+    grasp_rewards.reward_grasp_success) fresh every step before either
+    reward reads them.
+
+    Shape: [num_envs] bool
+    """
+    from .grasp_rewards import _force_closure_ok
+
+    apple: RigidObject = env.scene[object_cfg.name]
+    closure_ok = _force_closure_ok(
+        env, sensor_cfg, robot_cfg, object_cfg, mu=mu, contact_threshold=contact_threshold
+    )
+    env._force_closure_ok = closure_ok
+
+    if hasattr(env, "_grasp_handoff_apple_pos"):
+        lifted = apple.data.root_pos_w[:, 2] >= (env._grasp_handoff_apple_pos[:, 2] + lift_margin)
+    else:
+        # Autoplay hasn't run yet (e.g. this task's env got stepped once
+        # before any reset) — fail closed rather than crash.
+        lifted = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    in_neighbourhood = closure_ok & lifted
+
+    if not hasattr(env, "_grasp_hold_counter") or env._grasp_hold_counter.shape[0] != env.num_envs:
+        env._grasp_hold_counter = torch.zeros(env.num_envs, device=env.device)
+
+    env._grasp_hold_counter = torch.where(
+        env.episode_length_buf <= 1, torch.zeros_like(env._grasp_hold_counter), env._grasp_hold_counter
+    )
+    env._grasp_hold_counter = torch.where(
+        in_neighbourhood, env._grasp_hold_counter + 1, torch.zeros_like(env._grasp_hold_counter)
+    )
+
+    hold_steps_required = max(1, round(hold_time / env.step_dt))
+    success = env._grasp_hold_counter >= hold_steps_required
+    env._grasp_success = success   # read by grasp_rewards.reward_grasp_success
+    return success
+
+
+def fruit_damaged(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Hard, immediate failure: any per-finger-group contact force exceeds
+    the per-episode randomized env._fruit_damage_force (Li et al., 2026 +
+    broader pome-fruit literature range — see
+    domain_randomization.randomize_fruit_damage_force).
+
+    Unlike grasp_success, this is NOT hold-counted — bio-yield is a
+    near-instantaneous threshold effect (cellular rupture), not something to
+    average or require sustained. A single crossing fails the episode, on
+    par with apple_dropped as a first-class failure mode.
+
+    Shape: [num_envs] bool
+    """
+    from .grasp_rewards import _per_finger_group_force
+
+    if not hasattr(env, "_fruit_damage_force"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    per_finger = _per_finger_group_force(env, sensor_cfg)  # [N, 3]
+    max_force = per_finger.max(dim=-1).values
+    return max_force > env._fruit_damage_force
+
+
 def apple_placed_success(
     env: ManagerBasedRLEnv,
     object_cfg: SceneEntityCfg,

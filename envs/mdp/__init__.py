@@ -30,6 +30,10 @@ from .observations import (
     object_pos_relative_to_body,
     object_vel_world,
     body_quat_relative_to_body,
+    tactile_slip,
+    tactile_finger_balance,
+    tactile_force_level,
+    target_grip_level,
 )
 
 from .rewards import (
@@ -51,6 +55,9 @@ from .terminations_and_events import (
     apple_placed_success,
     reach_success,
     reset_apple_pose,
+    grasp_success,
+    fruit_damaged,
+    apple_fell_from_grip,
 )
 
 from .domain_randomization import (
@@ -58,4 +65,6 @@ from .domain_randomization import (
     randomize_stem_break_params,
     randomize_tree_and_apple,
     randomize_tree_geometry,
+    randomize_tactile_gain,
+    randomize_fruit_damage_force,
 )

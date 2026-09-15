@@ -97,6 +97,160 @@ def fingertip_contact_normals(
 
 
 # ─────────────────────────────────────────────
+#  Tactile observations (grasp phase) — deliberately calibration-agnostic.
+#
+#  tactile_layout.SIM_FORCE_TO_RAW_GAIN is an admitted, unverified placeholder
+#  (see that module's docstring), so these observations avoid depending on
+#  absolute force magnitude wherever possible: tactile_slip (derivative) and
+#  tactile_finger_balance (ratio) are both invariant to a uniform scale, and
+#  training additionally randomizes an INDEPENDENT per-taxel gain every
+#  episode (domain_randomization.randomize_tactile_gain) so the policy can't
+#  lean on a shared scale factor either. tactile_force_level is the one
+#  deliberate exception — needed so a command-conditioned grip-force setpoint
+#  (see the grasp env cfg's env._target_grip_level) has something to track;
+#  domain randomization still applies to it, so tracking is necessarily
+#  approximate, matching how an operator tuning a real, uncalibrated hand
+#  could only achieve approximate tracking too.
+#
+#  Reward functions must NOT reuse _sensed_tactile_forces (or these public
+#  observation functions) directly — rewards use ground-truth force straight
+#  from the ContactSensor (see envs/mdp/grasp_rewards.py's own
+#  _per_finger_group_force), since privileged, uncalibrated info is fine for
+#  a training-only reward signal but would defeat the point if fed to the
+#  policy as an observation.
+# ─────────────────────────────────────────────
+
+def _sensed_tactile_forces(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Apple-filtered, per-taxel force magnitude, WITH the per-env per-taxel
+    calibration gain applied (ground truth * env._tactile_gain).
+
+    Uses force_matrix_w (filtered specifically to the Apple via
+    ContactSensorCfg.filter_prim_paths_expr), not net_forces_w — same
+    reasoning as reach_rewards.penalty_apple_contact_force: self-collision or
+    tree contact must not leak into a tactile reading.
+
+    Shape: [num_envs, 9] (tactile_layout.TAXELS order).
+    """
+    import tactile_layout
+
+    sensor: ContactSensor = env.scene[sensor_cfg.name]
+    if not hasattr(env, "_taxel_body_ids"):
+        env._taxel_body_ids = [
+            sensor.body_names.index(t.link_name) for t in tactile_layout.TAXELS
+        ]
+
+    forces = sensor.data.force_matrix_w          # [N, B, 1, 3] -- filtered to Apple
+    force_norm = torch.norm(forces, dim=-1).squeeze(-1)   # [N, B]
+    ground_truth = force_norm[:, env._taxel_body_ids]      # [N, 9]
+
+    if not hasattr(env, "_tactile_gain"):
+        env._tactile_gain = torch.ones(env.num_envs, ground_truth.shape[-1], device=env.device)
+
+    return ground_truth * env._tactile_gain
+
+
+def _taxel_finger_groups(env: ManagerBasedRLEnv) -> dict[str, list[int]]:
+    """Lazily cache, per env, the taxel indices belonging to each finger
+    group (thumb/index/middle) — shared by the balance/level observations
+    below and by grasp_rewards.py's ground-truth equivalents."""
+    import tactile_layout
+
+    if not hasattr(env, "_taxel_finger_idx"):
+        fingers = ("thumb", "index", "middle")
+        env._taxel_finger_idx = {
+            f: [i for i, t in enumerate(tactile_layout.TAXELS) if t.finger == f]
+            for f in fingers
+        }
+    return env._taxel_finger_idx
+
+
+def tactile_slip(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Per-taxel temporal slip signal: (force_now - force_prev) / step_dt,
+    calibration-gained. The real physical signature of slip (a sudden force
+    change despite a steady grip command) — a derivative, so a UNIFORM
+    calibration gain cancels out of it entirely; only the independent
+    per-taxel gain randomization actually stresses this.
+
+    Shape: [num_envs, 9]
+    """
+    sensed = _sensed_tactile_forces(env, sensor_cfg)
+
+    if not hasattr(env, "_prev_tactile_force") or env._prev_tactile_force.shape != sensed.shape:
+        env._prev_tactile_force = sensed.clone()
+
+    slip = (sensed - env._prev_tactile_force) / env.step_dt
+    # Episode boundary: don't score a spurious spike against the previous
+    # episode's stale reading (same guard reach_rewards.reward_reach_progress
+    # and terminations_and_events.reach_success already use).
+    slip = torch.where(
+        (env.episode_length_buf <= 1).unsqueeze(-1), torch.zeros_like(slip), slip
+    )
+
+    env._prev_tactile_force = sensed.clone()
+    return slip
+
+
+def tactile_finger_balance(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Per-finger-group (thumb/index/middle) mean force, normalized by
+    deviation from the cross-finger mean — deliberately NOT absolute
+    magnitude, so a uniform miscalibration cancels and only genuine
+    imbalance shows up.
+
+    Shape: [num_envs, 3]
+    """
+    sensed = _sensed_tactile_forces(env, sensor_cfg)
+    idx = _taxel_finger_groups(env)
+    per_finger = torch.stack(
+        [sensed[:, idx[f]].mean(dim=-1) for f in ("thumb", "index", "middle")], dim=-1
+    )  # [N, 3]
+    mean_f = per_finger.mean(dim=-1, keepdim=True)
+    return (per_finger - mean_f) / (mean_f.abs() + 1e-3)
+
+
+def tactile_force_level(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Per-finger-group mean of the calibration-gained absolute force level.
+
+    The one deliberate exception to "no raw magnitude" in this module: a
+    command-conditioned grip-force setpoint (env._target_grip_level) needs
+    SOME absolute-level signal to know when it has reached a commanded
+    target — slip/balance alone can't provide that. Scoped narrowly to a
+    per-finger-group mean (not all 9 raw taxels) rather than adding a wider
+    raw-magnitude observation than this specific need requires.
+
+    Shape: [num_envs, 3]
+    """
+    sensed = _sensed_tactile_forces(env, sensor_cfg)
+    idx = _taxel_finger_groups(env)
+    return torch.stack(
+        [sensed[:, idx[f]].mean(dim=-1) for f in ("thumb", "index", "middle")], dim=-1
+    )  # [N, 3]
+
+
+def target_grip_level(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """The commanded grip-force setpoint itself, exposed directly as an
+    observation input — a COMMAND, not a measurement, so no calibration gain
+    applies (same as a commanded velocity input to a locomotion policy).
+
+    Shape: [num_envs, 1]
+    """
+    if not hasattr(env, "_target_grip_level"):
+        return torch.zeros(env.num_envs, 1, device=env.device)
+    return env._target_grip_level.unsqueeze(-1)
+
+
+# ─────────────────────────────────────────────
 #  Object position observations
 # ─────────────────────────────────────────────
 

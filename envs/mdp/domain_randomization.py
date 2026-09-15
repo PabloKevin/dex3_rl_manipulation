@@ -95,6 +95,105 @@ def randomize_stem_break_params(
         env._stem_break_force[idx] = random.uniform(lo_f, hi_f)
         env._stem_break_torque[idx] = random.uniform(lo_t, hi_t)
 
+def randomize_tactile_gain(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor,
+    gain_range: tuple[float, float] = (0.7, 1.3),
+) -> None:
+    """Independent per-taxel sensor-calibration gain, resampled every episode.
+
+    Grasp-phase-only randomizer (the reach task never calls this): tactile
+    observations (envs/mdp/observations.py::tactile_slip/_finger_balance/
+    _force_level) multiply the ground-truth apple-filtered contact force by
+    env._tactile_gain before exposing it to the policy, so training can't
+    lean on an absolute-force threshold that real hardware can't reproduce
+    (tactile_layout.SIM_FORCE_TO_RAW_GAIN is an admitted, unverified
+    placeholder — see that module's docstring). Independent PER TAXEL (not
+    one shared scalar) models realistic sensor-to-sensor miscalibration and
+    forces reliance on relative/gradient signals rather than a shared,
+    cancel-able scale factor.
+
+    Deliberately separate from tactile_layout.SIM_FORCE_TO_RAW_GAIN/
+    force_to_raw, which stay untouched — those are the sim-viewer/real-
+    hardware wire-format default scripts/run_env.py's DDS tactile publisher
+    depends on for scripts/tactile_monitor.py. This is a training-time-only
+    mechanism living purely on `env`.
+    """
+    import tactile_layout
+
+    n_taxels = len(tactile_layout.TAXELS)
+    if not hasattr(env, "_tactile_gain"):
+        env._tactile_gain = torch.ones(env.num_envs, n_taxels, device=env.device)
+
+    lo, hi = gain_range
+    n = len(env_ids)
+    env._tactile_gain[env_ids] = torch.empty(n, n_taxels, device=env.device).uniform_(lo, hi)
+
+
+def randomize_fruit_damage_force(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor,
+    low: float = 20.0,
+    high: float = 40.0,
+    apple_low: float = 22.0,
+    apple_high: float = 28.0,
+    apple_weight_pct: float = 0.6,
+    apple_mass_nominal: float = 0.15,
+    mu: float = 0.5,
+) -> None:
+    """Per-episode bio-yield/bruising-force threshold, AND the derived
+    command-conditioned grip setpoint that must sit strictly under it.
+
+    Damage force: the thesis's fruit-mechanics literature review (Li et al.,
+    2026, texture-analyzer compression tests on Red Fuji apples: 24.33 N
+    upper region, 26.37-26.38 N middle/lower; broader pome-fruit literature —
+    citrus, grapes, pears — spanning roughly 20-40 N) is compiled BECAUSE the
+    thesis hasn't fixed a final fruit species, so the threshold is randomized
+    per episode rather than hardcoded to one number. Sampled as a two-tier
+    mixture: with probability `apple_weight_pct`, sample tightly around the
+    best-documented Red Fuji apple range [apple_low, apple_high]; otherwise
+    sample the full reported range [low, high], so training generalizes
+    rather than overfitting to one species.
+
+    Caveat kept visible here (not just in the design doc): the literature
+    number is a local texture-analyzer PROBE force, not a perfect physical
+    analog to a simulated per-link contact-force magnitude — it's the best
+    available literature anchor, not a lab-measured constant for this setup.
+
+    Target grip setpoint (env._target_grip_level): sampled uniformly between
+    a rough friction-based minimum-to-not-slip estimate,
+    F_min ~= (apple_mass * g) / (3 * mu) (mu here is an ASSUMED constant —
+    no PhysX material is explicitly configured on the apple in this scene to
+    read a real friction coefficient from — and this is an order-of-magnitude
+    estimate, not a rigorous static-equilibrium solve), and THIS SAME
+    episode's just-sampled damage force. Computed in the same function
+    (rather than a separate event) because the target's upper bound depends
+    on this call's own damage-force sample — EventsCfg ordering alone can't
+    guarantee that dependency across two separate event terms as cleanly.
+    """
+    if not hasattr(env, "_fruit_damage_force"):
+        env._fruit_damage_force = torch.full(
+            (env.num_envs,), (low + high) / 2.0, device=env.device
+        )
+    if not hasattr(env, "_target_grip_level"):
+        env._target_grip_level = torch.zeros(env.num_envs, device=env.device)
+
+    n = len(env_ids)
+    use_apple = torch.rand(n, device=env.device) < apple_weight_pct
+    wide = torch.empty(n, device=env.device).uniform_(low, high)
+    tight = torch.empty(n, device=env.device).uniform_(apple_low, apple_high)
+    damage = torch.where(use_apple, tight, wide)
+    env._fruit_damage_force[env_ids] = damage
+
+    g = 9.81
+    f_min = (apple_mass_nominal * g) / (3.0 * mu)
+    lo_target = torch.full((n,), f_min, device=env.device)
+    hi_target = torch.maximum(damage, lo_target + 1e-3)  # guard a degenerate/inverted band
+    env._target_grip_level[env_ids] = lo_target + torch.rand(n, device=env.device) * (
+        hi_target - lo_target
+    )
+
+
 def _get_or_add_xform_op(prim, op_type):
     from pxr import UsdGeom
     xform = UsdGeom.Xformable(prim)
