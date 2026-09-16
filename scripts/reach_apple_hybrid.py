@@ -209,10 +209,14 @@ STEP_DT = 1.0 / CONTROL_HZ
 
 # Expected flat length of the published obs_policy vector -- 7 (right_arm_pos)
 # + 7 (right_arm_vel) + 3 (apple_pos_palm) + 4 (palm_orientation_torso) +
-# 7 (last_action), per envs/apple_grasp_env_cfg.py's ObservationsCfg.PolicyObs.
-# Only used to fail loudly if run_env.py and this script's obs contract ever
-# drift apart, instead of silently feeding the policy a malformed tensor.
-OBS_POLICY_DIM = 28
+# 7 (last_action) + 1 (palm_touch_force), per envs/apple_grasp_env_cfg.py's
+# ObservationsCfg.PolicyObs. Only used to fail loudly if run_env.py and this
+# script's obs contract ever drift apart, instead of silently feeding the
+# policy a malformed tensor. Bumped 28->29 when palm tactile sensing was
+# added to the reach task -- only matches a policy trained AFTER that
+# change; a pre-existing (still-preserved) 28-dim checkpoint will trip this
+# guard if loaded here, which is the intended fail-loud behavior, not a bug.
+OBS_POLICY_DIM = 29
 
 
 # ─────────────────────────────────────────────────────────────────────────

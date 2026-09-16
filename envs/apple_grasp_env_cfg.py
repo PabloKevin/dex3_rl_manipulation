@@ -171,12 +171,34 @@ PALM_LOCAL_OFFSET = (0.08, 0.0, 0.0)
 # reach_progress/hold/etc. actually track. At the old offset_z=0.08 the
 # converged pose put the thumb at apple_z - 0.08 + 0.065 = apple_z - 0.015 —
 # well inside the apple's own radius (~0.04 m) — so the thumb speared the
-# apple even at a "perfect" reach, no reward-shaping bug required. Sized to
-# clear: thumb's own protrusion + the apple's radius + the worst-case slack
-# a converged policy can sit at (anywhere within pos_tol=0.04 of the target
-# still counts as "reached") + a small margin.
+# apple even at a "perfect" reach, no reward-shaping bug required.
+#
+# 1.75 -> 1.3 (this multiplier, not the thumb term): now that "reach" is
+# meant to end in actual gentle palm contact (see palm_touch_force/
+# reach_success's touch gate and RewardsCfg.hold/palm_excess_force), the
+# target CANNOT stay 3 cm clear of the apple surface -- reach_progress is
+# POTENTIAL-BASED (pays out reduction in distance-to-TARGET), so once the
+# palm reaches a target that's short of the apple, moving the remaining few
+# cm to actually touch is scored as moving AWAY from the target and
+# actively penalized. That's not a weighting problem fixable by turning a
+# term down -- the target's LOCATION has to coincide with where contact
+# should happen, or position-shaping and the touch goal structurally fight
+# each other (confirmed empirically: apple_contact_force read exactly 0.0
+# the whole time at the old 1.75 clearance). 1.3 gives the palm reference
+# point only ~1.2 cm of nominal clearance -- well inside pos_tol=0.04's own
+# radius, so genuine light contact is achievable without fighting
+# reach_progress. This does NOT re-derive the thumb's own clearance
+# (_THUMB_UP_LOCAL_OFFSET is still zeroed below) -- deliberately: the new
+# force-based reward machinery (palm_excess_force's hard penalty above 3 N,
+# reach_success's 0.05-3 N gate) is what should now teach the policy to
+# modulate actual contact force down to "gentle" once it's in the contact
+# regime, rather than trying to hand-tune a kinematic target that never
+# touches at all. If training shows the thumb specifically over-penetrating
+# (as opposed to ordinary, force-limited palm contact), re-run
+# probe_palm_offset.py and reintroduce a real (non-zero) thumb term instead
+# of tightening this further.
 _THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
-GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.75 # + 0.04  + 0.02
+GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.3
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
@@ -579,6 +601,25 @@ class ObservationsCfg:
 
         last_action = ObsTerm(func=mdp.last_action, params={"action_name": "right_arm"})
 
+        # Palm tactile sensing: "reach" now means arrive AND gently touch
+        # (see RewardsCfg.reach_touch_bonus / palm_excess_force below and
+        # TerminationsCfg.reach_success's touch gate), so the policy needs
+        # to actually sense contact force to learn a controlled final
+        # approach rather than a blind position target. Raw/un-gained (see
+        # observations.py's own note on why this differs from the grasp
+        # phase's calibration-robust tactile terms).
+        #
+        # IMPORTANT: this changes obs dim 28 -> 29. envs/mdp/grasp_autoplay.
+        # py's _reach_obs (used by the grasp task's reach-autoplay hand-off)
+        # reassembles this SAME vector by hand and has been updated to match
+        # -- if you ever add/reorder a PolicyObs term here again, update
+        # _reach_obs's assembly order too, and scripts/reach_apple_hybrid.py's
+        # OBS_POLICY_DIM guard.
+        palm_touch_force = ObsTerm(
+            func=task_mdp.palm_contact_force,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+        )
+
         # NOTE: right_hand_pos/vel and fingertip_contacts removed with the
         # hand action for the reach-only phase. Re-add both when grasp
         # training starts (task_mdp.fingertip_contact_forces for the latter).
@@ -679,6 +720,12 @@ class RewardsCfg:
     )
 
     # ── Reason to stop moving once at the target ──────────────────────────
+    # sensor_cfg/pressure_min/pressure_max added: "hold" now requires actual
+    # gentle palm contact (0.05 < force <= 3.0 N), not just position/
+    # orientation -- kept in lockstep with TerminationsCfg.reach_success's
+    # own touch gate below (see reward_reach_hold's docstring for why: a
+    # mismatch here would let the policy collect this per-step reward
+    # without ever bothering to close the last few cm to touch).
     hold = RewTerm(
         func=rr.reward_reach_hold,
         weight=5.0,
@@ -690,6 +737,9 @@ class RewardsCfg:
             "offset_z": GRASP_OFFSET_Z,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": PALM_LOCAL_OFFSET,
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "pressure_min": 0.05,
+            "pressure_max": 3.0,
         },
     )
 
@@ -811,6 +861,24 @@ class RewardsCfg:
         },
     )
 
+    # Hard cap, distinct from the soft shaping penalty above: gentle contact
+    # (<=3 N at the palm) is now the GOAL (see reach_success's touch gate),
+    # so apple_contact_force alone (which costs a little for ANY contact)
+    # can't be the only force-related term -- this specifically punishes
+    # crossing 3 N, sharply, as a genuine "too hard" safety signal rather
+    # than a blanket "avoid touching" preference. Weight is intentionally
+    # much larger than apple_contact_force's -0.05 -- tune from the
+    # training curve, but don't shrink it toward that scale or it stops
+    # being the "big penalization" this was meant to be.
+    palm_excess_force = RewTerm(
+        func=rr.penalty_excess_palm_force,
+        weight=-2.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "threshold": 3.0,
+        },
+    )
+
 
 @configclass
 class TerminationsCfg:
@@ -835,6 +903,11 @@ class TerminationsCfg:
     # termination caches on env._reach_success rather than recomputing it.
     # (apple_lifted_success below is unrelated — a grasp/lift-phase criterion,
     # kept for later, not currently wired to anything.)
+    # sensor_cfg/pressure_min/pressure_max added: success now requires
+    # actual gentle palm contact (0.05 < force <= 3.0 N) held for hold_time,
+    # not just position/orientation -- MUST match RewardsCfg.hold's own
+    # sensor_cfg/pressure_min/pressure_max above, or the two disagree about
+    # what counts as success (see reward_reach_hold's docstring).
     reach_success = DoneTerm(
         func=task_mdp.reach_success,
         params={
@@ -846,6 +919,9 @@ class TerminationsCfg:
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "hold_time": 0.5,
             "palm_local_offset": PALM_LOCAL_OFFSET,
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "pressure_min": 0.05,
+            "pressure_max": 3.0,
         },
     )
 

@@ -343,6 +343,30 @@ def penalty_joint_deviation_from_handoff(
     return (w * dev ** 2).sum(dim=-1)
 
 
+def hand_motion_monitor(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Mean |hand joint velocity| (rad/s) -- NOT real reward shaping, purely
+    a diagnostic so "are the fingers actually moving during training" is
+    visible in the console printout / TensorBoard as Episode_Reward/
+    hand_motion_monitor, without needing to stop training and run play.py.
+
+    Give this an intentionally small (not literally zero) weight in
+    RewardsCfg: Isaac Lab's RewardManager SKIPS computing AND logging any
+    term with weight==0.0 entirely (confirmed against
+    managers/reward_manager.py's compute() -- a weight-0 term never even
+    calls its function), so exactly-zero would make this useless for
+    monitoring. A small nonzero weight (e.g. 0.05) keeps its contribution
+    to the actual training gradient negligible next to the real
+    grasp-quality terms while still producing a legible, nonzero number
+    whenever the hand is genuinely moving.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    dq = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return dq.abs().mean(dim=-1)
+
+
 def penalty_action_rate_weighted(
     env: "ManagerBasedRLEnv",
     weights: Sequence[float],

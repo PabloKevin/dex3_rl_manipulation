@@ -27,7 +27,7 @@ rt/arm_tune/state    (publish)    {"torso_pos": [x,y,z], "torso_quat": [w,x,y,z]
 "ee_pos": [x,y,z],
 "jacobian": [21 floats] (3x7 pos-Jacobian, row-major),
 "default_arm_pos": [7 floats],
-"obs_policy": [28 floats] (flat AppleGrasp policy obs vector --
+"obs_policy": [29 floats] (flat AppleGrasp policy obs vector --
 lets an external client replay policy.pt via
 scripts/reach_apple_hybrid.py)}
 All positions are WORLD frame, env-origin already

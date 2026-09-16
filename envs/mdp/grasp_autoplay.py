@@ -110,30 +110,40 @@ def _reach_obs(
     palm_local_offset: tuple[float, float, float],
     prev_raw_action: torch.Tensor,
 ) -> torch.Tensor:
-    """Reassemble the reach policy's own 28-dim observation vector, for just
+    """Reassemble the reach policy's own 29-dim observation vector, for just
     `ids`, by calling the SAME functions envs/apple_grasp_env_cfg.py's
     ObservationsCfg.PolicyObs wires up (joint_pos_selected/joint_vel_selected/
-    object_pos_relative_to_body/body_quat_relative_to_body) -- NOT the
-    ObservationManager, since we don't want the grasp task's own reward/
-    termination managers computed during this inner loop. Reusing the real
-    functions guarantees behavioral parity with how the reach policy was
-    actually trained, and survives future edits to those functions.
+    object_pos_relative_to_body/body_quat_relative_to_body/palm_contact_
+    force) -- NOT the ObservationManager, since we don't want the grasp
+    task's own reward/termination managers computed during this inner loop.
+    Reusing the real functions guarantees behavioral parity with how the
+    reach policy was actually trained, and survives future edits to those
+    functions.
 
     Order MUST match apple_grasp_env_cfg.ObservationsCfg.PolicyObs exactly:
     right_arm_pos(7), right_arm_vel(7), apple_pos_palm(3),
-    palm_orientation_torso(4), last_action(7) = 28.
+    palm_orientation_torso(4), last_action(7), palm_touch_force(1) = 29.
+    Update this the moment that ObservationsCfg's term list/order changes
+    again -- there is no automatic check that these two stay in sync
+    (scripts/reach_apple_hybrid.py's OBS_POLICY_DIM guard catches the
+    DDS-deployment side of the same drift risk, but not this one).
     """
     from .observations import (
         joint_pos_selected,
         joint_vel_selected,
         object_pos_relative_to_body,
         body_quat_relative_to_body,
+        palm_contact_force,
     )
 
     if not hasattr(env, "_autoplay_torso_cfg"):
         torso_cfg = SceneEntityCfg("robot", body_names=["torso_link"])
         torso_cfg.resolve(env.scene)
         env._autoplay_torso_cfg = torso_cfg
+    if not hasattr(env, "_autoplay_sensor_cfg"):
+        sensor_cfg = SceneEntityCfg("contact_forces")
+        sensor_cfg.resolve(env.scene)
+        env._autoplay_sensor_cfg = sensor_cfg
 
     arm_pos = joint_pos_selected(env, arm_cfg)[ids]
     arm_vel = joint_vel_selected(env, arm_cfg)[ids]
@@ -143,9 +153,11 @@ def _reach_obs(
     palm_orientation_torso = body_quat_relative_to_body(
         env, robot_body_cfg, env._autoplay_torso_cfg
     )[ids]
+    palm_force = palm_contact_force(env, env._autoplay_sensor_cfg)[ids]
 
     return torch.cat(
-        [arm_pos, arm_vel, apple_pos_palm, palm_orientation_torso, prev_raw_action], dim=-1
+        [arm_pos, arm_vel, apple_pos_palm, palm_orientation_torso, prev_raw_action, palm_force],
+        dim=-1,
     )
 
 

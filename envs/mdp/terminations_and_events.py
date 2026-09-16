@@ -68,6 +68,9 @@ def reach_success(
     palm_normal_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
     hold_time: float = 0.5,
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    sensor_cfg: SceneEntityCfg | None = None,
+    pressure_min: float = 0.05,
+    pressure_max: float | None = None,
 ) -> torch.Tensor:
     """Terminate once the palm has held within [pos_tol, ori_tol_rad] of the
     grasp point for `hold_time` continuous seconds — the same neighbourhood
@@ -75,6 +78,15 @@ def reach_success(
     toward a one-time terminal success instead. Mirrors g1_arm_env's
     hold-to-succeed / R_success design (config_right.yaml: hold.time=0.5,
     R_success=700).
+
+    sensor_cfg (optional, default None = old position/orientation-only
+    behaviour, fully backward compatible): when given, ALSO requires palm
+    contact force in (pressure_min, pressure_max] -- "reach" now means
+    "arrive AND gently touch", not just arrive. MUST be passed with the
+    same pressure_min/pressure_max as the paired reward_reach_hold call in
+    RewardsCfg (and this function's own params must match reward_reach_
+    success's expectations, same as before), or the two disagree about
+    what counts as success.
 
     IsaacLab computes terminations BEFORE rewards each step (see
     ManagerBasedRLEnv.step: termination_manager.compute() then
@@ -90,6 +102,14 @@ def reach_success(
     d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
     theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
     in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
+
+    if sensor_cfg is not None:
+        from .observations import palm_contact_force
+        force = palm_contact_force(env, sensor_cfg).squeeze(-1)
+        touching = force > pressure_min
+        if pressure_max is not None:
+            touching = touching & (force <= pressure_max)
+        in_neighbourhood = in_neighbourhood & touching
 
     if not hasattr(env, "_reach_hold_counter") or env._reach_hold_counter.shape != d.shape:
         env._reach_hold_counter = torch.zeros_like(d)

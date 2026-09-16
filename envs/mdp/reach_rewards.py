@@ -246,16 +246,60 @@ def reward_reach_hold(
     offset_z: float = 0.08,
     palm_normal_axis: Sequence[float] = (0.0, 0.0, 1.0),
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+    sensor_cfg: SceneEntityCfg | None = None,
+    pressure_min: float = 0.05,
+    pressure_max: float | None = None,
 ) -> torch.Tensor:
     """Per-step bonus (0 or 1) for sitting inside the success neighbourhood.
 
     g1_arm_env's R_hold_step = 14.0. Without a term like this the policy has
     no incentive to settle -- every reward it can see is already maxed while
     buzzing, so it buzzes. Pair with the brake penalty below.
+
+    sensor_cfg (optional, default None = old position/orientation-only
+    behaviour, fully backward compatible): when given, ALSO requires palm
+    contact force in (pressure_min, pressure_max] -- i.e. "arrived AND
+    gently touching", not just "arrived". Kept in sync with terminations_
+    and_events.reach_success's own optional touch-gate deliberately: if
+    this per-step reward paid out for "nearby" alone while the terminal
+    success bonus required actual contact, the policy could collect most of
+    the reward (hold pays every step) without ever closing the last few cm
+    to touch -- the same reward/gate mismatch that stalled the grasp
+    phase's first training run, avoided here by construction.
     """
     d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
     theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
-    return ((d < pos_tol) & (theta < ori_tol_rad)).float()
+    in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
+
+    if sensor_cfg is not None:
+        from .observations import palm_contact_force
+        force = palm_contact_force(env, sensor_cfg).squeeze(-1)
+        touching = force > pressure_min
+        if pressure_max is not None:
+            touching = touching & (force <= pressure_max)
+        in_neighbourhood = in_neighbourhood & touching
+
+    return in_neighbourhood.float()
+
+
+def penalty_excess_palm_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 3.0,
+) -> torch.Tensor:
+    """Large, sharply-growing penalty ONLY once palm contact force exceeds
+    `threshold` N. Distinct from the existing, always-on soft
+    penalty_apple_contact_force shaping term (which costs a little for any
+    contact, growing gradually) -- this specifically targets "you pressed
+    too hard, stop", zero below threshold, quadratic above it. Give this a
+    much larger weight than penalty_apple_contact_force in RewardsCfg to
+    make crossing the threshold unambiguously costly, matching the intent
+    of a hard safety limit rather than a soft preference.
+    """
+    from .observations import palm_contact_force
+    force = palm_contact_force(env, sensor_cfg).squeeze(-1)
+    excess = (force - threshold).clamp(min=0.0)
+    return excess ** 2
 
 
 def reward_reach_success(env: "ManagerBasedRLEnv") -> torch.Tensor:

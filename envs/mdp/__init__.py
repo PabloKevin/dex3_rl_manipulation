@@ -34,6 +34,7 @@ from .observations import (
     tactile_finger_balance,
     tactile_force_level,
     target_grip_level,
+    palm_contact_force,
 )
 
 from .rewards import (

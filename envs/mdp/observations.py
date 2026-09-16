@@ -97,6 +97,35 @@ def fingertip_contact_normals(
 
 
 # ─────────────────────────────────────────────
+#  Palm contact force (reach phase) — a single raw scalar, NOT calibration-
+#  robust like the grasp-phase block below. The reach task doesn't need to
+#  generalize across unknown real-hardware calibration the way the grasp
+#  phase's multi-finger force-closure comparison does (see that block's own
+#  note); this is a simple ground-truth-scale signal, matching what
+#  reach_rewards.penalty_excess_palm_force and terminations_and_events.
+#  reach_success's optional touch-gate compute against directly.
+# ─────────────────────────────────────────────
+
+def palm_contact_force(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Apple-filtered contact force magnitude at right_hand_palm_link —
+    "palm tactile sensing" for the reach phase. Uses force_matrix_w (filtered
+    to the Apple), same reasoning as reach_rewards.penalty_apple_contact_
+    force: self-collision or tree contact must not leak into this reading.
+
+    Shape: [num_envs, 1]
+    """
+    sensor: ContactSensor = env.scene[sensor_cfg.name]
+    if not hasattr(env, "_palm_body_id"):
+        env._palm_body_id = sensor.body_names.index("right_hand_palm_link")
+    forces = sensor.data.force_matrix_w  # [N, B, 1, 3] -- filtered to Apple
+    force_norm = torch.norm(forces[:, env._palm_body_id, 0, :], dim=-1)  # [N]
+    return force_norm.unsqueeze(-1)
+
+
+# ─────────────────────────────────────────────
 #  Tactile observations (grasp phase) — deliberately calibration-agnostic.
 #
 #  tactile_layout.SIM_FORCE_TO_RAW_GAIN is an admitted, unverified placeholder

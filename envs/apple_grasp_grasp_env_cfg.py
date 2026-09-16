@@ -373,6 +373,16 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_HAND_JOINTS, preserve_order=True)},
     )
 
+    # Diagnostic only -- see hand_motion_monitor's own docstring for why the
+    # weight can't be exactly 0. Watch Episode_Reward/hand_motion_monitor in
+    # the training printout/TensorBoard to answer "are the fingers actually
+    # moving" without stopping training to run play.py.
+    hand_motion_monitor = RewTerm(
+        func=gr.hand_motion_monitor,
+        weight=0.05,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_HAND_JOINTS, preserve_order=True)},
+    )
+
 
 @configclass
 class TerminationsCfg:
