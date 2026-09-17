@@ -26,6 +26,23 @@ Changes from your previous version, with reasons:
       At 50 Hz, 48 steps is a 0.96 s rollout against a (now 5 s) episode.
       With 64 envs this gives 4096 samples/iteration and 1024 per minibatch,
       up from 1536/384 -- much less gradient noise per update.
+
+  entropy_coef  0.002 -> 0.005 (modest bump, palm-touch retraining only)
+      After adding the palm-touch goal (see apple_grasp_env_cfg.py's
+      GRASP_OFFSET_Z/palm_touch_force/RewardsCfg.hold), an empirical trace
+      of the resulting policy showed it making genuine contact once (at a
+      violent 30-58 N, since fixed via penalty_excess_palm_force's max_excess
+      cap and a stronger brake weight) and then retreating to a safe
+      distance for the rest of the rollout, never approaching again. That's
+      a learned-avoidance local optimum, not a training bug -- the
+      DETERMINISTIC policy (play.py's inference mode) commits to hiding, so
+      escaping it needs the STOCHASTIC training-time policy to occasionally
+      re-sample a close approach despite the past bad experience. This is a
+      smaller bump than the analogous fix needed for the grasp task's own
+      "learned to do nothing" collapse (there: 0.002->0.01) since this is a
+      narrower behavior gap (a converged approach policy needs to soften its
+      final few cm, not discover contact from scratch) -- retune down once
+      gentle contact is being found reliably.
 """
 
 from isaaclab.utils import configclass
@@ -54,7 +71,7 @@ class AppleGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.002,
+        entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,

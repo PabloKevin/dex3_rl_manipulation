@@ -36,7 +36,6 @@ import torch
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import matrix_from_quat
 
 if TYPE_CHECKING:
@@ -247,8 +246,8 @@ def reward_reach_hold(
     palm_normal_axis: Sequence[float] = (0.0, 0.0, 1.0),
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
     sensor_cfg: SceneEntityCfg | None = None,
-    pressure_min: float = 0.05,
-    pressure_max: float | None = None,
+    pressure_min: float = 0.5,
+    pressure_max: float | None = 5.0,
 ) -> torch.Tensor:
     """Per-step bonus (0 or 1) for sitting inside the success neighbourhood.
 
@@ -282,24 +281,60 @@ def reward_reach_hold(
     return in_neighbourhood.float()
 
 
-def penalty_excess_palm_force(
+def reward_gentle_touch(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,
-    threshold: float = 3.0,
+    good_min: float = 0.5,
+    good_max: float = 5.0,
 ) -> torch.Tensor:
-    """Large, sharply-growing penalty ONLY once palm contact force exceeds
-    `threshold` N. Distinct from the existing, always-on soft
-    penalty_apple_contact_force shaping term (which costs a little for any
-    contact, growing gradually) -- this specifically targets "you pressed
-    too hard, stop", zero below threshold, quadratic above it. Give this a
-    much larger weight than penalty_apple_contact_force in RewardsCfg to
-    make crossing the threshold unambiguously costly, matching the intent
-    of a hard safety limit rather than a soft preference.
+    """Flat, per-step bonus (0 or 1) for palm+thumb-base contact force
+    landing in [good_min, good_max] N -- a direct, position-independent
+    stepping stone toward touching gently, separate from reward_reach_hold's
+    combined position+orientation+force gate. Without an isolated reward
+    like this, the policy only ever sees the force-related signal bundled
+    with the (much harder to simultaneously satisfy) full success
+    neighbourhood, which is a much sparser target to stumble into --
+    same "give it an easier, more isolated gradient" reasoning as the
+    grasp phase's own reward_finger_approach.
+
+    Below good_min: not really touching, no bonus. Above good_max: handled
+    by penalty_excess_palm_force below, not by shrinking this term back to
+    zero -- keeping this flat rather than peaked avoids fighting that
+    penalty over exactly where the "good enough" boundary sits.
     """
     from .observations import palm_contact_force
     force = palm_contact_force(env, sensor_cfg).squeeze(-1)
-    excess = (force - threshold).clamp(min=0.0)
-    return excess ** 2
+    return ((force >= good_min) & (force <= good_max)).float()
+
+
+def penalty_excess_palm_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    start: float = 5.0,
+    cap: float = 20.0,
+) -> torch.Tensor:
+    """Quadratically-growing penalty for palm+thumb-base contact force above
+    `start` N, normalized to reach exactly 1.0 (times whatever weight
+    RewardsCfg gives this) at `cap` N and CLAMPED there beyond `cap` --
+    force above the cap is unambiguously bad and gets the max penalty, but
+    doesn't keep growing without bound.
+
+    The clamp matters for the same reason it did in the previous version of
+    this function: an empirical trace of an early reach checkpoint showed
+    the palm taking a 58 N impact. An UNCLAMPED quadratic penalty at that
+    force would be enormous (tens of times larger than the entire
+    reach_success bonus of 95) -- a reward outlier that extreme doesn't
+    teach "be gentler", it teaches "never go anywhere near this region
+    again", which is consistent with what was observed: the policy touched
+    once, then retreated and never approached again for the rest of the
+    rollout. Capping at `cap` keeps this a clear, dominant-but-bounded
+    safety penalty instead.
+    """
+    from .observations import palm_contact_force
+    force = palm_contact_force(env, sensor_cfg).squeeze(-1)
+    span = cap - start
+    excess = (force - start).clamp(min=0.0, max=span)
+    return (excess / span) ** 2
 
 
 def reward_reach_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
@@ -357,14 +392,15 @@ def penalty_apple_contact_force(
 ) -> torch.Tensor:
     """Squared-norm penalty on contact force between the hand and the apple.
 
-    Uses force_matrix_w, not net_forces_w -- the latter is the TOTAL contact
+    Apple-filtered, not net_forces_w -- the latter is the TOTAL contact
     force on each hand body against ANYTHING (self-collision, the tree,
     accidental floor contact), which would give a false "pressing the apple"
-    signal for contact that has nothing to do with the apple. force_matrix_w
-    is the force filtered specifically against ContactSensorCfg's
-    filter_prim_paths_expr=["{ENV_REGEX_NS}/Apple"] (see AppleGraspSceneCfg.
-    contact_forces), so this only ever penalises force actually applied to
-    the apple.
+    signal for contact that has nothing to do with the apple. Read through
+    observations.apple_force_per_link, which goes to the per-link,
+    Apple-filtered sensors (AppleGraspSceneCfg's contact_forces_* block), so
+    this only ever penalises force actually applied to the apple. Do NOT go
+    back to reading force_matrix_w off the multi-body `contact_forces`
+    sensor -- that silently reports zeros, see that block's comment.
 
     Squared and normalised by `ref` newtons: a light touch (~ref or below)
     costs little, pressing hard costs much more than linearly. Not a binary
@@ -377,10 +413,9 @@ def penalty_apple_contact_force(
     state regardless of what's wired into the obs group, so there's no
     reason to spend an observation dimension on this.
     """
-    sensor: ContactSensor = env.scene[sensor_cfg.name]
-    forces = sensor.data.force_matrix_w  # [N, B, M=1, 3] -- filtered to Apple
-    force_norm = torch.norm(forces, dim=-1)  # [N, B, M]
-    return ((force_norm / ref) ** 2).sum(dim=(-2, -1))
+    from .observations import RIGHT_HAND_CONTACT_LINKS, apple_force_per_link
+    force_norm = apple_force_per_link(env, sensor_cfg, RIGHT_HAND_CONTACT_LINKS)
+    return ((force_norm / ref) ** 2).sum(dim=-1)
 
 
 def penalty_joint_jerk(

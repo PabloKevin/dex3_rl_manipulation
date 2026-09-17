@@ -7,7 +7,7 @@ They are referenced by ObservationTermCfg(func=...) in the env cfg.
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -64,6 +64,99 @@ def joint_effort_selected(
 
 
 # ─────────────────────────────────────────────
+#  Apple-filtered contact force: per-link accessors
+#
+#  IsaacLab's filtered contact reporting ("force_matrix_w") only works when
+#  the ContactSensor's prim_path resolves to a SINGLE body per environment:
+#  "the reporting of filtered contact forces is only possible as one-to-many
+#  [...] only one sensor body in an environment can be filtered against
+#  multiple bodies in that environment" (isaaclab/sensors/contact_sensor/
+#  contact_sensor.py). A multi-body sensor with a filter does not raise — it
+#  silently reports zeros forever, which is exactly how every force-based
+#  reward term in this project ended up flat at 0.0.
+#
+#  So the scene declares one single-body, Apple-filtered sensor per hand
+#  link, named "<base>_<short link name>" (see AppleGraspSceneCfg's
+#  contact_forces_* block). Everything that wants apple-filtered force goes
+#  through the two accessors below instead of touching force_matrix_w, so
+#  the naming convention and the [N, 1, 1, 3] indexing live in one place.
+#
+#  The unfiltered whole-hand sensor (`contact_forces` itself) still exists
+#  and is still the right thing for net_forces_w consumers — see
+#  fingertip_contact_forces/_normals below, tree_utils and run_env.py.
+# ─────────────────────────────────────────────
+
+#: Every right-hand link that has its own Apple-filtered contact sensor.
+RIGHT_HAND_CONTACT_LINKS = [
+    "right_hand_palm_link",
+    "right_hand_thumb_0_link",
+    "right_hand_thumb_1_link",
+    "right_hand_thumb_2_link",
+    "right_hand_index_0_link",
+    "right_hand_index_1_link",
+    "right_hand_middle_0_link",
+    "right_hand_middle_1_link",
+]
+
+
+def link_sensor_name(base: str, link_name: str) -> str:
+    """Scene key of the single-body, Apple-filtered sensor for `link_name`.
+
+    `base` is the sensor-group name the config passes around as
+    SceneEntityCfg("contact_forces"), so callers keep taking a sensor_cfg
+    and it keeps meaning something: it selects the sensor FAMILY, and this
+    picks the member of it that watches one link.
+
+    "contact_forces" + "right_hand_thumb_0_link" -> "contact_forces_thumb_0"
+    """
+    short = link_name.removeprefix("right_hand_").removesuffix("_link")
+    return f"{base}_{short}"
+
+
+def _apple_contact_sensors(env: ManagerBasedRLEnv, base: str) -> dict[str, ContactSensor]:
+    """Lazily cache {link_name: ContactSensor} for one sensor family."""
+    cache = getattr(env, "_apple_contact_sensors", None)
+    if cache is None:
+        cache = env._apple_contact_sensors = {}
+    group = cache.get(base)
+    if group is None:
+        group = cache[base] = {
+            link: env.scene[link_sensor_name(base, link)]
+            for link in RIGHT_HAND_CONTACT_LINKS
+        }
+    return group
+
+
+def apple_force_vec_per_link(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    link_names: Sequence[str],
+) -> torch.Tensor:
+    """Apple-filtered contact force VECTOR (world frame, N) per link.
+
+    Shape: [num_envs, len(link_names), 3], rows in `link_names` order.
+    """
+    group = _apple_contact_sensors(env, sensor_cfg.name)
+    # Each sensor is single-body and has exactly one filter (the Apple),
+    # so force_matrix_w is [N, 1, 1, 3].
+    return torch.stack(
+        [group[link].data.force_matrix_w[:, 0, 0, :] for link in link_names], dim=1
+    )
+
+
+def apple_force_per_link(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    link_names: Sequence[str],
+) -> torch.Tensor:
+    """Apple-filtered contact force MAGNITUDE (N) per link.
+
+    Shape: [num_envs, len(link_names)], columns in `link_names` order.
+    """
+    return torch.norm(apple_force_vec_per_link(env, sensor_cfg, link_names), dim=-1)
+
+
+# ─────────────────────────────────────────────
 #  Contact / tactile observations
 # ─────────────────────────────────────────────
 
@@ -106,23 +199,38 @@ def fingertip_contact_normals(
 #  reach_success's optional touch-gate compute against directly.
 # ─────────────────────────────────────────────
 
+_PALM_CONTACT_LINKS = [
+    "right_hand_palm_link",
+    "right_hand_thumb_0_link",   # thumb base
+    "right_hand_index_0_link",   # index base
+    "right_hand_middle_0_link",  # middle base
+]
+
+
 def palm_contact_force(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Apple-filtered contact force magnitude at right_hand_palm_link —
-    "palm tactile sensing" for the reach phase. Uses force_matrix_w (filtered
-    to the Apple), same reasoning as reach_rewards.penalty_apple_contact_
-    force: self-collision or tree contact must not leak into this reading.
+    """Apple-filtered contact force magnitude, SUMMED across the palm and
+    the BASE (proximal) segment of each of the three digits (_PALM_CONTACT_
+    LINKS) -- "palm tactile sensing" for the reach phase, deliberately
+    scoped to the middle-of-the-hand/cupping region rather than the whole
+    hand. Explicitly excludes the more distal segments (thumb_1/thumb_2,
+    index_1, middle_1) -- an empirical per-link contact trace showed real
+    apple contact landing there too, but rewarding that would teach the
+    reach policy to arrive fingertip-first, which is the wrong hand-off
+    geometry for the grasp phase (want the apple settling into the middle
+    of an open hand, not caught on the fingertips).
+
+    Apple-filtered (via apple_force_per_link, i.e. the per-link filtered
+    sensors), same reasoning as reach_rewards.penalty_apple_contact_force:
+    self-collision or tree contact must not leak into this reading.
 
     Shape: [num_envs, 1]
     """
-    sensor: ContactSensor = env.scene[sensor_cfg.name]
-    if not hasattr(env, "_palm_body_id"):
-        env._palm_body_id = sensor.body_names.index("right_hand_palm_link")
-    forces = sensor.data.force_matrix_w  # [N, B, 1, 3] -- filtered to Apple
-    force_norm = torch.norm(forces[:, env._palm_body_id, 0, :], dim=-1)  # [N]
-    return force_norm.unsqueeze(-1)
+    return apple_force_per_link(env, sensor_cfg, _PALM_CONTACT_LINKS).sum(
+        dim=-1, keepdim=True
+    )
 
 
 # ─────────────────────────────────────────────
@@ -156,24 +264,22 @@ def _sensed_tactile_forces(
     """Apple-filtered, per-taxel force magnitude, WITH the per-env per-taxel
     calibration gain applied (ground truth * env._tactile_gain).
 
-    Uses force_matrix_w (filtered specifically to the Apple via
-    ContactSensorCfg.filter_prim_paths_expr), not net_forces_w — same
-    reasoning as reach_rewards.penalty_apple_contact_force: self-collision or
-    tree contact must not leak into a tactile reading.
+    Apple-filtered via apple_force_per_link (the per-link filtered sensors),
+    not net_forces_w — same reasoning as reach_rewards.
+    penalty_apple_contact_force: self-collision or tree contact must not
+    leak into a tactile reading.
+
+    Note that several taxels share one sim link (palm_0/1/2 all map to
+    right_hand_palm_link), so those columns are identical by construction —
+    flagged on the monitor plot too (scripts/tactile_monitor.py).
 
     Shape: [num_envs, 9] (tactile_layout.TAXELS order).
     """
-    import tactile_layout
+    import scripts.tactile_layout as tactile_layout
 
-    sensor: ContactSensor = env.scene[sensor_cfg.name]
-    if not hasattr(env, "_taxel_body_ids"):
-        env._taxel_body_ids = [
-            sensor.body_names.index(t.link_name) for t in tactile_layout.TAXELS
-        ]
-
-    forces = sensor.data.force_matrix_w          # [N, B, 1, 3] -- filtered to Apple
-    force_norm = torch.norm(forces, dim=-1).squeeze(-1)   # [N, B]
-    ground_truth = force_norm[:, env._taxel_body_ids]      # [N, 9]
+    ground_truth = apple_force_per_link(
+        env, sensor_cfg, [t.link_name for t in tactile_layout.TAXELS]
+    )  # [N, 9]
 
     if not hasattr(env, "_tactile_gain"):
         env._tactile_gain = torch.ones(env.num_envs, ground_truth.shape[-1], device=env.device)
@@ -185,7 +291,7 @@ def _taxel_finger_groups(env: ManagerBasedRLEnv) -> dict[str, list[int]]:
     """Lazily cache, per env, the taxel indices belonging to each finger
     group (thumb/index/middle) — shared by the balance/level observations
     below and by grasp_rewards.py's ground-truth equivalents."""
-    import tactile_layout
+    import scripts.tactile_layout as tactile_layout
 
     if not hasattr(env, "_taxel_finger_idx"):
         fingers = ("thumb", "index", "middle")

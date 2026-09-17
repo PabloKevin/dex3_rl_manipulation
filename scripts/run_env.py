@@ -112,7 +112,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY
 from proximity_stop import QuinticStopController, QuinticStopConfig
-import tactile_layout
+import scripts.tactile_layout as tactile_layout
 
 # Must match ActionsCfg.right_arm.joint_names order in apple_grasp_env_cfg.py
 RIGHT_ARM_JOINT_NAMES = [

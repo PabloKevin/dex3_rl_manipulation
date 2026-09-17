@@ -31,7 +31,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import tactile_layout
+import scripts.tactile_layout as tactile_layout
 
 parser = argparse.ArgumentParser(description="Dex3-1 right hand tactile viewer")
 parser.add_argument("--domain", type=int, default=1,

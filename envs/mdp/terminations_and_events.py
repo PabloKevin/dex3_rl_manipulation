@@ -69,8 +69,8 @@ def reach_success(
     hold_time: float = 0.5,
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     sensor_cfg: SceneEntityCfg | None = None,
-    pressure_min: float = 0.05,
-    pressure_max: float | None = None,
+    pressure_min: float = 0.5,
+    pressure_max: float | None = 5.0,
 ) -> torch.Tensor:
     """Terminate once the palm has held within [pos_tol, ori_tol_rad] of the
     grasp point for `hold_time` continuous seconds — the same neighbourhood

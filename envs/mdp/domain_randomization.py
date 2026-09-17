@@ -119,7 +119,7 @@ def randomize_tactile_gain(
     depends on for scripts/tactile_monitor.py. This is a training-time-only
     mechanism living purely on `env`.
     """
-    import tactile_layout
+    import scripts.tactile_layout as tactile_layout
 
     n_taxels = len(tactile_layout.TAXELS)
     if not hasattr(env, "_tactile_gain"):

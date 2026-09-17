@@ -26,7 +26,6 @@ import torch
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -41,8 +40,8 @@ def _per_finger_group_force(
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
     """[N, 3] ground-truth mean force per finger group (thumb/index/middle),
-    apple-filtered (force_matrix_w, not net_forces_w — same reasoning as
-    reach_rewards.penalty_apple_contact_force).
+    apple-filtered (via observations.apple_force_per_link, not net_forces_w —
+    same reasoning as reach_rewards.penalty_apple_contact_force).
 
     Shared by reward_grasp_balance / reward_grasp_setpoint_tracking /
     terminations_and_events.fruit_damaged, so they all agree on the same
@@ -50,13 +49,9 @@ def _per_finger_group_force(
     observations.tactile_force_level (that one is calibration-gained, this
     one is not, by design).
     """
-    import tactile_layout
+    import scripts.tactile_layout as tactile_layout
+    from .observations import apple_force_per_link
 
-    sensor: ContactSensor = env.scene[sensor_cfg.name]
-    if not hasattr(env, "_taxel_body_ids"):
-        env._taxel_body_ids = [
-            sensor.body_names.index(t.link_name) for t in tactile_layout.TAXELS
-        ]
     if not hasattr(env, "_taxel_finger_idx"):
         fingers = ("thumb", "index", "middle")
         env._taxel_finger_idx = {
@@ -64,9 +59,9 @@ def _per_finger_group_force(
             for f in fingers
         }
 
-    forces = sensor.data.force_matrix_w                    # [N, B, 1, 3]
-    force_norm = torch.norm(forces, dim=-1).squeeze(-1)     # [N, B]
-    ground_truth = force_norm[:, env._taxel_body_ids]        # [N, 9]
+    ground_truth = apple_force_per_link(
+        env, sensor_cfg, [t.link_name for t in tactile_layout.TAXELS]
+    )  # [N, 9]
 
     idx = env._taxel_finger_idx
     return torch.stack(
@@ -100,26 +95,22 @@ def _finger_contact_state(
 
     Returns: (points [N,3,3], forces [N,3,3], in_contact [N,3])
     """
-    sensor: ContactSensor = env.scene[sensor_cfg.name]
+    from .observations import apple_force_vec_per_link
+
     robot: Articulation = env.scene[robot_cfg.name]
 
-    if not hasattr(env, "_finger_tip_body_ids"):
-        env._finger_tip_body_ids = {
-            f: sensor.body_names.index(link) for f, link in _FINGER_TIP_LINKS.items()
-        }
     if not hasattr(env, "_finger_tip_robot_ids"):
         env._finger_tip_robot_ids = {
             f: robot.data.body_names.index(link) for f, link in _FINGER_TIP_LINKS.items()
         }
 
     fingers = ("thumb", "index", "middle")
-    forces_raw = sensor.data.force_matrix_w  # [N, B, 1, 3]
 
     points = torch.stack(
         [robot.data.body_pos_w[:, env._finger_tip_robot_ids[f], :] for f in fingers], dim=1
     )  # [N, 3, 3]
-    forces = torch.stack(
-        [forces_raw[:, env._finger_tip_body_ids[f], 0, :] for f in fingers], dim=1
+    forces = apple_force_vec_per_link(
+        env, sensor_cfg, [_FINGER_TIP_LINKS[f] for f in fingers]
     )  # [N, 3, 3]
     in_contact = torch.norm(forces, dim=-1) > contact_threshold  # [N, 3]
     return points, forces, in_contact
