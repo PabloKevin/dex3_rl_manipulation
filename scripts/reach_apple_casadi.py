@@ -369,12 +369,13 @@ def _grasp_diag(state: dict, grasp_offset_z: float) -> dict:
     own FK model -- so they're trustworthy even if the analytic FK chain
     somehow drifted from the real USD kinematics.
 
-    Returns raw wrist-to-apple distance (the same metric the proximity-stop
-    and the periodic tick log use, run_env.py's own convention), the TRUE
-    grasp-point distance (palm + PALM_LOCAL_OFFSET, vs apple - offset_z --
-    the actual metric reach_rewards.py/terminations_and_events.py score
-    against, pos_tol=0.04), the palm-up orientation residual, and the raw
-    (dx,dy,dz) world-frame gap for axis attribution.
+    Returns raw wrist-to-apple distance (kept for the periodic tick log and
+    for continuity with older logs), the TRUE grasp-point distance (palm +
+    PALM_LOCAL_OFFSET, vs apple - offset_z -- the actual metric
+    reach_rewards.py/terminations_and_events.py score against, pos_tol=0.04,
+    and, since the metric fix, the one the proximity stop consumes too), the
+    palm-up orientation residual, and the raw (dx,dy,dz) world-frame gap for
+    axis attribution.
     """
     ee_pos = torch.tensor(state["ee_pos"], dtype=torch.float32)
     ee_quat = torch.tensor(state["ee_quat"], dtype=torch.float32)  # wxyz
@@ -478,7 +479,8 @@ def main():
         stop_ctrl = QuinticStopController(num_joints=7, cfg=stop_cfg, device="cpu")
         _wd = stop_cfg.watchdog_time
         _wd_str = f"{_wd:.2f}s" if (_wd is not None and _wd > 0.0) else "disabled"
-        print(f"[ProximityStop] armed — stop_dist={stop_cfg.stop_dist*100:.1f}cm, "
+        print(f"[ProximityStop] armed — stop_dist={stop_cfg.stop_dist*100:.1f}cm "
+              f"(palm-ref to grasp target), "
               f"dwell={stop_cfg.dwell_time:.2f}s, stop_duration={stop_cfg.stop_duration:.2f}s, "
               f"resume_margin={stop_cfg.resume_margin*100:.1f}cm, watchdog={_wd_str} "
               f"(disable with --no_proximity_stop)")
@@ -557,13 +559,19 @@ def main():
                 q_target = ik.solve(goal_local, up_local, q_prev, q_lower, q_upper)
                 q_prev = list(q_target)
 
-            # ── Proximity stop — same distance metric run_env.py uses:
-            # raw ee_pos (palm-link origin) to apple_pos, NOT the grasp-point
-            # metric the IK cost above uses. ──
+            # ── Proximity stop — same distance metric run_env.py uses, which
+            # is now the GRASP-POINT metric (palm reference point to the
+            # target GRASP_OFFSET_Z below the apple centre), i.e. the one
+            # reach_rewards.py scores against and the one QuinticStopConfig.
+            # stop_dist is tuned for. It used to be raw ee_pos (palm-link
+            # origin) to apple centre, which reads ~0.10 m at the very pose
+            # this script is steering toward. ──
             q_cmd = q_target
             if stop_ctrl is not None:
-                ee_pos = torch.tensor(state["ee_pos"], dtype=torch.float32)
-                dist_now = float(torch.norm(torch.tensor(apple_pos, dtype=torch.float32) - ee_pos))
+                dist_now = _grasp_diag(state, args.grasp_offset_z)["grasp_dist"]
+                # No contact sensing on this path (CasADi/IK, not the RL env
+                # observation stack), so the contact trigger and contact
+                # recall stay inactive here: proximity dwell + watchdog only.
                 stop_ctrl.update_state(t_ep, dist_now, q_now, dq_now)
                 overridden, q_cmd_t = stop_ctrl.get_command(t_ep, torch.tensor(q_target, dtype=torch.float32))
                 if overridden:

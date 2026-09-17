@@ -47,13 +47,22 @@ import torch
 
 @dataclass
 class QuinticStopConfig:
-    stop_dist: float = 0.09        # metres: palm-to-apple distance that arms the trigger
+    stop_dist: float = 0.05        # metres: arms the trigger (see metric note below)
     dwell_time: float = 0.6        # seconds: must stay within stop_dist this long before it fires
     stop_duration: float = 0.4     # seconds: duration of the quintic deceleration
-    resume_margin: float = 0.12    # metres: hysteresis on the dwell-timer arming check (see IDLE
+    resume_margin: float = 0.04    # metres: hysteresis on the dwell-timer arming check (see IDLE
                                     # branch in _loop) -- NOT a "resume policy control" threshold;
                                     # HOLDING only ever exits via reset(), see its comment below
     poll_interval: float = 0.01    # seconds: background thread tick rate (cheap; just a clock+FSM)
+
+    # DISTANCE METRIC: `dist` passed to update_state() is the palm REFERENCE
+    # POINT (palm link origin + PALM_LOCAL_OFFSET, out at the finger pads) to
+    # the GRASP TARGET (GRASP_OFFSET_Z below the apple centre) -- exactly the
+    # quantity reach_rewards._palm_target_dist computes, so stop_dist is
+    # directly comparable to RewardsCfg's own pos_tol (0.04 m). It used to be
+    # fed wrist-origin-to-apple-CENTRE, which reads ~0.10 m at the very pose
+    # the policy is trained to reach; stop_dist and resume_margin above were
+    # retuned for the corrected metric and old values do not carry over.
     watchdog_time: float | None = 2.5
     """Seconds since the current attempt started (episode reset, or
     controller construction) before the stop triggers UNCONDITIONALLY, even
@@ -61,6 +70,64 @@ class QuinticStopConfig:
     a policy that diverges/oscillates and never satisfies the proximity
     condition on its own -- the arm still gets a smooth quintic stop instead
     of running indefinitely. Set to None (or <= 0) to disable."""
+
+    # ── Contact trigger ────────────────────────────────────────────────
+    # The reach task's goal became "arrive AND touch gently", not "arrive",
+    # so actual palm contact is now the most direct evidence that the arm is
+    # where it should be -- much more direct than a distance threshold, and
+    # available strictly earlier than any dwell timer can confirm. Contact
+    # therefore triggers the stop IMMEDIATELY, with no dwell.
+    contact_force_min: float = 0.5
+    """Newtons of apple-filtered palm contact force that count as 'touching'.
+    Lower edge of the good band, used by BOTH the trigger and the recall
+    latch. Keep in sync with RewardsCfg.gentle_touch / reward_reach_hold's
+    `good_min`/`pressure_min`.
+
+    Turn the behaviours off with the `contact_trigger` / `contact_recall`
+    flags, never by zeroing this: it is a band edge, not an enable switch,
+    and zeroing it would make every no-contact reading look like a valid
+    contact to the recall latch."""
+
+    contact_trigger: bool = True
+    """Whether a reading >= contact_force_min fires the stop immediately.
+    Independent of contact_recall: switching this off still lets a good
+    contact pose be latched and returned to if a timer fires later."""
+
+    contact_force_max: float = 5.0
+    """Upper edge of the 'good' contact band, matching gentle_touch's
+    good_max. Only a reading inside [contact_force_min, contact_force_max]
+    is latched as a pose worth returning to (see contact_recall below) -- a
+    slam above this band is a pose to leave, not one to go back to."""
+
+    contact_recall: bool = True
+    """If a good contact was seen earlier in this attempt but the stop ends
+    up being fired by the proximity dwell or the watchdog instead, decelerate
+    back to the LATCHED CONTACT POSE rather than to wherever the arm happens
+    to be at trigger time.
+
+    This is the fix for the observed "policy makes a clean 3 N contact, then
+    the stop takes over and parks the hand a few centimetres away, touching
+    nothing". Two independent causes, both covered here: (a) the watchdog
+    fires on elapsed time alone and does not care what the arm is doing, and
+    (b) the stop target was ALWAYS q0 + v0*T/2, i.e. it blindly coasts along
+    whatever joint velocity existed at the trigger instant -- for a policy
+    making small corrections around the contact pose that velocity is as
+    likely to point away from the apple as into it, and HOLDING never exits,
+    so the arm stays parked at that coasted-away pose for the rest of the
+    episode."""
+
+    coast_fraction: float = 0.5
+    """Stop target = q0 + v0 * stop_duration * coast_fraction. 0.5 is the
+    displacement of a symmetric smooth deceleration from v0 to 0 (the
+    original, and still the default for a plain proximity/watchdog stop with
+    nothing better to aim at). 0.0 stops in place."""
+
+    contact_coast_fraction: float = 0.0
+    """coast_fraction used when the stop was fired BY contact. Zero: the arm
+    is already touching, so coasting a further 0.2 s along v0 can only press
+    harder into the apple. The quintic still matches q'(0) = v0 exactly, so
+    the handoff stays smooth -- it just returns to q0 instead of running on
+    past it."""
 
 
 class QuinticStopController:
@@ -92,8 +159,13 @@ class QuinticStopController:
         # Latest readings pushed by the main thread.
         self._t = 0.0
         self._dist = None
+        self._contact_force: float | None = None
         self._q = torch.zeros(num_joints, device=device)
         self._dq = torch.zeros(num_joints, device=device)
+
+        # Most recent joint pose observed while palm contact force was
+        # inside [contact_force_min, contact_force_max]. See contact_recall.
+        self._q_at_contact: torch.Tensor | None = None
 
         # Captured once, at the moment STOPPING begins.
         self._q0 = torch.zeros(num_joints, device=device)
@@ -118,17 +190,42 @@ class QuinticStopController:
             self._state = self.IDLE
             self._near_since = None
             self._dist = None
+            self._contact_force = None
+            # Belongs to the attempt that just ended -- returning to it in
+            # the next episode would aim at a pose for a differently-placed
+            # apple, exactly the kind of stale-target leak this reset exists
+            # to prevent.
+            self._q_at_contact = None
             self._episode_start_t = t
             self.last_trigger_reason = None
 
     # ── Called every control step from the main thread ──────────────────────
 
-    def update_state(self, t: float, dist: float, q: torch.Tensor, dq: torch.Tensor) -> None:
+    def update_state(
+        self,
+        t: float,
+        dist: float,
+        q: torch.Tensor,
+        dq: torch.Tensor,
+        contact_force: float | None = None,
+    ) -> None:
+        """`contact_force`: apple-filtered palm contact force in newtons, or
+        None if the caller has no contact sensing (contact trigger and
+        contact recall then both stay inactive and this behaves exactly as
+        it did before -- proximity dwell + watchdog only)."""
         with self._lock:
             self._t = t
             self._dist = dist
+            self._contact_force = contact_force
             self._q = q.detach().clone()
             self._dq = dq.detach().clone()
+
+            if (
+                self.cfg.contact_recall
+                and contact_force is not None
+                and self.cfg.contact_force_min <= contact_force <= self.cfg.contact_force_max
+            ):
+                self._q_at_contact = self._q.clone()
 
     def get_command(self, t: float, q_policy: torch.Tensor):
         """Returns (override: bool, q_cmd: Tensor[num_joints]).
@@ -159,6 +256,8 @@ class QuinticStopController:
             with self._lock:
                 t, dist, state = self._t, self._dist, self._state
                 q, dq = self._q, self._dq
+                contact_force = self._contact_force
+                q_at_contact = self._q_at_contact
 
             if dist is not None:
                 if state == self.IDLE:
@@ -192,14 +291,42 @@ class QuinticStopController:
                         and t - self._episode_start_t >= self.cfg.watchdog_time
                     )
 
-                    if dwell_fired or watchdog_fired:
+                    # Contact needs no dwell: unlike "the palm is nearby",
+                    # which is noisy and can be satisfied while the policy is
+                    # still flailing, a real apple-filtered contact reading
+                    # is unambiguous evidence the arm has arrived. Waiting
+                    # dwell_time to confirm it only gives the policy 0.6 s to
+                    # bounce back off the apple first.
+                    contact_fired = (
+                        self.cfg.contact_trigger
+                        and contact_force is not None
+                        and contact_force >= self.cfg.contact_force_min
+                    )
+
+                    if contact_fired or dwell_fired or watchdog_fired:
+                        T = self.cfg.stop_duration
                         with self._lock:
                             self._q0 = q.clone()
                             self._v0 = dq.clone()
-                            self._q1 = self._q0 + self._v0 * self.cfg.stop_duration / 2.0
+                            if contact_fired:
+                                time.sleep(0.8)
+                                reason = "contact"
+                                # Already touching -- do not coast further in.
+                                self._q1 = self._q0 + self._v0 * T * self.cfg.contact_coast_fraction
+                            elif q_at_contact is not None:
+                                # Fired on a timer, but this attempt DID make
+                                # good contact earlier: decelerate back onto
+                                # that pose instead of parking wherever the
+                                # timer happened to catch the arm.
+                                reason = "proximity" if dwell_fired else "watchdog"
+                                reason += "+recall"
+                                self._q1 = q_at_contact.clone()
+                            else:
+                                reason = "proximity" if dwell_fired else "watchdog"
+                                self._q1 = self._q0 + self._v0 * T * self.cfg.coast_fraction
                             self._stop_start_t = t
                             self._state = self.STOPPING
-                            self.last_trigger_reason = "proximity" if dwell_fired else "watchdog"
+                            self.last_trigger_reason = reason
 
                 elif state == self.STOPPING:
                     if t - self._stop_start_t >= self.cfg.stop_duration:

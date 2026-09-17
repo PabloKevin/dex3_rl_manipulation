@@ -72,7 +72,10 @@ parser.add_argument("--no_proximity_stop", action="store_true",
                           "seconds, control hands off from the RL policy to a smooth quintic "
                           "deceleration instead of letting the policy keep moving near the object.")
 parser.add_argument("--stop_dist",     type=float, default=None,
-                     help="Proximity-stop trigger distance, palm to apple centre (metres). "
+                     help="Proximity-stop trigger distance (metres), palm reference point to the "
+                          "grasp target — the same metric the reach rewards use, so it is directly "
+                          "comparable to RewardsCfg's pos_tol. NOTE: this is no longer "
+                          "wrist-to-apple-centre; old values do not carry over. "
                           "Defaults to QuinticStopConfig.stop_dist (proximity_stop.py) if not given.")
 parser.add_argument("--stop_dwell",    type=float, default=None,
                      help="Seconds the palm must stay within --stop_dist before the stop triggers. "
@@ -110,7 +113,9 @@ import envs  # registers gym tasks
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import ContactSensor
-from envs.apple_grasp_env_cfg import AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY
+from envs.apple_grasp_env_cfg import (
+    AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY, GRASP_OFFSET_Z, PALM_LOCAL_OFFSET,
+)
 from proximity_stop import QuinticStopController, QuinticStopConfig
 import scripts.tactile_layout as tactile_layout
 
@@ -514,6 +519,34 @@ def main():
 
     palm_bid = robot.data.body_names.index("right_hand_palm_link")
 
+    # ── Readings the proximity-stop controller consumes ─────────────────────
+    _palm_local_offset_t = torch.tensor(
+        PALM_LOCAL_OFFSET, device=env.device, dtype=torch.float32
+    )
+
+    def _palm_target_dist_env0(robot, apple, palm_bid) -> torch.Tensor:
+        """Env 0's palm-reference-point -> grasp-target distance, the same
+        quantity reach_rewards._palm_target_dist computes (and therefore the
+        same one pos_tol/hold/reach_success are all expressed in)."""
+        from isaaclab.utils.math import matrix_from_quat
+        R = matrix_from_quat(robot.data.body_quat_w[0:1, palm_bid, :])[0]
+        ref = robot.data.body_pos_w[0, palm_bid] + R @ _palm_local_offset_t
+        target = apple.data.root_pos_w[0].clone()
+        target[2] -= GRASP_OFFSET_Z
+        return torch.norm(target - ref)
+
+    def _palm_force_env0(env) -> float | None:
+        """Env 0's apple-filtered palm+thumb-base contact force, in newtons —
+        the SAME function the reward and termination touch-gates read, so the
+        stop controller's contact trigger fires on exactly the signal the
+        policy was trained against. None if the sensors aren't present."""
+        try:
+            from isaaclab.managers import SceneEntityCfg
+            from envs.mdp.observations import palm_contact_force
+            return float(palm_contact_force(env, SceneEntityCfg("contact_forces"))[0, 0])
+        except Exception:
+            return None
+
     # ── Proximity-stop safety controller (see proximity_stop.py) ────────────
     # Only meaningful while a policy is actually driving the arm. Reads
     # ActionsCfg.right_arm's own scale/offset from the live action term
@@ -547,9 +580,13 @@ def main():
         )
         _wd = stop_cfg.watchdog_time
         _wd_str = f"{_wd:.2f}s" if (_wd is not None and _wd > 0.0) else "disabled"
-        print(f"[ProximityStop] armed — stop_dist={stop_cfg.stop_dist*100:.1f}cm, "
-              f"dwell={stop_cfg.dwell_time:.2f}s, stop_duration={stop_cfg.stop_duration:.2f}s, "
-              f"resume_margin={stop_cfg.resume_margin*100:.1f}cm, watchdog={_wd_str} "
+        _ct_str = (f"{stop_cfg.contact_force_min:.2f}N (immediate)"
+                   if stop_cfg.contact_trigger else "disabled")
+        print(f"[ProximityStop] armed — stop_dist={stop_cfg.stop_dist*100:.1f}cm "
+              f"(palm-ref to grasp target), dwell={stop_cfg.dwell_time:.2f}s, "
+              f"stop_duration={stop_cfg.stop_duration:.2f}s, "
+              f"resume_margin={stop_cfg.resume_margin*100:.1f}cm, watchdog={_wd_str}, "
+              f"contact_trigger={_ct_str}, recall={stop_cfg.contact_recall} "
               f"(disable with --no_proximity_stop)")
 
         def _q_to_raw_action(q_cmd: torch.Tensor) -> torch.Tensor:
@@ -651,11 +688,24 @@ def main():
 
                 if stop_ctrl is not None:
                     _t = step * env.step_dt
-                    _palm_now = robot.data.body_pos_w[0, palm_bid]
-                    _dist_now = float(torch.norm(apple.data.root_pos_w[0] - _palm_now))
+                    # Distance measured EXACTLY as the reward stack measures
+                    # it: palm reference point (palm link origin offset by
+                    # PALM_LOCAL_OFFSET, i.e. out at the finger pads, not the
+                    # wrist) to the grasp target (GRASP_OFFSET_Z below the
+                    # apple centre). This used to be wrist-origin-to-apple-
+                    # CENTRE, a completely different quantity: at the pose
+                    # the policy is trained to reach, that metric reads
+                    # ~sqrt(0.08^2 + GRASP_OFFSET_Z^2) ~ 0.10 m while this
+                    # one reads ~0. A stop_dist tuned against one metric
+                    # means nothing in the other, so the trigger distance was
+                    # effectively arbitrary relative to the task.
+                    _dist_now = float(_palm_target_dist_env0(robot, apple, palm_bid))
                     _q_now  = robot.data.joint_pos[0, arm_joint_idx]
                     _dq_now = robot.data.joint_vel[0, arm_joint_idx]
-                    stop_ctrl.update_state(_t, _dist_now, _q_now, _dq_now)
+                    stop_ctrl.update_state(
+                        _t, _dist_now, _q_now, _dq_now,
+                        contact_force=_palm_force_env0(env),
+                    )
 
                     # Scoped to env 0 only, matching the rest of this
                     # script's single-env-focused debug/publish logic — with

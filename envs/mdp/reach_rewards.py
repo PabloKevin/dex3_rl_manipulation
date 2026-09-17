@@ -537,3 +537,155 @@ def penalty_joint_range_box(
         excess = excess * torch.tensor(weights, device=env.device, dtype=q.dtype)
 
     return (excess ** 2).sum(dim=-1)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Arm-vs-torso self-collision (task space)
+# ═════════════════════════════════════════════════════════════════════════
+#
+# The robot spawns with enabled_self_collisions=False (see ArticulationCfg
+# in apple_grasp_env_cfg.py), so PhysX will happily let the upper arm and
+# forearm pass straight through the torso — nothing in the sim stops it and
+# nothing in the reward noticed it either. The existing guard,
+# RewardsCfg.posture_box, boxes right_shoulder_roll_joint at +0.35 rad,
+# which is a JOINT-space proxy for "elbow swung in toward the chest". That
+# catches the one failure mode it was tuned against, but it cannot catch the
+# general case: with the apple close to the robot, shoulder_pitch/yaw and
+# elbow flexion can put the upper arm inside the torso at shoulder_roll
+# values the box considers perfectly legal.
+#
+# So this term works in TASK space instead, on the actual link poses.
+#
+# Geometry is NOT guessed — both the torso capsule and the arm sphere radii
+# below are read off the project's own cuRobo collision model,
+# envs/assets/cuRobo/g1_29dof_rev_1_0_spherized.yml, which is the same
+# spherization the CasADi/cuRobo planners in scripts/ already plan against.
+# Keeping the RL penalty and the planner on one collision model means a pose
+# the policy learns is clear is also a pose the planner considers clear.
+#
+# torso_link's three spheres in that file sit exactly on the link's local Z
+# axis (x = y = 0) at z = 0.0930 / 0.2149 / 0.3919 with radii 0.1045 /
+# 0.1170 / 0.1014 — i.e. a vertical capsule of radius ~0.117 (the largest,
+# taken as the conservative single radius) spanning that z range.
+
+#: Torso collision capsule, in torso_link's OWN local frame. From
+#: g1_29dof_rev_1_0_spherized.yml's torso_link spheres (see above).
+TORSO_CAPSULE_P0 = (0.0, 0.0, 0.0930)
+TORSO_CAPSULE_P1 = (0.0, 0.0, 0.3919)
+TORSO_CAPSULE_RADIUS = 0.1170
+
+#: Right-arm collision spheres as (link name, centre in that link's LOCAL
+#: frame, radius), lifted verbatim from the same spherized model.
+#:
+#: Deliberately starts at right_shoulder_yaw_link (the upper arm) and does
+#: NOT include right_shoulder_pitch/roll_link: those two sit at the shoulder
+#: itself, roughly 0.10 m off the torso centreline, so they are inside or
+#: touching the torso capsule in EVERY pose including the home pose. Adding
+#: them would contribute a near-constant offset with no usable gradient
+#: while making the term's magnitude impossible to read on a training curve.
+#: The links kept here are exactly the ones reported as colliding: the upper
+#: arm (shoulder_yaw) and the forearm (elbow), plus the wrist for free.
+ARM_COLLISION_SPHERES = [
+    ("right_shoulder_yaw_link", ( 0.0123,  0.0020, -0.0773), 0.0458),
+    ("right_shoulder_yaw_link", (-0.0046,  0.0000, -0.0114), 0.0431),
+    ("right_elbow_link",        ( 0.0843,  0.0000, -0.0101), 0.0415),
+    ("right_elbow_link",        ( 0.0391,  0.0000, -0.0085), 0.0415),
+    ("right_wrist_roll_link",   ( 0.0325,  0.0000,  0.0000), 0.0395),
+]
+
+
+def _point_segment_distance(
+    p: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """Distance from points `p` [N, S, 3] to the segment a->b ([N, 3] each).
+
+    Returns: [N, S]
+    """
+    ab = (b - a).unsqueeze(1)                                   # [N, 1, 3]
+    ap = p - a.unsqueeze(1)                                     # [N, S, 3]
+    denom = (ab * ab).sum(dim=-1).clamp(min=1e-12)              # [N, 1]
+    t = ((ap * ab).sum(dim=-1) / denom).clamp(0.0, 1.0)         # [N, S]
+    closest = a.unsqueeze(1) + t.unsqueeze(-1) * ab             # [N, S, 3]
+    return torch.norm(p - closest, dim=-1)                      # [N, S]
+
+
+def penalty_torso_self_collision(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    margin: float = 0.02,
+    ref: float = 0.05,
+    capsule_radius: float = TORSO_CAPSULE_RADIUS,
+) -> torch.Tensor:
+    """Quadratic penalty on the right arm intruding into the torso capsule.
+
+    For each arm collision sphere s (ARM_COLLISION_SPHERES):
+
+        depth_s = max(0, capsule_radius + r_s + margin - dist(c_s, torso axis))
+        penalty = sum_s (depth_s / ref)^2
+
+    Zero cost whenever the whole arm is clear, so every non-colliding IK
+    branch stays completely free — this only ever pushes the arm out of the
+    torso, it never expresses a preference between two clear postures (that
+    is home_excursion's job). Because it is a smooth function of link pose
+    rather than a joint box, it gives a real gradient that grows as the arm
+    goes deeper, which is what actually teaches "swing the elbow out" rather
+    than "this joint value is forbidden".
+
+    `margin` is clearance required ON TOP of the two collision radii, so the
+    arm is pushed to a visibly clear posture rather than to exact tangency.
+    `ref` normalises the depth so a `ref`-deep intrusion on one sphere costs
+    exactly 1.0 before the weight — pick the weight against that scale.
+
+    Both defaults are in metres. Raise `margin` if the arm still brushes the
+    torso mesh (the capsule is an approximation of a non-convex mesh, and
+    the shoulder end of the torso is where it fits worst).
+
+    `robot_cfg` selects the articulation only; the bodies come from
+    ARM_COLLISION_SPHERES / the torso capsule constants, so no body_names
+    are needed on it and none are read.
+
+    Returns: [num_envs]
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+
+    if not hasattr(env, "_torso_collision_ids"):
+        names = robot.data.body_names
+        env._torso_collision_ids = {
+            "torso": names.index("torso_link"),
+            "arm": [names.index(link) for link, _, _ in ARM_COLLISION_SPHERES],
+        }
+        env._arm_sphere_offsets = torch.tensor(
+            [c for _, c, _ in ARM_COLLISION_SPHERES],
+            device=env.device, dtype=torch.float32,
+        )                                                        # [S, 3]
+        env._arm_sphere_radii = torch.tensor(
+            [r for _, _, r in ARM_COLLISION_SPHERES],
+            device=env.device, dtype=torch.float32,
+        )                                                        # [S]
+
+    ids = env._torso_collision_ids
+
+    # Torso capsule endpoints, local -> world.
+    torso_pos = robot.data.body_pos_w[:, ids["torso"], :]                  # [N, 3]
+    torso_rot = matrix_from_quat(robot.data.body_quat_w[:, ids["torso"], :])  # [N, 3, 3]
+    p0 = torch.tensor(TORSO_CAPSULE_P0, device=env.device, dtype=torso_pos.dtype)
+    p1 = torch.tensor(TORSO_CAPSULE_P1, device=env.device, dtype=torso_pos.dtype)
+    a = torso_pos + torch.matmul(torso_rot, p0)                            # [N, 3]
+    b = torso_pos + torch.matmul(torso_rot, p1)                            # [N, 3]
+
+    # Arm sphere centres, local -> world. Each sphere rides its own link, so
+    # index the link poses per-sphere (a link with two spheres appears twice).
+    link_pos = robot.data.body_pos_w[:, ids["arm"], :]                     # [N, S, 3]
+    link_rot = matrix_from_quat(
+        robot.data.body_quat_w[:, ids["arm"], :].reshape(-1, 4)
+    ).reshape(link_pos.shape[0], len(ids["arm"]), 3, 3)                    # [N, S, 3, 3]
+    offsets = env._arm_sphere_offsets.to(link_pos.dtype)                   # [S, 3]
+    centres = link_pos + torch.matmul(
+        link_rot, offsets.unsqueeze(0).unsqueeze(-1)
+    ).squeeze(-1)                                                          # [N, S, 3]
+
+    dist = _point_segment_distance(centres, a, b)                          # [N, S]
+    clearance = capsule_radius + env._arm_sphere_radii.to(dist.dtype) + margin
+    depth = (clearance.unsqueeze(0) - dist).clamp(min=0.0)                 # [N, S]
+
+    return ((depth / ref) ** 2).sum(dim=-1)

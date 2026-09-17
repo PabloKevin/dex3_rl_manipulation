@@ -951,6 +951,39 @@ class RewardsCfg:
         },
     )
 
+    # Task-space arm-vs-torso guard. posture_box above is a JOINT-space
+    # proxy for the same failure (it boxes shoulder_roll at +0.35 rad); this
+    # is the general version, and the two are complementary rather than
+    # redundant -- the box is a cheap, sharp fence on the one DOF that
+    # usually picks the colliding IK branch, this one catches every OTHER
+    # way the upper arm and forearm can end up inside the torso, which is
+    # what happens when the apple is sampled close to the robot and the arm
+    # has to fold. Needed because enabled_self_collisions=False means PhysX
+    # never stops the arm from passing through the torso, so without a
+    # reward term nothing does.
+    #
+    # Geometry comes from the project's own cuRobo spherization (see
+    # reach_rewards.TORSO_CAPSULE_* / ARM_COLLISION_SPHERES), not from
+    # hand-tuned numbers.
+    #
+    # Weight: `ref`=0.05 m means one sphere buried 5 cm past the required
+    # clearance costs 1.0 before the weight, and depth grows smoothly from
+    # zero, so -8.0 makes a real collision clearly worse than any posture
+    # gain while staying bounded and costing exactly nothing in the clear.
+    # Watch the curve: it should fall toward 0 and stay there. If it sits
+    # pinned above zero the arm is parked in the torso and `margin` is
+    # probably too big for the reachable workspace; if the arm still visibly
+    # brushes the mesh, raise `margin`.
+    torso_collision = RewTerm(
+        func=rr.penalty_torso_self_collision,
+        weight=-8.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot"),
+            "margin": 0.02,   # metres of clearance on top of both radii
+            "ref": 0.05,      # metres of intrusion that costs 1.0
+        },
+    )
+
     joint_limits = RewTerm(
         func=mdp.joint_pos_limits,
         weight=-1.0,
