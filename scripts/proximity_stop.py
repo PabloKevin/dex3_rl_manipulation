@@ -80,8 +80,8 @@ class QuinticStopConfig:
     contact_force_min: float = 0.5
     """Newtons of apple-filtered palm contact force that count as 'touching'.
     Lower edge of the good band, used by BOTH the trigger and the recall
-    latch. Keep in sync with RewardsCfg.gentle_touch / reward_reach_hold's
-    `good_min`/`pressure_min`.
+    latch. Keep in sync with RewardsCfg.gentle_touch_palm / _fingers and
+    reward_reach_hold's `good_min` / `pressure_min`.
 
     Turn the behaviours off with the `contact_trigger` / `contact_recall`
     flags, never by zeroing this: it is a band edge, not an enable switch,
@@ -94,7 +94,7 @@ class QuinticStopConfig:
     contact pose be latched and returned to if a timer fires later."""
 
     contact_force_max: float = 5.0
-    """Upper edge of the 'good' contact band, matching gentle_touch's
+    """Upper edge of the 'good' contact band, matching gentle_touch_*'s
     good_max. Only a reading inside [contact_force_min, contact_force_max]
     is latched as a pose worth returning to (see contact_recall below) -- a
     slam above this band is a pose to leave, not one to go back to."""
@@ -309,7 +309,6 @@ class QuinticStopController:
                             self._q0 = q.clone()
                             self._v0 = dq.clone()
                             if contact_fired:
-                                time.sleep(0.8)
                                 reason = "contact"
                                 # Already touching -- do not coast further in.
                                 self._q1 = self._q0 + self._v0 * T * self.cfg.contact_coast_fraction

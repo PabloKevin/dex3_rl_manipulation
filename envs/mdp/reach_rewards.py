@@ -112,16 +112,79 @@ def _palm_normal_angle(
 
     Returns: [num_envs], 0 = palm facing straight up, pi = facing straight down.
     """
+    n_world = _palm_normal_world(env, robot_cfg, palm_normal_axis)
+    cos_up = n_world[:, 2].clamp(-1.0, 1.0)                       # dot with [0,0,1]
+    return torch.acos(cos_up)
+
+
+def _palm_normal_world(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    palm_normal_axis: Sequence[float],
+) -> torch.Tensor:
+    """Unit palm normal in WORLD frame, pointing OUT of the palm face.
+
+    Returns: [num_envs, 3]
+    """
     robot: Articulation = env.scene[robot_cfg.name]
     quat = robot.data.body_quat_w[:, robot_cfg.body_ids[0], :]   # [N, 4] wxyz
     rot = matrix_from_quat(quat)                                  # [N, 3, 3]
 
     n_local = torch.tensor(palm_normal_axis, device=env.device, dtype=quat.dtype)
     n_local = n_local / (n_local.norm() + 1e-9)
+    return torch.matmul(rot, n_local)                             # [N, 3]
 
-    n_world = torch.matmul(rot, n_local)                          # [N, 3]
-    cos_up = n_world[:, 2].clamp(-1.0, 1.0)                       # dot with [0,0,1]
-    return torch.acos(cos_up)
+
+def _palmar_dorsal_force(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    palm_normal_axis: Sequence[float],
+    link_names: Sequence[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split apple contact force on each link into the part pressing on the
+    PALM side of the hand and the part pressing on the BACK of it.
+
+    Returns: (palmar [N, L], dorsal [N, L]), both non-negative, in newtons.
+
+    Why this exists
+    ---------------
+    A ContactSensor reports contact on a whole rigid BODY, not on a patch of
+    its surface: right_hand_palm_link registers a contact identically whether
+    the apple touched the palm face or the back of the hand. So a reward that
+    reads only |force| cannot tell the two apart, and
+    reward_gentle_touch paid exactly the same for either -- which is the
+    degenerate optimum a policy trained against it actually found: touch the
+    apple with the BACK of the hand, collect the touch reward, and never
+    bother rotating the palm up at all.
+
+    The fix does not need any new sensing, just the sign of the force. A
+    compressive contact on a surface whose outward normal is n_hat pushes the
+    body it acts on along -n_hat (this is what "compressive" means, and it is
+    why net_forces_w on a foot standing on the ground points UP). So with
+    n_hat the OUTWARD palm normal:
+
+        dot(F, n_hat) < 0  ->  something is pressing on the palm face
+        dot(F, n_hat) > 0  ->  something is pressing on the back of the hand
+
+    and the magnitudes are just the two clamped halves of that projection.
+    No extra geometry has to be measured: palm_normal_axis is already known
+    and already used by reward_palm_normal_up.
+
+    The palm's own normal is used as the reference direction for the digit
+    links too. That is an approximation -- a curled finger's pad normal is
+    not exactly the palm normal -- but it is the RIGHT approximation here,
+    because what this has to distinguish is "the apple is on the grasping
+    side of the hand" from "the apple is on the back of it", and for any
+    cupping pose the whole grasping side faces within well under 90 deg of
+    the palm normal. The sign is what matters, not the exact angle.
+    """
+    from .observations import apple_force_vec_per_link
+
+    n_world = _palm_normal_world(env, robot_cfg, palm_normal_axis)    # [N, 3]
+    forces = apple_force_vec_per_link(env, sensor_cfg, link_names)    # [N, L, 3]
+    f_n = (forces * n_world.unsqueeze(1)).sum(dim=-1)                 # [N, L]
+    return (-f_n).clamp(min=0.0), f_n.clamp(min=0.0)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -284,10 +347,13 @@ def reward_reach_hold(
 def reward_gentle_touch(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
     good_min: float = 0.5,
     good_max: float = 5.0,
+    link_names: Sequence[str] | None = None,
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
 ) -> torch.Tensor:
-    """Flat, per-step bonus (0 or 1) for palm+thumb-base contact force
+    """Flat, per-step bonus (0 or 1) for contact force on `link_names`
     landing in [good_min, good_max] N -- a direct, position-independent
     stepping stone toward touching gently, separate from reward_reach_hold's
     combined position+orientation+force gate. Without an isolated reward
@@ -301,10 +367,79 @@ def reward_gentle_touch(
     by penalty_excess_palm_force below, not by shrinking this term back to
     zero -- keeping this flat rather than peaked avoids fighting that
     penalty over exactly where the "good enough" boundary sits.
+
+    `link_names` (default: observations._PALM_CONTACT_LINKS, i.e. the old
+    palm + all three digit bases lumped together) exists so RewardsCfg can
+    register this term MORE THAN ONCE over different parts of the hand at
+    different weights -- "touching with the palm or thumb" is a better
+    hand-off pose for the grasp phase than "touching with an index or
+    middle finger", and a single term summing all four links cannot express
+    that preference: it pays exactly the same for either. Splitting it also
+    gives one TensorBoard curve per group, so which part of the hand the
+    policy actually settles on is directly readable instead of inferred.
+
+    Note the band applies to the SUM over `link_names`, so a group is a set
+    of links that should be touching together, not an arbitrary bag.
+
+    Only the PALMAR component of the contact force counts (see
+    _palmar_dorsal_force). Touching the apple with the BACK of the hand pays
+    nothing here, no matter how clean the force magnitude looks. This is not
+    a refinement -- it is load-bearing. Without it this term is maximised by
+    backhanding the apple, which needs no wrist rotation at all and is
+    therefore much easier to find than cupping: a policy trained against the
+    magnitude-only version converged straight onto it, took the touch reward
+    every step, and left reward_palm_normal_up sitting at ~0 for the whole
+    run because nothing ever required the palm to face anywhere in
+    particular.
     """
-    from .observations import palm_contact_force
-    force = palm_contact_force(env, sensor_cfg).squeeze(-1)
+    from .observations import _PALM_CONTACT_LINKS
+    if link_names is None:
+        link_names = _PALM_CONTACT_LINKS
+    palmar, _ = _palmar_dorsal_force(
+        env, robot_cfg, sensor_cfg, palm_normal_axis, link_names
+    )
+    force = palmar.sum(dim=-1)
     return ((force >= good_min) & (force <= good_max)).float()
+
+
+def penalty_back_of_hand_contact(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
+    cap: float = 5.0,
+    link_names: Sequence[str] | None = None,
+) -> torch.Tensor:
+    """Penalise the apple pressing on the BACK of the hand, anywhere, at any
+    distance. Use a NEGATIVE weight.
+
+    Dorsal contact is never part of a correct reach: there is no pose in
+    which the apple should be resting against the back of the hand or the
+    back of the thumb. So unlike penalty_premature_contact this needs no
+    distance gate -- the contact is wrong on its own terms, not wrong
+    because of when it happened, and gating it would just leave a region
+    where backhanding is free again.
+
+    Making reward_gentle_touch palmar-only already removes the INCENTIVE to
+    backhand the apple; this adds an active cost, so a trajectory that
+    sweeps the back of the hand through the apple on its way in is worse
+    than one that goes around, rather than merely no better.
+
+    Force is clamped per link at `cap`, same reasoning as
+    penalty_excess_palm_force and penalty_premature_contact: a fast clip
+    spikes far above any steady contact, and an unbounded penalty on a
+    transient outlier teaches avoidance of the whole region instead of
+    teaching a cleaner approach.
+
+    Returns [num_envs], 0 when nothing is touching the back of the hand.
+    """
+    from .observations import RIGHT_HAND_CONTACT_LINKS
+    if link_names is None:
+        link_names = RIGHT_HAND_CONTACT_LINKS
+    _, dorsal = _palmar_dorsal_force(
+        env, robot_cfg, sensor_cfg, palm_normal_axis, link_names
+    )
+    return (dorsal.clamp(max=cap) / cap).sum(dim=-1)
 
 
 def penalty_excess_palm_force(
@@ -335,6 +470,67 @@ def penalty_excess_palm_force(
     span = cap - start
     excess = (force - start).clamp(min=0.0, max=span)
     return (excess / span) ** 2
+
+
+def penalty_premature_contact(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    gate_dist: float = 0.05,
+    ramp: float = 0.03,
+    cap: float = 5.0,
+    offset_z: float = 0.08,
+    palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+    link_names: Sequence[str] | None = None,
+) -> torch.Tensor:
+    """Penalise apple contact ANYWHERE on the hand while the palm is still
+    too far from the grasp point for that contact to be the intended gentle
+    touch. Use a NEGATIVE weight.
+
+    This is the "collided on the way in" term. The observed failure is the
+    BACK of the thumb clipping the apple during the approach: the hand
+    arrives from a direction that sweeps a dorsal surface through the
+    apple's volume before the palm ever gets underneath it. Nothing else in
+    the reward set objects -- reward_gentle_touch only looks at whether the
+    force is in band (and the dorsal links aren't even in its group),
+    penalty_excess_palm_force only fires above 5 N, and
+    penalty_apple_contact_force's weight (-0.05, ref 5 N) makes a 3 N scrape
+    cost ~0.018, i.e. nothing. So a trajectory that bumps its way in scores
+    essentially the same as one that approaches cleanly.
+
+    Rather than trying to identify the dorsal surface geometrically (which
+    would need a pad-normal axis per thumb link that nobody has measured for
+    this USD), this uses the fact that makes the contact wrong in the first
+    place: WHEN it happens. In the intended trajectory the hand gets behind
+    and below the apple first and only then closes the last couple of
+    centimetres, so ANY apple contact while the palm reference point is
+    still `gate_dist` away is premature by construction, whichever surface
+    it lands on. Contact inside the neighbourhood -- the gentle touch this
+    whole phase is trying to produce -- costs exactly zero.
+
+    gate is a smooth ramp, not a step: zero at d <= gate_dist, 1.0 at
+    d >= gate_dist + ramp. A hard step would put a discontinuity right where
+    the policy is trying to settle.
+
+    Force is CLAMPED at `cap` before normalising, for the same reason
+    penalty_excess_palm_force clamps: an approach-speed clip can spike far
+    above any steady contact, and an unbounded penalty on a transient
+    outlier teaches "never go near the apple" rather than "go around".
+
+    Returns [num_envs] in [0, 1] (per link summed, so a multi-link clip can
+    exceed 1 -- that is intended, hitting with more of the hand is worse).
+    """
+    from .observations import RIGHT_HAND_CONTACT_LINKS, apple_force_per_link
+    if link_names is None:
+        link_names = RIGHT_HAND_CONTACT_LINKS
+
+    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+    gate = ((d - gate_dist) / max(ramp, 1e-6)).clamp(0.0, 1.0)      # [N]
+
+    force = apple_force_per_link(env, sensor_cfg, link_names)        # [N, L]
+    normalised = (force.clamp(max=cap) / cap).sum(dim=-1)            # [N]
+    return gate * normalised
 
 
 def reward_reach_success(env: "ManagerBasedRLEnv") -> torch.Tensor:

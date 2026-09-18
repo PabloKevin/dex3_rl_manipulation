@@ -808,15 +808,24 @@ class RewardsCfg:
     #    above) that made orientation kinematically impossible regardless.
     #    Re-tighten gate_dist if this starts getting farmed away from the
     #    target instead of reaching once REACH_MAX is respected.
+    # Weight RAISED 3.0 -> 6.0. Orientation was being outcompeted: the dense
+    # per-step touch terms (4.0 + 1.0) were collectable without facing the
+    # apple at all once a backhand counted as a touch, and a per-step 3.0 for
+    # orientation is a weak pull against that. The palmar-only fix removes
+    # the degenerate option outright, so this is belt-and-braces -- but the
+    # broader lesson holds regardless: the sparse reach_success bonus (95,
+    # one-time) is worth less than ~25 steps of a 4.0 dense term, so any
+    # dense term that can be farmed in a wrong pose will beat the success
+    # bonus outright. Keep dense terms gated on the pose being right.
     palm_up = RewTerm(
         func=rr.reward_palm_normal_up,
-        weight=3.0,
+        weight=10.0,
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "palm_normal_axis": PALM_NORMAL_AXIS,   # verify with play_debug_patch probe
             "std_rad": 0.5,      # ~29 deg basin
-            "gate_dist": 0.40,   # metres
+            "gate_dist": 0.55,   # metres
             "offset_z": GRASP_OFFSET_Z,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
@@ -1014,13 +1023,127 @@ class RewardsCfg:
     # separate from hold's combined position+orientation+force gate (see
     # reward_gentle_touch's own docstring for why an isolated version of
     # this signal matters). Same 0.5-5.0 N band as hold's own touch gate.
-    gentle_touch = RewTerm(
+    #
+    # Split into TWO terms over two parts of the hand, because not every
+    # gentle touch is equally good: the apple settling into the palm / against
+    # the thumb is the hand-off pose the grasp phase wants, while catching it
+    # on an index or middle finger is a pose the grasp phase then has to undo.
+    # The single summed term this replaces paid exactly the same for either,
+    # so the policy had no reason to prefer one, and it was drifting to
+    # finger contact. The ratio below (4.0 vs 1.0) is the preference; the
+    # finger term stays clearly POSITIVE on purpose -- finger contact is
+    # still much better than no contact at all, and zeroing it would throw
+    # away the stepping stone that got contact working in the first place.
+    #
+    # Two terms also means two TensorBoard curves, so which part of the hand
+    # the policy is settling on is directly readable. Expect palm to climb
+    # and fingers to fall; if fingers stays on top, widen the ratio.
+    #
+    # BOTH terms count only the PALMAR component of the contact force. A
+    # ContactSensor fires on a whole rigid body, so the magnitude-only
+    # version of this reward paid identically for "apple cupped in the palm"
+    # and "apple bumped with the back of the hand" -- and the backhand needs
+    # no wrist rotation, so it is far easier to find. That is exactly what
+    # the previous run converged to, with palm_up flat at ~0 all the way
+    # through, because once the touch reward was collectable without facing
+    # the apple nothing else required the palm to point anywhere.
+    gentle_touch_palm = RewTerm(
         func=rr.reward_gentle_touch,
         weight=4.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "palm_normal_axis": PALM_NORMAL_AXIS,
             "good_min": 0.5,
             "good_max": 5.0,
+            "link_names": [
+                "right_hand_palm_link",
+                "right_hand_thumb_0_link",
+            ],
+        },
+    )
+
+    gentle_touch_fingers = RewTerm(
+        func=rr.reward_gentle_touch,
+        weight=1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "palm_normal_axis": PALM_NORMAL_AXIS,
+            "good_min": 0.5,
+            "good_max": 5.0,
+            "link_names": [
+                "right_hand_index_0_link",
+                "right_hand_middle_0_link",
+            ],
+        },
+    )
+
+    # "Collided on the way in" -- the back-of-the-thumb clipping observed
+    # during the approach. See penalty_premature_contact's docstring for why
+    # this is gated on DISTANCE rather than on trying to identify the dorsal
+    # surface geometrically. Covers all 8 hand links, so it catches the clip
+    # whichever surface it lands on.
+    #
+    # gate_dist WIDENED 0.05 -> 0.10 after the first run with this term.
+    # 0.05 was too tight to be safe: the palm reference point is ~0.08 m
+    # behind the fingertips (PALM_LOCAL_OFFSET), so during a CORRECT final
+    # approach the digits are already brushing the apple while the reference
+    # point still reads 0.05-0.08 m from target. The term was therefore
+    # taxing the legitimate approach, not just the bad one -- a plausible
+    # contributor to the policy abandoning the cupping approach entirely.
+    # At 0.10 m only contact made genuinely early, before the hand is
+    # anywhere near the cup pose, is charged.
+    #
+    # Dorsal contact specifically is now handled by back_of_hand_contact
+    # below, WITHOUT a distance gate, because it is wrong whenever it
+    # happens. This term is left as the weaker "you bumped it on the way in
+    # from a long way out" catch-all over both sides of the hand.
+    #
+    # Weight -3.0: clearly worse than the 4.0 a clean palm touch pays, so
+    # bumping your way in never beats going around, while staying well under
+    # reach_success's 95 so a single unlucky graze doesn't erase a
+    # successful episode.
+    #
+    # Watch this curve together with gentle_touch_palm: premature_contact
+    # should fall toward 0 while gentle_touch_palm rises. If BOTH go to zero
+    # the policy has gone timid and is refusing to approach -- lower the
+    # weight rather than widening the gate.
+    premature_contact = RewTerm(
+        func=rr.penalty_premature_contact,
+        weight=-3.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "object_cfg": SceneEntityCfg("apple"),
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "gate_dist": 0.10,
+            "ramp": 0.03,
+            "cap": 5.0,
+            "offset_z": GRASP_OFFSET_Z,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
+        },
+    )
+
+    # The apple pressing on the BACK of the hand -- the observed "touches it
+    # with the back of the hand / back of the thumb" failure. No distance
+    # gate: there is no pose in this task where dorsal contact is correct,
+    # so unlike premature_contact this is wrong on its own terms rather than
+    # wrong because of when it happened, and gating it would leave a region
+    # where backhanding is free again.
+    #
+    # Pairs with the palmar-only gentle_touch terms above: those remove the
+    # INCENTIVE to backhand the apple, this adds an active cost so sweeping
+    # the back of the hand through it on the way in is worse than going
+    # around rather than merely no better. Weight -4.0 matches what a clean
+    # palm touch pays, so the two can't be traded off against each other.
+    back_of_hand_contact = RewTerm(
+        func=rr.penalty_back_of_hand_contact,
+        weight=-4.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "palm_normal_axis": PALM_NORMAL_AXIS,
+            "cap": 5.0,
         },
     )
 
