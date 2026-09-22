@@ -7,9 +7,9 @@ Single self-contained script, deliberately NOT split across two
 terminals/processes like the reach task's run_env.py + reach_apple_hybrid.py
 pair: that split existed because reach->classical-control sequencing lived
 in an EXTERNAL script (reach_apple_hybrid.py's own phase FSM). For the grasp
-task, the reach -> grasp hand-off already happens automatically inside the
-environment's own reset() (see envs/mdp/grasp_autoplay.py::
-reach_autoplay_handoff), so a single process loading Isaac Sim ONCE and
+task, the reach -> grasp hand-off already happens automatically inside every
+episode (the frozen reach policy drives first, then the grasp policy -- see
+envs/mdp/grasp_autoplay.py), so a single process loading Isaac Sim ONCE and
 supporting 'r'+Enter to reset (no reload) already gives the full picture
 with far less complexity. If real-hardware DDS deployment is needed later
 (mirroring reach_apple_hybrid.py), that's a separate, later script — this
@@ -61,7 +61,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import envs  # noqa: registers gym tasks
 
 from envs.apple_grasp_grasp_env_cfg import AppleGraspGraspEnvCfg_PLAY
-from envs.mdp.grasp_autoplay import _find_last_reach_policy  # generic despite the name -- just "latest export under <experiment_name>"
 from envs.mdp.grasp_rewards import _per_finger_group_force
 
 # ── Terminal Reset Listener (identical pattern to scripts/run_env.py) ───────
@@ -83,6 +82,26 @@ def _listen_terminal_reset():
             break
 
 
+def _find_last_exported_grasp_policy() -> str:
+    """Newest apple_grasp_grasp run that HAS an exported policy.pt. Runs
+    are only exported when play.py is run against them, so the newest run
+    often has none yet -- say so, instead of crashing on it."""
+    runs_dir = os.path.join(BASE_DIR, "logs", "rsl_rl", "apple_grasp_grasp")
+    runs = sorted(os.listdir(runs_dir), reverse=True) if os.path.isdir(runs_dir) else []
+    for i, run in enumerate(runs):
+        path = os.path.join(runs_dir, run, "exported", "policy.pt")
+        if os.path.isfile(path):
+            if i > 0:
+                print(f"[Policy] WARNING: newer run(s) {runs[:i]} have no export -- using {run}. "
+                      f"To view the newest, first run:\n  scripts/play.py --task AppleGraspGrasp-Play-v0 "
+                      f"--load_run {runs[0]}")
+            return path
+    raise FileNotFoundError(
+        f"No exported grasp policy under {runs_dir}. Run scripts/play.py --task "
+        f"AppleGraspGrasp-Play-v0 once (it exports policy.pt), or pass --policy <path>."
+    )
+
+
 def main():
     reset_thread = threading.Thread(target=_listen_terminal_reset, daemon=True)
     reset_thread.start()
@@ -101,7 +120,7 @@ def main():
     policy_module = None
     if not args_cli.random_actions:
         if args_cli.policy == "last":
-            policy_path = _find_last_reach_policy(experiment_name="apple_grasp_grasp")
+            policy_path = _find_last_exported_grasp_policy()
         else:
             policy_path = args_cli.policy
         policy_module = torch.jit.load(policy_path, map_location=env.device).eval()
@@ -123,7 +142,8 @@ def main():
         apple = env.scene["apple"]
         apple_z = apple.data.root_pos_w[0, 2].item()
         handoff_z = env._grasp_handoff_apple_pos[0, 2].item() if hasattr(env, "_grasp_handoff_apple_pos") else float("nan")
-        print(f"  force={level:5.2f} N  target={target:5.2f} N  "
+        phase = "grasp" if getattr(env, "_grasp_phase_active", torch.ones(1, dtype=torch.bool))[0] else "reach"
+        print(f"  phase={phase:5s}  force={level:5.2f} N  target={target:5.2f} N  "
               f"ever_closed={ever_closed}  apple_drop={handoff_z - apple_z:+.3f} m")
 
     global _reset_requested

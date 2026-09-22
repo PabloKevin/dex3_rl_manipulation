@@ -172,24 +172,25 @@ def apple_fell_from_grip(
 
     Shape: [num_envs] bool
     """
+    from .grasp_autoplay import grasp_phase_active
+
     apple: RigidObject = env.scene[object_cfg.name]
     if not hasattr(env, "_grasp_handoff_apple_pos"):
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    return apple.data.root_pos_w[:, 2] < (env._grasp_handoff_apple_pos[:, 2] - drop_margin)
+    fell = apple.data.root_pos_w[:, 2] < (env._grasp_handoff_apple_pos[:, 2] - drop_margin)
+    return fell & grasp_phase_active(env)
 
 
 def grasp_success(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
-    robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
     hold_time: float = 0.5,
     lift_margin: float = 0.03,
-    mu: float = 0.5,
-    contact_threshold: float = 0.05,
+    contact_threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Terminate once force closure (Lynch & Park, 2017, Ch.12 — see
-    grasp_rewards._force_closure_ok for the geometric proxy used) has held
+    """Terminate once the hand has enclosed the apple (see
+    grasp_rewards._force_closure_ok for the proxy used) and that has held
     for hold_time continuous seconds AND the apple has been lifted
     lift_margin above its post-hand-off height. Mirrors reach_success's
     hold-counter idiom exactly (same episode-boundary reset via
@@ -200,8 +201,8 @@ def grasp_success(
     "grasped": with a 14-DoF action space the arm has enough authority to
     make a degenerate "palm-as-shelf" solution look stable without the
     fingers actually gripping. Anchored to env._grasp_handoff_apple_pos
-    (cached by grasp_autoplay.reach_autoplay_handoff at the reach->grasp
-    hand-off) rather than a fixed absolute height, for the same reason
+    (the apple's pinned pose, recorded by grasp_autoplay.
+    reset_reach_grasp_phase) rather than a fixed absolute height, for the same reason
     rewards.reward_lift anchors to env._stem_anchor_pos — the apple's height
     at that moment varies per episode.
 
@@ -211,14 +212,16 @@ def grasp_success(
     grasp_rewards.reward_grasp_success) fresh every step before either
     reward reads them.
 
+    Only counts in the grasp phase (grasp_autoplay.grasp_phase_active) --
+    nothing the frozen reach policy does can succeed or fail the episode.
+
     Shape: [num_envs] bool
     """
     from .grasp_rewards import _force_closure_ok
+    from .grasp_autoplay import grasp_phase_active
 
     apple: RigidObject = env.scene[object_cfg.name]
-    closure_ok = _force_closure_ok(
-        env, sensor_cfg, robot_cfg, object_cfg, mu=mu, contact_threshold=contact_threshold
-    )
+    closure_ok = _force_closure_ok(env, sensor_cfg, contact_threshold=contact_threshold)
     env._force_closure_ok = closure_ok
 
     if hasattr(env, "_grasp_handoff_apple_pos"):
@@ -228,7 +231,7 @@ def grasp_success(
         # before any reset) — fail closed rather than crash.
         lifted = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
-    in_neighbourhood = closure_ok & lifted
+    in_neighbourhood = closure_ok & lifted & grasp_phase_active(env)
 
     if not hasattr(env, "_grasp_hold_counter") or env._grasp_hold_counter.shape[0] != env.num_envs:
         env._grasp_hold_counter = torch.zeros(env.num_envs, device=env.device)
@@ -263,13 +266,15 @@ def fruit_damaged(
     Shape: [num_envs] bool
     """
     from .grasp_rewards import _per_finger_group_force
+    from .grasp_autoplay import grasp_phase_active
 
     if not hasattr(env, "_fruit_damage_force"):
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
     per_finger = _per_finger_group_force(env, sensor_cfg)  # [N, 3]
     max_force = per_finger.max(dim=-1).values
-    return max_force > env._fruit_damage_force
+    # Grasp phase only: a hard reach-policy arrival isn't the trainee's doing.
+    return (max_force > env._fruit_damage_force) & grasp_phase_active(env)
 
 
 def apple_placed_success(

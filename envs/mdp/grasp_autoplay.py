@@ -1,43 +1,51 @@
 # Copyright 2025 - G1 Dex3 Apple Grasp Project
 """
-Reach-policy autoplay — the reach->grasp hand-off, implemented as a single
-mode="reset" EventTerm.
+Reach -> grasp hand-off, as an IN-EPISODE phase.
 
-Why an event term and not a subclassed environment: Isaac Lab already calls
-mode="reset" event terms with EXACTLY the env_ids that just terminated,
-during ManagerBasedRLEnv._reset_idx, BEFORE action_manager.reset()/
-observation_manager.reset() fire for those envs and before episode_length_buf
-is zeroed for them (confirmed by reading manager_based_rl_env.py directly:
-_reset_idx's order is curriculum -> scene.reset -> event_manager.apply(mode=
-"reset") -> observation/action/reward/... manager .reset() -> episode_length_
-buf[env_ids] = 0). This means the grasp trainee (whichever PPO policy rsl_rl
-is training) is NEVER asked to act during autoplay -- rsl_rl only ever sees
-the environment AFTER this function returns, so there is no way for it to
-record "trainee proposed action A, but action B was actually applied",
-which would corrupt PPO's on-policy assumptions. No library-level surgery,
-no reentrant env.step() call, no custom rollout loop.
+Every grasp episode has two phases, tracked per env in env._grasp_phase_active:
 
-Physics still advances for the WHOLE batched scene while this runs (PhysX
-steps every env together, always) -- autoplay substeps for the resetting
-envs also advance physics time for every other, currently-training env.
-That's harmless to their trajectories (their commanded joint-position
-targets are simply left untouched, so their PD controllers just keep
-tracking whatever was already commanded), but it IS extra wall-clock cost.
-Budget for it: keep watchdog_s tight and episode_length_s longer than the
-reach phase's own value (see the grasp env cfg), and measure actual
-iterations/sec before assuming this is fine at your num_envs.
+  1. REACH phase (episode start): the frozen, already-trained reach policy
+     drives the arm, the hand is held at its default (open) pose -- exactly
+     the conditions the reach policy was trained under -- and the apple is
+     pinned in place. The grasp trainee's actions are IGNORED, and every
+     grasp reward/termination is gated to zero (see grasp_phase_active).
+  2. GRASP phase: the trainee drives arm+hand. Its arm actions are offsets
+     from the arm target the reach policy left behind (not from the default
+     pose), so a zero action holds the hand-off pose. The apple stays pinned
+     until the trainee first achieves force closure, then gravity is real.
+
+The switch happens in update_reach_grasp_phase (an every-step interval
+event, so the policy observation computed right after it already carries
+the new phase flag): after a fixed handoff_time_s ("fixed"), or once the
+palm has held the reach-success neighbourhood for hold_time ("converged",
+with handoff_time_s as the watchdog).
+
+Why not run the reach policy inside a mode="reset" event (the previous
+design): PhysX steps every env together, so each reset batch's autoplay
+advanced physics time for ALL the other, mid-episode envs while their
+policies were frozen and their apples were no longer re-pinned -- a
+silent multi-second time jump in the middle of their trajectories. And
+since resets are desynchronised across envs, that autoplay ran almost
+every step: the last run with it collected at ~160 FPS vs ~3400 FPS for
+reach training. In-episode, the reach phase costs one extra (tiny) policy
+forward pass per step and nothing else. The price is that the reach-phase
+steps are PPO samples whose actions have no effect; the grasp_phase
+observation lets the critic tell them apart, and their policy-gradient
+contribution is zero in expectation.
 """
 
 from __future__ import annotations
 from typing import TYPE_CHECKING
 
-import math
 import os
 
 import torch
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import configclass
+
+from .actions import RateLimitedJointPositionAction, RateLimitedJointPositionActionCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -49,29 +57,29 @@ _reach_policy_cache: dict[str, torch.jit.ScriptModule] = {}
 # BASE_DIR / G1_DEX3_USD_PATH.
 _BASE_DIR = os.environ.get("DEX3_RL_BASE_DIR", "/home/pablo_kevin/dex3_rl_manipulation")
 
+# The reach policy the grasp task hands off from, PINNED to a frozen copy
+# rather than "latest apple_grasp_reach run" -- so training the reach task
+# further never silently changes (or, mid-run with no export yet, breaks)
+# the grasp task. Copied from logs/rsl_rl/apple_grasp_reach/
+# 2026-09-18_04-01-01/exported/policy.pt (commit 5f6276a, 29-dim obs). To
+# hand off from a newer reach policy, overwrite this file on purpose (or
+# point the arm action's reach_policy_path somewhere else).
+PINNED_REACH_POLICY = os.path.join(_BASE_DIR, "envs", "agents", "best_weights", "grasp_handoff_reach_apple.pt")
+
 
 def _find_last_reach_policy(experiment_name: str = "apple_grasp_reach") -> str:
-    """Path to the latest reach-training run's JIT-exported policy.pt --
-    same convention (and same "only the exported file works with
-    torch.jit.load, not the raw model_*.pt checkpoints" caveat) as
-    scripts/run_env.py's _find_last_policy.
+    """Path to the latest run's JIT-exported policy.pt under
+    logs/rsl_rl/<experiment_name> -- same convention (and same "only the
+    exported file works with torch.jit.load, not the raw model_*.pt
+    checkpoints" caveat) as scripts/run_env.py's _find_last_policy.
 
-    Resolved LAZILY (only ever called from _load_reach_policy, which only
-    runs when reach_autoplay_handoff actually fires at env reset) rather
-    than as a module-level or class-level default -- importing this module,
-    and therefore envs/__init__.py registering every task including the
-    reach task itself, must not require a reach policy to already exist on
-    disk.
+    No longer used for the hand-off itself (see PINNED_REACH_POLICY); kept
+    for scripts/run_grasp_env.py, which uses it generically to find the
+    latest GRASP export.
     """
     base_dir = os.path.join(_BASE_DIR, "logs", "rsl_rl", experiment_name)
     if not os.path.isdir(base_dir):
-        raise FileNotFoundError(
-            f"No reach-training runs found at {base_dir}. Grasp-phase training "
-            f"depends on an already-trained, exported reach policy for the "
-            f"reach-autoplay hand-off (see grasp_autoplay.reach_autoplay_handoff) "
-            f"-- train one first: scripts/train.py --task AppleGrasp-v0, then "
-            f"scripts/play.py --task AppleGrasp-Play-v0 to export policy.pt."
-        )
+        raise FileNotFoundError(f"No training runs found at {base_dir}.")
     latest_folder = max(os.listdir(base_dir))
     exported_path = os.path.join(base_dir, latest_folder, "exported", "policy.pt")
     if not os.path.isfile(exported_path):
@@ -83,42 +91,35 @@ def _find_last_reach_policy(experiment_name: str = "apple_grasp_reach") -> str:
 
 
 def _load_reach_policy(policy_path: str, device) -> torch.jit.ScriptModule:
-    """Lazily torch.jit.load the frozen, already-trained reach policy once
-    per process. The exported JIT module already bakes in the observation
-    normalizer (same reasoning scripts/reach_apple_hybrid.py's own docstring
-    gives for replaying it outside Isaac Lab), so calling it directly here
-    reproduces exactly what the reach task's own --policy in-process mode
-    would output for the same observation.
-
-    `policy_path`: an explicit path, or "" to auto-resolve the latest
-    apple_grasp_reach export (see _find_last_reach_policy) the first time
-    this is called.
+    """Lazily torch.jit.load the frozen reach policy once per process. The
+    exported JIT module already bakes in the observation normalizer, so
+    calling it directly reproduces what the reach task itself would output
+    for the same observation.
     """
-    resolved = policy_path or _find_last_reach_policy()
-    key = os.path.abspath(resolved)
+    key = os.path.abspath(policy_path)
     if key not in _reach_policy_cache:
+        if not os.path.isfile(key):
+            raise FileNotFoundError(
+                f"Reach hand-off policy not found at {key}. Export one with "
+                f"scripts/play.py --task AppleGrasp-Play-v0 and copy its "
+                f"exported/policy.pt there (see grasp_autoplay.PINNED_REACH_POLICY)."
+            )
         _reach_policy_cache[key] = torch.jit.load(key, map_location=device).eval()
     return _reach_policy_cache[key]
 
 
 def _reach_obs(
     env: "ManagerBasedRLEnv",
-    ids: torch.Tensor,
     arm_cfg: SceneEntityCfg,
     robot_body_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
     palm_local_offset: tuple[float, float, float],
     prev_raw_action: torch.Tensor,
 ) -> torch.Tensor:
-    """Reassemble the reach policy's own 29-dim observation vector, for just
-    `ids`, by calling the SAME functions envs/apple_grasp_env_cfg.py's
-    ObservationsCfg.PolicyObs wires up (joint_pos_selected/joint_vel_selected/
-    object_pos_relative_to_body/body_quat_relative_to_body/palm_contact_
-    force) -- NOT the ObservationManager, since we don't want the grasp
-    task's own reward/termination managers computed during this inner loop.
-    Reusing the real functions guarantees behavioral parity with how the
-    reach policy was actually trained, and survives future edits to those
-    functions.
+    """Reassemble the reach policy's own 29-dim observation vector (all
+    envs) by calling the SAME functions envs/apple_grasp_env_cfg.py's
+    ObservationsCfg.PolicyObs wires up -- NOT the ObservationManager, which
+    belongs to the grasp task here.
 
     Order MUST match apple_grasp_env_cfg.ObservationsCfg.PolicyObs exactly:
     right_arm_pos(7), right_arm_vel(7), apple_pos_palm(3),
@@ -127,6 +128,10 @@ def _reach_obs(
     again -- there is no automatic check that these two stay in sync
     (scripts/reach_apple_hybrid.py's OBS_POLICY_DIM guard catches the
     DDS-deployment side of the same drift risk, but not this one).
+
+    `arm_cfg` must be resolved WITHOUT preserve_order, like the reach task's
+    own right_arm_pos/right_arm_vel terms, so the joint order matches what
+    the reach policy was trained on.
     """
     from .observations import (
         joint_pos_selected,
@@ -145,237 +150,326 @@ def _reach_obs(
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
 
-    arm_pos = joint_pos_selected(env, arm_cfg)[ids]
-    arm_vel = joint_vel_selected(env, arm_cfg)[ids]
-    apple_pos_palm = object_pos_relative_to_body(
-        env, object_cfg, robot_body_cfg, local_offset=palm_local_offset
-    )[ids]
-    palm_orientation_torso = body_quat_relative_to_body(
-        env, robot_body_cfg, env._autoplay_torso_cfg
-    )[ids]
-    palm_force = palm_contact_force(env, env._autoplay_sensor_cfg)[ids]
-
     return torch.cat(
-        [arm_pos, arm_vel, apple_pos_palm, palm_orientation_torso, prev_raw_action, palm_force],
+        [
+            joint_pos_selected(env, arm_cfg),
+            joint_vel_selected(env, arm_cfg),
+            object_pos_relative_to_body(env, object_cfg, robot_body_cfg, local_offset=palm_local_offset),
+            body_quat_relative_to_body(env, robot_body_cfg, env._autoplay_torso_cfg),
+            prev_raw_action,
+            palm_contact_force(env, env._autoplay_sensor_cfg),
+        ],
         dim=-1,
     )
 
 
-def hold_apple_until_first_closure(
-    env: "ManagerBasedRLEnv",
-    env_ids,
-    object_cfg: SceneEntityCfg,
-    robot_cfg: SceneEntityCfg,
-    sensor_cfg: SceneEntityCfg,
-    mu: float = 0.5,
-    contact_threshold: float = 0.05,
-) -> None:
-    """Keep the apple pinned at its hand-off pose ("still attached to the
-    branch") for every env that hasn't yet achieved force closure even once
-    this episode -- continues reach_autoplay_handoff's own pin mechanism
-    into the grasp trainee's real, counted env.step() calls, so the policy
-    gets to establish a grip with NO gravity/time pressure, exactly like a
-    real apple that doesn't need to be "caught" while still on the branch.
-    Releases (stops re-pinning) permanently for an env the moment force
-    closure is first detected -- from that point on, gravity is real and
-    apple_fell_from_grip/grasp_success become a genuine test of whether the
-    established grip actually holds.
+# ─────────────────────────────────────────────
+#  Phase state
+# ─────────────────────────────────────────────
 
-    Registered as a mode="interval" EventTerm with interval_range_s=(0.0,
-    0.0), which makes Isaac Lab's EventManager call this every single
-    control step for every env (see managers/event_manager.py's interval
-    handling: an env's timer starts at 0 and is immediately due again after
-    the first `dt` subtraction) -- env_ids received here is effectively "all
-    envs, every step"; this function itself decides per-env whether to
-    actually touch anything, based on env._grasp_ever_closed.
-
-    Ignored for envs where reach_autoplay_handoff has never run yet
-    (defensive only -- shouldn't happen once training is underway, since
-    every episode starts with a hand-off).
+def grasp_phase_active(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[num_envs] bool: True once an env has been handed off to the grasp
+    trainee this episode. Every grasp reward/termination multiplies by (or
+    ANDs with) this, so the trainee is never credited or blamed for what the
+    frozen reach policy did. All-True before the first reset has created the
+    state (defensive only).
     """
-    if not hasattr(env, "_grasp_handoff_apple_pos") or not hasattr(env, "_grasp_ever_closed"):
-        return
-
-    apple: RigidObject = env.scene[object_cfg.name]
-
-    from .grasp_rewards import _force_closure_ok
-    closure_now = _force_closure_ok(
-        env, sensor_cfg, robot_cfg, object_cfg, mu=mu, contact_threshold=contact_threshold
-    )
-    env._grasp_ever_closed = env._grasp_ever_closed | closure_now
-
-    still_holding = ~env._grasp_ever_closed
-    if not still_holding.any():
-        return
-    ids = still_holding.nonzero(as_tuple=True)[0]
-
-    pose = torch.cat([env._grasp_handoff_apple_pos[ids], env._grasp_handoff_apple_quat[ids]], dim=-1)
-    apple.write_root_pose_to_sim(pose, env_ids=ids)
-    apple.write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=env.device), env_ids=ids)
+    if not hasattr(env, "_grasp_phase_active"):
+        return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    return env._grasp_phase_active
 
 
-def reach_autoplay_handoff(
+def grasp_phase_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """Policy observation: 1.0 in the grasp phase, 0.0 in the reach phase.
+    Lets the critic tell the (action-independent) reach-phase steps apart.
+
+    Shape: [num_envs, 1]
+    """
+    return grasp_phase_active(env).float().unsqueeze(-1)
+
+
+def reset_reach_grasp_phase(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
-    arm_cfg: SceneEntityCfg,
-    robot_body_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    offset_z: float,
-    palm_normal_axis: tuple[float, float, float],
+    robot_cfg: SceneEntityCfg,
+) -> None:
+    """mode="reset" event -- MUST come after the apple placement event
+    (randomize_tree), since it records the apple's freshly-placed pose as
+    this episode's pin pose.
+
+    Puts the env back into the reach phase and records the per-episode
+    bookkeeping every other grasp term reads:
+      _grasp_phase_active       -> False (reach phase)
+      _grasp_ever_closed        -> False (apple pinned until first closure)
+      _grasp_handoff_apple_pos/quat -> the pin pose; also the reference
+                                   apple_fell_from_grip / grasp_success's
+                                   lift check measure against
+      _grasp_handoff_joint_pos  -> placeholder until the real hand-off
+                                   (penalty_joint_deviation_from_handoff is
+                                   gated off until then anyway)
+    """
+    apple: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    device = env.device
+    ids = env_ids if isinstance(env_ids, torch.Tensor) else torch.as_tensor(env_ids, device=device, dtype=torch.long)
+
+    if not hasattr(env, "_grasp_phase_active"):
+        env._grasp_phase_active = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+        env._grasp_ever_closed = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+        env._reach_phase_hold_counter = torch.zeros(env.num_envs, device=device)
+        env._grasp_handoff_apple_pos = torch.zeros(env.num_envs, 3, device=device)
+        env._grasp_handoff_apple_quat = torch.zeros(env.num_envs, 4, device=device)
+        env._grasp_handoff_joint_pos = robot.data.joint_pos.clone()
+
+    env._grasp_phase_active[ids] = False
+    env._grasp_ever_closed[ids] = False
+    env._reach_phase_hold_counter[ids] = 0.0
+    # write_root_pose_to_sim updates the data buffers immediately, so this
+    # reads the pose randomize_tree_and_apple just wrote.
+    env._grasp_handoff_apple_pos[ids] = apple.data.root_pos_w[ids].clone()
+    env._grasp_handoff_apple_quat[ids] = apple.data.root_quat_w[ids].clone()
+    env._grasp_handoff_joint_pos[ids] = robot.data.joint_pos[ids].clone()
+
+
+def update_reach_grasp_phase(
+    env: "ManagerBasedRLEnv",
+    env_ids,
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    handoff_mode: str = "fixed",
+    handoff_time_s: float = 2.5,
+    offset_z: float = 0.0,
+    palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     pos_tol: float = 0.04,
     ori_tol_rad: float = 0.30,
     hold_time: float = 0.5,
-    watchdog_s: float = 2.0,
-    scale: float = 0.5,
-    clip_val: float = 3.0,
-    max_velocity: float = 2.0,
-    max_acceleration: float = 15.0,
-    policy_path: str = "",
 ) -> None:
-    """Run the frozen reach policy, live, for the just-reset env_ids, until
-    each converges to the grasp point (or its own per-env watchdog fires),
-    then hand control to the grasp trainee. Place this LAST in the grasp
-    task's EventsCfg, after apple placement, so it sees the apple at its
-    final randomized position for this episode.
+    """Every-step interval event: switch envs from the reach phase to the
+    grasp phase.
 
-    policy_path: explicit path to an exported reach policy.pt, or "" (the
-    default) to auto-resolve the latest AppleGrasp-v0 training run's export
-    the first time this fires (see _find_last_reach_policy) -- resolved
-    lazily at reset time, never at config-import time.
+    handoff_mode:
+      "fixed"     -- after exactly handoff_time_s of reach-policy control,
+                     whatever state it reached. Doesn't depend on the reach
+                     policy settling into a stable hold, which it was never
+                     trained to do past reach_success.
+      "converged" -- as soon as the palm has stayed inside the reach-success
+                     neighbourhood (pos_tol/ori_tol_rad, same test as the
+                     reach task's reach_success) for hold_time, with
+                     handoff_time_s as a watchdog.
 
-    scale/clip_val/max_velocity/max_acceleration MUST match the reach task's
-    OWN ActionsCfg.right_arm (apple_grasp_env_cfg.py) -- this reproduces
-    RateLimitedJointPositionAction.process_actions's exact affine + clip +
-    velocity/acceleration-clamp math locally (see envs/mdp/actions.py), so
-    the replayed trajectory matches what the reach policy actually learned
-    against.
+    Runs after the step's physics/terminations/rewards/resets and before
+    the observation, so the observation the trainee acts on next already
+    says "grasp phase". A just-reset env has episode_length_buf == 0 and so
+    never switches here.
     """
-    from .reach_rewards import _palm_target_dist, _palm_normal_angle
-
-    robot: Articulation = env.scene["robot"]
-    apple: RigidObject = env.scene[object_cfg.name]
-    device = env.device
-
-    ids = env_ids if isinstance(env_ids, torch.Tensor) else torch.as_tensor(
-        env_ids, device=device, dtype=torch.long
-    )
-    n = ids.numel()
-    if n == 0:
+    if not hasattr(env, "_grasp_phase_active"):
+        return
+    reaching = ~env._grasp_phase_active
+    if not reaching.any():
         return
 
-    arm_ids = arm_cfg.joint_ids
-    n_arm = len(arm_ids)
+    elapsed = env.episode_length_buf.float() * env.step_dt
+    switch = reaching & (elapsed >= handoff_time_s - 1e-6)
 
-    policy = _load_reach_policy(policy_path, device)
+    if handoff_mode == "converged":
+        from .reach_rewards import _palm_target_dist, _palm_normal_angle
 
-    default_pos = robot.data.default_joint_pos[ids][:, arm_ids].clone()
-    prev_target = robot.data.joint_pos[ids][:, arm_ids].clone()
-    prev_vel = torch.zeros(n, n_arm, device=device)
-    # Zero on the very first tick, mirroring mdp.last_action's zero-at-
-    # episode-start convention (the real reach env's first-ever observation
-    # after a reset genuinely sees zero last-action, since reset() computes
-    # obs_buf before any process_action() call).
-    prev_raw_action = torch.zeros(n, n_arm, device=device)
-    hold_counter = torch.zeros(n, device=device)
-    active = torch.ones(n, dtype=torch.bool, device=device)
+        d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+        theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
+        inside = (d < pos_tol) & (theta < ori_tol_rad)
+        env._reach_phase_hold_counter.copy_(torch.where(
+            inside & reaching, env._reach_phase_hold_counter + 1, torch.zeros_like(env._reach_phase_hold_counter)
+        ))
+        switch = switch | (reaching & (env._reach_phase_hold_counter >= max(1, round(hold_time / env.step_dt))))
+    elif handoff_mode != "fixed":
+        raise ValueError(f"handoff_mode must be 'fixed' or 'converged', got {handoff_mode!r}")
 
-    # Pin the apple for the WHOLE batch's autoplay window, released only
-    # once every env in THIS batch has converged/watchdogged -- releasing
-    # per-env immediately on convergence would expose an early-converged
-    # env's apple (open hand, no real grip yet) to gravity/drift while
-    # physics keeps stepping for its still-autoplaying batch-mates.
-    pinned_pose = torch.cat([apple.data.root_pos_w[ids], apple.data.root_quat_w[ids]], dim=-1)
-    zero_vel = torch.zeros(n, 6, device=device)
+    if not switch.any():
+        return
+    ids = switch.nonzero(as_tuple=True)[0]
+    robot: Articulation = env.scene[robot_cfg.name]
+    env._grasp_handoff_joint_pos[ids] = robot.data.joint_pos[ids].clone()
+    env._grasp_phase_active[ids] = True
 
-    dt = env.step_dt
-    max_ticks = max(1, math.ceil(watchdog_s / dt))
-    hold_steps_required = max(1, round(hold_time / dt))
 
-    for _tick in range(max_ticks):
-        obs = _reach_obs(env, ids, arm_cfg, robot_body_cfg, object_cfg, palm_local_offset, prev_raw_action)
-        with torch.inference_mode():
-            raw_action = policy(obs)
-        prev_raw_action = raw_action.clone()
+def update_first_closure(
+    env: "ManagerBasedRLEnv",
+    env_ids,
+    sensor_cfg: SceneEntityCfg,
+    contact_threshold: float = 0.5,
+    min_steps: int = 5,
+) -> None:
+    """Every-step interval event: latch env._grasp_ever_closed the first time
+    the TRAINEE achieves force closure this episode. Until then the apple
+    stays pinned ("still on the branch", see ReachHandoffJointPositionAction.
+    apply_actions), so the policy can establish a grip with no gravity/time
+    pressure; from then on gravity is real and apple_fell_from_grip /
+    grasp_success test whether the grip actually holds.
 
-        # -- RateLimitedJointPositionAction.process_actions, reproduced --
-        # offset+scale, then an ABSOLUTE clamp to [-clip_val, clip_val] (NOT
-        # relative to default_pos -- confirmed against Isaac Lab's own
-        # JointAction.process_actions: clip bounds are applied directly to
-        # the already-offset target).
-        target_desired = raw_action * scale + default_pos
-        target_desired = torch.clamp(target_desired, min=-clip_val, max=clip_val)
-
-        v_desired = (target_desired - prev_target) / dt
-        v_cmd = torch.clamp(v_desired, -max_velocity, max_velocity)
-        max_dv = max_acceleration * dt
-        v_cmd = torch.clamp(v_cmd, prev_vel - max_dv, prev_vel + max_dv)
-        target_cmd = prev_target + v_cmd * dt
-
-        # Rows that already converged/watchdogged just keep re-asserting
-        # their last command (a no-op hold) rather than continuing to move.
-        target_cmd = torch.where(active.unsqueeze(-1), target_cmd, prev_target)
-        v_cmd = torch.where(active.unsqueeze(-1), v_cmd, torch.zeros_like(v_cmd))
-
-        prev_target = target_cmd
-        prev_vel = v_cmd
-
-        robot.set_joint_position_target(target_cmd, joint_ids=arm_ids, env_ids=ids)
-
-        for _sub in range(env.cfg.decimation):
-            # Re-pin every substep, not once per tick -- gravity acts on the
-            # (always-dynamic) apple every substep between control ticks too.
-            apple.write_root_pose_to_sim(pinned_pose, env_ids=ids)
-            apple.write_root_velocity_to_sim(zero_vel, env_ids=ids)
-            env.scene.write_data_to_sim()
-            env.sim.step(render=False)
-            env.scene.update(dt=env.physics_dt)
-
-        # -- convergence check, same neighbourhood test reach_success uses --
-        d_all = _palm_target_dist(env, robot_body_cfg, object_cfg, offset_z, palm_local_offset)
-        theta_all = _palm_normal_angle(env, robot_body_cfg, palm_normal_axis)
-        d = d_all[ids]
-        theta = theta_all[ids]
-        in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
-
-        hold_counter = torch.where(in_neighbourhood, hold_counter + 1, torch.zeros_like(hold_counter))
-        newly_converged = hold_counter >= hold_steps_required
-        active = active & ~newly_converged
-
-        if not active.any():
-            break
-    # else: per-env watchdog -- any row still `active` here simply hands off
-    # anyway once max_ticks is exhausted, accepting an imperfect hand-off
-    # into grasp training rather than looping forever. Bounds worst-case
-    # per-reset cost and mirrors scripts/reach_apple_hybrid.py's own
-    # switch_dist/rl_max_time watchdog fallback.
-
-    # -- hand-off bookkeeping, read by terminations_and_events.grasp_success
-    #    and grasp_rewards' hold/success rewards --
-    if not hasattr(env, "_grasp_handoff_apple_pos"):
-        env._grasp_handoff_apple_pos = torch.zeros(env.num_envs, 3, device=device)
-    if not hasattr(env, "_grasp_handoff_apple_quat"):
-        env._grasp_handoff_apple_quat = torch.zeros(env.num_envs, 4, device=device)
-    if not hasattr(env, "_grasp_handoff_arm_pos"):
-        env._grasp_handoff_arm_pos = torch.zeros(env.num_envs, n_arm, device=device)
+    Closure must hold for min_steps consecutive control steps before the
+    apple is released, so a one-step contact blip while the fingers are
+    still moving can't drop it into a grip that doesn't exist yet.
+    """
     if not hasattr(env, "_grasp_ever_closed"):
-        env._grasp_ever_closed = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
-    env._grasp_handoff_apple_pos[ids] = apple.data.root_pos_w[ids].clone()
-    env._grasp_handoff_apple_quat[ids] = apple.data.root_quat_w[ids].clone()
-    env._grasp_handoff_arm_pos[ids] = robot.data.joint_pos[ids][:, arm_ids].clone()
-    # Fresh episode -> fresh "hasn't gripped it yet" state, read by
-    # hold_apple_until_first_closure below (must reset here, at the one
-    # point every new episode passes through, or the flag would incorrectly
-    # stay True forever after the first episode that ever closed).
-    env._grasp_ever_closed[ids] = False
+        return
+    from .grasp_rewards import _force_closure_ok
 
-    # No pin-release here: the apple stays supported ("still attached to the
-    # branch") for as long as it takes the grasp trainee to first achieve
-    # force closure on its own -- see hold_apple_until_first_closure below,
-    # a separate mode="interval" event that continues the SAME pin/hold
-    # mechanism into the trainee's own real, counted env.step() calls (this
-    # function's own pin can't do that -- it only runs once per reset,
-    # before the trainee is ever exposed to the environment). Deliberate:
-    # a real apple doesn't need to be "caught" while still on the branch --
-    # only once the policy has actually established a grip does gravity
-    # become the thing being tested.
+    closure_now = _force_closure_ok(env, sensor_cfg, contact_threshold=contact_threshold)
+    if not hasattr(env, "_closure_streak"):
+        env._closure_streak = torch.zeros(env.num_envs, device=env.device)
+    env._closure_streak.copy_(torch.where(
+        closure_now & env._grasp_phase_active, env._closure_streak + 1, torch.zeros_like(env._closure_streak)
+    ))
+    env._grasp_ever_closed |= env._closure_streak >= min_steps
+
+
+# ─────────────────────────────────────────────
+#  Action term
+# ─────────────────────────────────────────────
+
+class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
+    """RateLimitedJointPositionAction that is aware of the reach/grasp phase.
+
+    Reach phase: the trainee's actions for this term are ignored. If
+    cfg.drive_with_reach_policy, the frozen reach policy's action is used
+    instead (arm); otherwise the joints are held at their default pose
+    (hand -- the reach policy was trained with the hand never commanded,
+    i.e. sitting at its default open pose).
+
+    Grasp phase: the trainee drives. With cfg.anchor_to_handoff, its action
+    is an offset from the rate-limited target this term was commanding at
+    the moment of hand-off, instead of from the default pose -- otherwise a
+    zero action (where a fresh policy starts) would pull the arm straight
+    back toward its home pose, away from the apple.
+
+    Both phases go through the same velocity/acceleration limiter (same
+    math as the parent class), and the limiter state carries over the
+    switch, so the hand-off itself is smooth.
+
+    With cfg.pin_object set, this term also re-pins that object at
+    env._grasp_handoff_apple_pos every PHYSICS substep, for envs in the
+    reach phase or not yet in force closure. It lives here only because
+    action terms are the one per-substep hook ManagerBasedRLEnv offers;
+    once per control step would let gravity and palm contact move the apple
+    between pins, unlike the kinematic apple the reach policy trained on.
+    """
+
+    cfg: "ReachHandoffJointPositionActionCfg"
+
+    def __init__(self, cfg: "ReachHandoffJointPositionActionCfg", env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        n, j = self._processed_actions.shape
+        self._anchor = torch.zeros(n, j, device=self.device)
+        self._anchored = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self._reach_prev_raw = torch.zeros(n, j, device=self.device)
+
+        if cfg.drive_with_reach_policy:
+            # Resolved WITHOUT preserve_order, matching the reach task's own
+            # observation terms and this term's own joint ids.
+            self._reach_arm_cfg = SceneEntityCfg("robot", joint_names=cfg.joint_names)
+            self._reach_arm_cfg.resolve(env.scene)
+            self._palm_cfg = SceneEntityCfg("robot", body_names=[cfg.palm_body_name])
+            self._palm_cfg.resolve(env.scene)
+            self._apple_cfg = SceneEntityCfg(cfg.object_name)
+            self._apple_cfg.resolve(env.scene)
+
+    def process_actions(self, actions: torch.Tensor):
+        self._raw_actions[:] = actions
+        phase = grasp_phase_active(self._env).unsqueeze(-1)
+
+        # -- grasp-phase (trainee) target --
+        offset = self._offset
+        if self.cfg.anchor_to_handoff:
+            newly = grasp_phase_active(self._env) & ~self._anchored
+            if newly.any():
+                self._anchor[newly] = self._prev_target[newly]
+                self._anchored |= newly
+            offset = torch.where(self._anchored.unsqueeze(-1), self._anchor, self._offset)
+        trainee_target = self._raw_actions * self._scale + offset
+
+        # -- reach-phase target --
+        if self.cfg.drive_with_reach_policy and not bool(phase.all()):
+            policy = _load_reach_policy(self.cfg.reach_policy_path, self.device)
+            obs = _reach_obs(
+                self._env, self._reach_arm_cfg, self._palm_cfg, self._apple_cfg,
+                self.cfg.palm_local_offset, self._reach_prev_raw,
+            )
+            with torch.inference_mode():
+                reach_raw = policy(obs)
+            # In-place: rollouts run under inference_mode, and a reassigned
+            # inference tensor could not be reset in place outside it later.
+            self._reach_prev_raw.copy_(reach_raw)
+            reach_target = self._reach_prev_raw * self.cfg.reach_scale + self._offset
+        else:
+            reach_target = self._offset
+
+        target_desired = torch.where(phase, trainee_target, reach_target)
+        if self.cfg.clip is not None:
+            target_desired = torch.clamp(
+                target_desired, min=self._clip[:, :, 0], max=self._clip[:, :, 1]
+            )
+
+        # -- rate limiter: identical to RateLimitedJointPositionAction --
+        current_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        needs_reset = (self._env.episode_length_buf <= 1).unsqueeze(-1)
+        self._prev_target = torch.where(needs_reset, current_pos, self._prev_target)
+        self._prev_vel = torch.where(needs_reset, torch.zeros_like(self._prev_vel), self._prev_vel)
+
+        dt = self._env.step_dt
+        v_desired = (target_desired - self._prev_target) / dt
+        v_cmd = torch.clamp(v_desired, -self.cfg.max_velocity, self.cfg.max_velocity)
+        max_dv = self.cfg.max_acceleration * dt
+        v_cmd = torch.clamp(v_cmd, self._prev_vel - max_dv, self._prev_vel + max_dv)
+
+        target_cmd = self._prev_target + v_cmd * dt
+
+        self._prev_target = target_cmd
+        self._prev_vel = v_cmd
+        self._processed_actions = target_cmd
+
+    def apply_actions(self):
+        super().apply_actions()
+        if self.cfg.pin_object is None or not hasattr(self._env, "_grasp_ever_closed"):
+            return
+        pin = ~self._env._grasp_phase_active | ~self._env._grasp_ever_closed
+        if not pin.any():
+            return
+        ids = pin.nonzero(as_tuple=True)[0]
+        obj: RigidObject = self._env.scene[self.cfg.pin_object]
+        pose = torch.cat([self._env._grasp_handoff_apple_pos[ids], self._env._grasp_handoff_apple_quat[ids]], dim=-1)
+        obj.write_root_pose_to_sim(pose, env_ids=ids)
+        obj.write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=self.device), env_ids=ids)
+
+    def reset(self, env_ids=None) -> None:
+        super().reset(env_ids)
+        if env_ids is None:
+            env_ids = slice(None)
+        self._anchored[env_ids] = False
+        # Zero on the first tick, mirroring mdp.last_action's zero-at-
+        # episode-start convention in the reach task.
+        self._reach_prev_raw[env_ids] = 0.0
+
+
+@configclass
+class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
+    """Config for ReachHandoffJointPositionAction.
+
+    When drive_with_reach_policy is set, scale/clip/max_velocity/
+    max_acceleration apply to the reach policy's output too, so they MUST
+    match the reach task's own ActionsCfg.right_arm (apple_grasp_env_cfg.py)
+    -- except `scale`, which is the TRAINEE's scale; the reach policy's is
+    reach_scale.
+    """
+
+    class_type: type = ReachHandoffJointPositionAction
+
+    drive_with_reach_policy: bool = False
+    anchor_to_handoff: bool = False
+    reach_policy_path: str = PINNED_REACH_POLICY
+    reach_scale: float = 0.5
+    palm_body_name: str = "right_hand_palm_link"
+    palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    object_name: str = "apple"
+    pin_object: str | None = None

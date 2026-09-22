@@ -12,10 +12,19 @@ and takes a NEGATIVE weight.
 
 Ground-truth vs. observation split (deliberate, throughout this module):
 these are REWARD functions, so they read force straight from the
-ContactSensor (via _per_finger_group_force / _finger_contact_state) with NO
+ContactSensor (via _per_finger_group_force / apple_force_vec_per_link) with NO
 calibration gain applied — rewards are training-time-only and never
 deployed, so calibration-robustness doesn't apply to them. Only the tactile
 OBSERVATIONS in observations.py apply env._tactile_gain. Don't cross the two.
+
+Reach/grasp phase gating: every reward here is multiplied by
+_grasp_mask(env), i.e. exactly zero while the frozen reach policy is still
+driving (see grasp_autoplay.py's module docstring) -- the trainee's actions
+are ignored then, so it must not be credited or charged for anything.
+Gating lives inside each function rather than in a generic wrapper on
+purpose: Isaac Lab's Hydra round-trip re-resolves every term func from its
+"module:name" string, which would silently swap a functools.wraps wrapper
+back to the ungated original.
 """
 
 from __future__ import annotations
@@ -29,6 +38,12 @@ from isaaclab.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def _grasp_mask(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[N] float: 1.0 in the grasp phase, 0.0 while the reach policy drives."""
+    from .grasp_autoplay import grasp_phase_active
+    return grasp_phase_active(env).float()
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -70,109 +85,87 @@ def _per_finger_group_force(
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Force closure (Lynch & Park, 2017, Ch. 12) — cheap geometric proxy
+#  Grasp closure — palm-inclusive enclosure proxy
 # ═════════════════════════════════════════════════════════════════════════
 
-# Distal-most link per finger group, used as an approximate contact-point
-# LOCATION for the checks below. ContactSensor gives per-link FORCE, not
-# exact contact position, so this is a documented approximation, not
-# measured contact geometry.
+# Distal-most link per finger, used by reward_finger_approach as the
+# fingertip location.
 _FINGER_TIP_LINKS = {
     "thumb": "right_hand_thumb_2_link",
     "index": "right_hand_index_1_link",
     "middle": "right_hand_middle_1_link",
 }
 
-
-def _finger_contact_state(
-    env: "ManagerBasedRLEnv",
-    sensor_cfg: SceneEntityCfg,
-    robot_cfg: SceneEntityCfg,
-    contact_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-finger (thumb/index/middle) approximate contact point (world),
-    force vector (apple-filtered, ground truth), and in-contact mask.
-
-    Returns: (points [N,3,3], forces [N,3,3], in_contact [N,3])
-    """
-    from .observations import apple_force_vec_per_link
-
-    robot: Articulation = env.scene[robot_cfg.name]
-
-    if not hasattr(env, "_finger_tip_robot_ids"):
-        env._finger_tip_robot_ids = {
-            f: robot.data.body_names.index(link) for f, link in _FINGER_TIP_LINKS.items()
-        }
-
-    fingers = ("thumb", "index", "middle")
-
-    points = torch.stack(
-        [robot.data.body_pos_w[:, env._finger_tip_robot_ids[f], :] for f in fingers], dim=1
-    )  # [N, 3, 3]
-    forces = apple_force_vec_per_link(
-        env, sensor_cfg, [_FINGER_TIP_LINKS[f] for f in fingers]
-    )  # [N, 3, 3]
-    in_contact = torch.norm(forces, dim=-1) > contact_threshold  # [N, 3]
-    return points, forces, in_contact
+# Contact groups for the closure check: the palm plus EVERY segment of each
+# digit, not just the fingertips.
+_CLOSURE_GROUPS = {
+    "palm": ["right_hand_palm_link"],
+    "thumb": ["right_hand_thumb_0_link", "right_hand_thumb_1_link", "right_hand_thumb_2_link"],
+    "index": ["right_hand_index_0_link", "right_hand_index_1_link"],
+    "middle": ["right_hand_middle_0_link", "right_hand_middle_1_link"],
+}
 
 
 def _force_closure_ok(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,
-    robot_cfg: SceneEntityCfg,
-    object_cfg: SceneEntityCfg,
-    mu: float = 0.5,
-    contact_threshold: float = 0.05,
-    collinearity_eps: float = 1e-5,
+    contact_threshold: float = 0.5,
+    max_mean_push: float = 0.5,
 ) -> torch.Tensor:
-    """Cheap geometric proxy for 3-finger force closure: >=3 non-collinear
-    contacts, each contact force lying within its friction cone of the
-    (spherical-apple) surface normal at that point. A full wrench-cone/LP
-    feasibility test is more rigor than a per-step reward/termination needs.
+    """Is the hand ENCLOSING the apple right now: >= 3 contact groups
+    (_CLOSURE_GROUPS) each pressing with > contact_threshold N, AND those
+    pushes coming from opposing sides rather than all from one side.
 
-    Approximations documented, not hidden:
-    - contact "points" are the finger-tip LINK positions (_FINGER_TIP_LINKS),
-      not true measured contact locations (ContactSensor gives force, not
-      contact position).
-    - mu is an ASSUMED constant (0.5, a typical skin-on-fruit-skin order-of-
-      magnitude estimate) — no PhysX material is explicitly configured on
-      the apple in this scene to read a real coefficient from.
-    - the apple is a sphere (APPLE_RADIUS), so the surface normal at any
-      point is exactly the radial direction from the apple centre — exact
-      for this asset, not a general mesh-normal approximation.
+    "Opposing sides" is measured without any contact POSITIONS: d_g is the
+    unit push group g exerts ON the apple (the negated force on the hand
+    link, see _palmar_dorsal_force in reach_rewards for the sign
+    convention), and the check is ||mean_g d_g|| < max_mean_push. All
+    groups pushing from the same side gives ~1.0; palm underneath plus a
+    horizontal thumb-vs-fingers pinch gives ~0.33; a perfectly balanced
+    enclosure gives 0.
+
+    Replaces a fingertip-only friction-cone proxy (3 distal links in
+    contact, each force within atan(mu) of the radial through the link
+    ORIGIN). Driving every digit to every combination of its joint limits
+    from the reach hand-off pose never once got all three fingertips onto
+    the apple at the same time -- with the apple resting on the palm, the
+    Dex3's reachable grasp on an 8 cm fruit is a power grasp (palm + finger
+    segments + thumb), not a fingertip grasp -- so grasp_hold, grasp_success
+    and the apple's release from its pin could never fire. The same sweep
+    reaches this criterion for 100+ steps in several combinations. The
+    link-origin contact points were also a poor stand-in for real contact
+    locations (the palm link origin sits back near the wrist), which is why
+    this version uses force directions only.
 
     Shape: [num_envs] bool
     """
-    apple: RigidObject = env.scene[object_cfg.name]
-    points, forces, in_contact = _finger_contact_state(env, sensor_cfg, robot_cfg, contact_threshold)
+    mag, n_contact, mean_push = _closure_state(env, sensor_cfg, contact_threshold)
+    return (n_contact >= 3) & (mean_push < max_mean_push)
 
-    enough_contact = in_contact.sum(dim=-1) >= 3
 
-    apple_center = apple.data.root_pos_w.unsqueeze(1)  # [N, 1, 3]
-    radial = points - apple_center                      # [N, 3, 3]
-    normals = radial / (torch.norm(radial, dim=-1, keepdim=True) + 1e-6)
+def _closure_state(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    contact_threshold: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared by _force_closure_ok and reward_grasp_enclosure, so the hard
+    criterion and the reward that shapes toward it can never disagree.
 
-    # Non-collinearity: cross product of the two vectors spanning the 3
-    # contact points, thresholded away from zero.
-    v1 = points[:, 1, :] - points[:, 0, :]
-    v2 = points[:, 2, :] - points[:, 0, :]
-    cross = torch.cross(v1, v2, dim=-1)
-    non_collinear = torch.norm(cross, dim=-1) > collinearity_eps
+    Returns (per-group force magnitude [N, 4], number of groups in contact
+    [N], ||mean unit push on the apple|| [N]).
+    """
+    from .observations import apple_force_vec_per_link
 
-    # Friction-cone alignment per contact: angle between the measured force
-    # direction and the INWARD surface normal (-radial) must be <= atan(mu)
-    # (the standard Coulomb friction-cone half-angle). Only meaningful for
-    # contacts actually engaged; a non-contacting finger can't be part of a
-    # closed grasp, so it doesn't veto on angle alone but fails the overall
-    # "3 engaged and aligned" requirement via enough_contact instead.
-    force_dirs = forces / (torch.norm(forces, dim=-1, keepdim=True) + 1e-6)
-    cos_angle = (force_dirs * (-normals)).sum(dim=-1).clamp(-1.0, 1.0)  # [N, 3]
-    angle = torch.acos(cos_angle)
-    half_angle = math.atan(mu)
-    engaged_aligned = torch.where(in_contact, angle <= half_angle, torch.ones_like(angle, dtype=torch.bool))
-    all_engaged_aligned = engaged_aligned.all(dim=-1)
-
-    return enough_contact & non_collinear & all_engaged_aligned
+    force_on_hand = torch.stack(
+        [apple_force_vec_per_link(env, sensor_cfg, links).sum(dim=1) for links in _CLOSURE_GROUPS.values()],
+        dim=1,
+    )  # [N, 4, 3]
+    mag = torch.norm(force_on_hand, dim=-1)                    # [N, 4]
+    in_contact = mag > contact_threshold
+    n_contact = in_contact.sum(dim=-1)
+    push_on_apple = -force_on_hand / (mag.unsqueeze(-1) + 1e-6)
+    mean_push = (push_on_apple * in_contact.unsqueeze(-1)).sum(dim=1).norm(dim=-1) / n_contact.clamp(min=1)
+    return mag, n_contact, mean_push
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -201,7 +194,7 @@ def reward_grasp_balance(
     mean_f = per_finger.mean(dim=-1)
     cv = per_finger.std(dim=-1) / (mean_f + 1e-6)
     balance = torch.exp(-cv)
-    return balance * (n_contact / 3.0)
+    return balance * (n_contact / 3.0) * _grasp_mask(env)
 
 
 def reward_finger_approach(
@@ -233,7 +226,69 @@ def reward_finger_approach(
     )  # [N, 3, 3]
     dist = torch.norm(points - apple.data.root_pos_w.unsqueeze(1), dim=-1)  # [N, 3]
     mean_dist = dist.mean(dim=-1)
-    return torch.exp(-(mean_dist ** 2) / (2.0 * std ** 2))
+    return torch.exp(-(mean_dist ** 2) / (2.0 * std ** 2)) * _grasp_mask(env)
+
+
+def reward_gentle_contact_groups(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    good_min: float = 0.5,
+    good_max: float = 5.0,
+    decay: float = 5.0,
+) -> torch.Tensor:
+    """Mean over the 4 contact groups (palm/thumb/index/middle, see
+    _CLOSURE_GROUPS) of a trapezoid on that group's own contact force:
+    ramps 0 -> 1 over [0, good_min], stays 1 across the gentle band
+    [good_min, good_max], then decays back to 0 over `decay` N above it.
+
+    The grasp-phase counterpart of reach_rewards.reward_gentle_touch, and
+    added for the same reason it was there: it pays PER GROUP, so getting a
+    second and a third part of the hand onto the apple is rewarded
+    incrementally, instead of everything hinging on the all-or-nothing
+    closure test. Counting the palm as a group matters -- the apple rests
+    on it in the hand-off pose, so it is the one contact the policy starts
+    with and should not be taught to give up.
+
+    The decay above good_max is the anti-crush half: past the gentle band
+    squeezing harder pays LESS, a dense gradient the hard fruit_damaged
+    cutoff (and penalty_excess_hand_force, which only ramps near this
+    episode's damage threshold) can't provide. Motivated by the run where
+    the fingers learned to press hard enough to bruise the apple in 72% of
+    episodes while never once enclosing it.
+
+    Shape: [num_envs], in [0, 1]
+    """
+    mag, _, _ = _closure_state(env, sensor_cfg, contact_threshold=good_min)
+    ramp_up = (mag / good_min).clamp(max=1.0)
+    ramp_down = (1.0 - (mag - good_max) / decay).clamp(min=0.0, max=1.0)
+    return (ramp_up * ramp_down).mean(dim=-1) * _grasp_mask(env)
+
+
+def reward_grasp_enclosure(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    contact_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Continuous progress toward the closure criterion itself: how many
+    contact groups are engaged (capped at the 3 closure needs) TIMES how
+    much their pushes oppose each other (1 - ||mean unit push||).
+
+    _force_closure_ok is a step function -- 3 groups AND opposing -- so on
+    its own it gives a policy that has 2 groups on, or 3 groups all pushing
+    the same way, exactly zero gradient toward fixing either. This is that
+    gradient, and it is computed from the same _closure_state, so climbing
+    it leads to the real criterion rather than beside it.
+
+    One-sided contact (everything pushing the same way, e.g. all fingers
+    pressing down onto the palm) scores ~0 however hard it presses; a
+    thumb-vs-fingers pinch with the palm underneath scores ~0.67.
+
+    Shape: [num_envs], in [0, 1]
+    """
+    _, n_contact, mean_push = _closure_state(env, sensor_cfg, contact_threshold)
+    contact_frac = (n_contact.float() / 3.0).clamp(max=1.0)
+    opposition = (1.0 - mean_push).clamp(min=0.0)
+    return contact_frac * opposition * _grasp_mask(env)
 
 
 def reward_grasp_setpoint_tracking(
@@ -269,16 +324,13 @@ def reward_grasp_setpoint_tracking(
     if not hasattr(env, "_target_grip_level"):
         return torch.zeros(env.num_envs, device=env.device)
     err = level - env._target_grip_level
-    return torch.exp(-(err ** 2) / (2.0 * std ** 2)) * has_contact
+    return torch.exp(-(err ** 2) / (2.0 * std ** 2)) * has_contact * _grasp_mask(env)
 
 
 def reward_grasp_hold(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,
-    robot_cfg: SceneEntityCfg,
-    object_cfg: SceneEntityCfg,
-    mu: float = 0.5,
-    contact_threshold: float = 0.05,
+    contact_threshold: float = 0.5,
 ) -> torch.Tensor:
     """Per-step bonus (0 or 1) for being in force closure right now — reads
     the SAME cache terminations_and_events.grasp_success computes
@@ -290,10 +342,8 @@ def reward_grasp_hold(
     already rely on).
     """
     if hasattr(env, "_force_closure_ok"):
-        return env._force_closure_ok.float()
-    return _force_closure_ok(
-        env, sensor_cfg, robot_cfg, object_cfg, mu=mu, contact_threshold=contact_threshold
-    ).float()
+        return env._force_closure_ok.float() * _grasp_mask(env)
+    return _force_closure_ok(env, sensor_cfg, contact_threshold=contact_threshold).float() * _grasp_mask(env)
 
 
 def reward_grasp_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
@@ -308,13 +358,61 @@ def reward_grasp_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return env._grasp_success.float()
 
 
+def penalty_excess_hand_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    start_frac: float = 0.6,
+    cap_frac: float = 0.9,
+) -> torch.Tensor:
+    """Quadratically-growing penalty for finger-group contact force
+    approaching THIS EPISODE's own randomized bio-damage threshold
+    (env._fruit_damage_force) -- scaled per-episode rather than a fixed N
+    band, because the commanded grip setpoint (env._target_grip_level)
+    legitimately ranges anywhere from ~1 N up to just under that threshold
+    (domain_randomization.randomize_fruit_damage_force), and a fixed cap
+    would fight grasp_setpoint_tracking on high-target episodes.
+
+    Zero below start_frac * threshold, grows to 1.0 (times RewardsCfg's
+    weight) at cap_frac * threshold, clamped beyond -- same "capped, not
+    unbounded" reasoning as reach_rewards.penalty_excess_palm_force (an
+    unclamped penalty on a rare, huge outlier teaches outright avoidance,
+    not "be gentler").
+
+    Added after the first real grasp-phase training run: with NO force
+    shaping between "gentle" and terminations_and_events.fruit_damaged's
+    hard, instantaneous cutoff, an empirical trace of the resulting policy
+    showed 21-76 N transient spikes on first finger contact, and
+    fruit_damaged fired in 93.75% of episodes at a median of 11 control
+    steps (0.22 s) into the grasp phase -- so close to the hand-off that
+    grasp_hold/grasp_success never once registered nonzero across 1407
+    iterations. fruit_damaged's own hard-cutoff design is intentional
+    (bio-yield is a near-instantaneous threshold effect, not something to
+    average -- see its own docstring), so this doesn't touch that; it adds
+    the missing DENSE, WITHIN-episode gradient toward backing off before
+    the cutoff, mirroring how the reach phase solved the identical problem
+    for the palm rather than relying solely on "the episode ended early"
+    (a sparse, delayed signal PPO had 1407 iterations to learn nothing
+    from).
+    """
+    if not hasattr(env, "_fruit_damage_force"):
+        return torch.zeros(env.num_envs, device=env.device)
+    force = _per_finger_group_force(env, sensor_cfg).max(dim=-1).values
+    threshold = env._fruit_damage_force
+    start = start_frac * threshold
+    span = (cap_frac - start_frac) * threshold
+    excess = (force - start).clamp(min=0.0)
+    excess = torch.minimum(excess, span)
+    return ((excess / span) ** 2) * _grasp_mask(env)
+
+
 def penalty_joint_deviation_from_handoff(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg,
     weights: Sequence[float],
 ) -> torch.Tensor:
     """Weighted ||q - q_handoff||^2, where q_handoff is the ARM pose the
-    reach-autoplay hand-off left it at (env._grasp_handoff_arm_pos) — NOT the
+    reach phase left it at (env._grasp_handoff_joint_pos, a full-articulation
+    snapshot indexed by asset_cfg.joint_ids) — NOT the
     articulation's default/parked pose, unlike reach_rewards.
     penalty_joint_deviation_weighted. The reach-converged pose near the apple
     is the right reference here.
@@ -326,12 +424,12 @@ def penalty_joint_deviation_from_handoff(
     any per-joint-weight reward in this codebase). Zero before the first
     hand-off has ever run (defensive only).
     """
-    if not hasattr(env, "_grasp_handoff_arm_pos"):
+    if not hasattr(env, "_grasp_handoff_joint_pos"):
         return torch.zeros(env.num_envs, device=env.device)
     asset: Articulation = env.scene[asset_cfg.name]
-    dev = asset.data.joint_pos[:, asset_cfg.joint_ids] - env._grasp_handoff_arm_pos
+    dev = asset.data.joint_pos[:, asset_cfg.joint_ids] - env._grasp_handoff_joint_pos[:, asset_cfg.joint_ids]
     w = torch.tensor(weights, device=env.device, dtype=dev.dtype)
-    return (w * dev ** 2).sum(dim=-1)
+    return (w * dev ** 2).sum(dim=-1) * _grasp_mask(env)
 
 
 def hand_motion_monitor(
@@ -355,7 +453,7 @@ def hand_motion_monitor(
     """
     asset: Articulation = env.scene[asset_cfg.name]
     dq = asset.data.joint_vel[:, asset_cfg.joint_ids]
-    return dq.abs().mean(dim=-1)
+    return dq.abs().mean(dim=-1) * _grasp_mask(env)
 
 
 def penalty_action_rate_weighted(
@@ -381,4 +479,23 @@ def penalty_action_rate_weighted(
         return torch.zeros(env.num_envs, device=env.device)
     w = torch.tensor(weights, device=env.device, dtype=curr.dtype)
     delta = curr - prev
-    return (w * delta ** 2).sum(dim=-1)
+    # Only once BOTH actions are the trainee's own: on the first grasp step
+    # `prev` is an ignored reach-phase action, so the difference means
+    # nothing. prev_mask is last step's phase, cached here each call.
+    mask = _grasp_mask(env)
+    prev_mask = getattr(env, "_action_rate_prev_mask", None)
+    if prev_mask is None or prev_mask.shape != mask.shape:
+        prev_mask = torch.zeros_like(mask)
+    both = mask * prev_mask * (env.episode_length_buf > 1).float()
+    env._action_rate_prev_mask = mask.clone()
+    return (w * delta ** 2).sum(dim=-1) * both
+
+
+def penalty_joint_pos_limits(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Isaac Lab's mdp.joint_pos_limits, gated to the grasp phase (the reach
+    policy's own joint-limit excursions aren't the trainee's doing)."""
+    import isaaclab.envs.mdp as mdp
+    return mdp.joint_pos_limits(env, asset_cfg) * _grasp_mask(env)

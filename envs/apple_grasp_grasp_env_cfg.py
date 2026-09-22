@@ -15,9 +15,10 @@ grasp phase genuinely needs to differ:
 
   - Apple: a REAL dynamic RigidObject (kinematic_enabled=False) instead of
     the reach phase's kinematic/teleported apple -- grasp physics (lift,
-    drop, contact force) require it. Pinned in place during reach-autoplay
-    (see envs/mdp/grasp_autoplay.py) via repeated tensor-API pose/velocity
-    writes, NOT a runtime kinematic-flag toggle (Isaac Lab's kinematic_
+    drop, contact force) require it. Pinned in place during the reach phase
+    and until the trainee's first force closure (see envs/mdp/
+    grasp_autoplay.py) via per-substep tensor-API pose/velocity writes,
+    NOT a runtime kinematic-flag toggle (Isaac Lab's kinematic_
     enabled is a USD/PhysX schema attribute with no tensor-API setter) and
     NOT a PhysX FixedJoint (apple_grasp_env_cfg.py already documents a known
     GPU-multi-env-replication bug with that approach) -- sidestepped
@@ -30,12 +31,15 @@ grasp phase genuinely needs to differ:
     than distal (wrist/hand) motion, so the policy learns to mostly use
     fingers/wrist and only lightly correct with the arm.
 
-  - Each episode starts with the FROZEN, already-trained reach policy
-    actually driving the arm from its own reset pose to the apple (real
-    chained rollout, not a fabricated "post-reach" start pose) -- see
-    envs/mdp/grasp_autoplay.py::reach_autoplay_handoff, the last event in
-    EventsCfg below. Reliability mitigation: this task's own apple-placement
-    randomization (GRASP_TRAIN_REACH_*) is NARROWER than the reach task's
+  - Each episode starts with a REACH phase: the FROZEN, already-trained
+    reach policy (pinned copy, see grasp_autoplay.PINNED_REACH_POLICY)
+    drives the arm from its own reset pose to the apple inside the episode
+    (real chained rollout, not a fabricated "post-reach" start pose), the
+    trainee's actions are ignored and every grasp reward/termination is
+    gated off; then control hands off to the trainee (REACH_HANDOFF_* below,
+    envs/mdp/grasp_autoplay.py's module docstring for why this is in-episode
+    rather than a reset event). Reliability mitigation: this task's own
+    apple-placement randomization (GRASP_TRAIN_REACH_*) is NARROWER than the reach task's
     own training range, so hand-off is reliable rather than a stress test of
     reach robustness.
 
@@ -126,6 +130,19 @@ GRASP_TRAIN_REACH_MAX = 0.40
 GRASP_TRAIN_REACH_AZIMUTH_CENTER_DEG = -45.0
 GRASP_TRAIN_REACH_AZIMUTH_SPAN_DEG = 40.0
 
+# Reach -> grasp hand-off (see grasp_autoplay.update_reach_grasp_phase).
+# "fixed": the reach policy gets exactly REACH_HANDOFF_TIME_S, then the
+# trainee takes over wherever the arm is -- doesn't depend on the reach
+# policy settling into a stable hold (it was trained to terminate at
+# reach_success, never to hold past it). "converged": hand off as soon as
+# the palm holds the reach-success neighbourhood for 0.5 s, with
+# REACH_HANDOFF_TIME_S as the watchdog.
+REACH_HANDOFF_MODE = "fixed"
+REACH_HANDOFF_TIME_S = 2.5
+# Trainee's own control window after the hand-off (in "fixed" mode; longer
+# in "converged" mode whenever the reach phase ends early).
+GRASP_WINDOW_S = 5.0
+
 # Literature-grounded per-episode bruising-force range (Li et al., 2026: Red
 # Fuji apple 24.33-26.38 N; broader pome-fruit literature 20-40 N) -- see
 # domain_randomization.randomize_fruit_damage_force's own docstring for the
@@ -184,22 +201,48 @@ class AppleGraspGraspSceneCfg(AppleGraspSceneCfg):
 
 @configclass
 class ActionsCfg:
-    """14-dim joint position targets: right arm (7) + right Dex3 hand (7)."""
+    """14-dim joint position targets: right arm (7) + right Dex3 hand (7).
 
-    right_arm: task_mdp.RateLimitedJointPositionActionCfg = task_mdp.RateLimitedJointPositionActionCfg(
+    Both are phase-aware (grasp_autoplay.ReachHandoffJointPositionAction):
+    during the reach phase the arm is driven by the frozen reach policy and
+    the hand held at its default open pose, whatever the trainee outputs.
+    """
+
+    # clip/max_velocity/max_acceleration (and reach_scale) apply to the
+    # reach policy's output during the reach phase too, so they MUST keep
+    # matching apple_grasp_env_cfg.ActionsCfg.right_arm. After the hand-off
+    # the trainee's actions are offsets from the hand-off target
+    # (anchor_to_handoff), so a zero action holds the pose the reach policy
+    # left -- with a default-pose offset, a fresh policy's ~zero actions
+    # pulled the arm back toward home, away from the apple.
+    #
+    # scale (the TRAINEE's, 0.5 -> 0.05 rad per unit action): at 0.5, PPO's
+    # exploration noise alone moved arm targets by ~0.5 rad, driving the
+    # palm ~2.5 cm into the pinned apple within ~10 steps of every hand-off.
+    # A 4-group ablation of a trained policy showed the arm, not the hand,
+    # caused every fruit_damaged termination (arm zeroed: 0/16 damaged,
+    # hand zeroed: 16/16), and pure N(0, 0.8) exploration noise damaged
+    # 10/16 at 0.5 vs 0/16 at <= 0.1. 0.05 keeps the arm a light correction,
+    # as intended; the reach phase is unaffected (it uses reach_scale).
+    right_arm: ga.ReachHandoffJointPositionActionCfg = ga.ReachHandoffJointPositionActionCfg(
         asset_name="robot",
         joint_names=RIGHT_ARM_JOINTS,
-        scale=0.5,
+        scale=0.05,
         use_default_offset=True,
         clip={".*": (-3.0, 3.0)},
         max_velocity=2.0,
         max_acceleration=15.0,
+        drive_with_reach_policy=True,
+        anchor_to_handoff=True,
+        reach_scale=0.5,
+        palm_local_offset=PALM_LOCAL_OFFSET,
+        pin_object="apple",
     )
     # Weaker actuator than the arm (effort_limit=2.0 vs 87.0), so a smaller
     # scale and lower rate limits -- starting guesses, not measured/validated
     # like the arm's own (see RateLimitedJointPositionActionCfg's docstring
     # for the arm's real-hardware-grounded numbers); retune from training.
-    right_hand: task_mdp.RateLimitedJointPositionActionCfg = task_mdp.RateLimitedJointPositionActionCfg(
+    right_hand: ga.ReachHandoffJointPositionActionCfg = ga.ReachHandoffJointPositionActionCfg(
         asset_name="robot",
         joint_names=RIGHT_HAND_JOINTS,
         scale=0.3,
@@ -273,6 +316,11 @@ class ObservationsCfg:
         # a locomotion policy).
         target_grip_level = ObsTerm(func=task_mdp.target_grip_level)
 
+        # 0 while the frozen reach policy drives (trainee actions ignored,
+        # all rewards gated to 0), 1 after the hand-off -- without it the
+        # critic can't tell the two apart from the rest of the state.
+        grasp_phase = ObsTerm(func=ga.grasp_phase_obs)
+
         last_action = ObsTerm(func=mdp.last_action)  # action_name=None -> full 14-dim vector
 
         def __post_init__(self):
@@ -283,7 +331,8 @@ class ObservationsCfg:
 
 @configclass
 class RewardsCfg:
-    """Grasp-phase reward set.
+    """Grasp-phase reward set. Every term is gated to exactly 0 during the
+    reach phase (see grasp_rewards.py's module docstring).
 
     Deliberately NOT the reach phase's position/orientation-reaching terms
     (reach_progress, reach_coarse/fine, palm_up, hold, reach_success_bonus)
@@ -314,6 +363,37 @@ class RewardsCfg:
         weight=4.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
+    # Per-contact-group stepping stones toward the closure criterion, added
+    # after a run where episodes survived and the fingers learned to press
+    # (fruit_damaged 0 -> 72%) but grasp_hold stayed at exactly 0: the
+    # policy was pressing HARD from ONE side, which the old term set paid
+    # for (setpoint_tracking/balance both read force magnitude only) and
+    # nothing pulled it toward opposing contacts or gentleness.
+    #
+    # gentle_contact_groups: pays per group (palm/thumb/index/middle) for
+    # force inside the gentle band, and DECAYS above it -- the dense
+    # anti-crush gradient fruit_damaged's hard cutoff can't give.
+    # grasp_enclosure: continuous version of _force_closure_ok (groups
+    # engaged x how much their pushes oppose), so "2 groups on" or "3
+    # groups all pushing one way" finally has a gradient out.
+    # Weights are in the same range as the reach phase's gentle_touch_palm
+    # (4.0); retune from the curves.
+    gentle_contact_groups = RewTerm(
+        func=gr.reward_gentle_contact_groups,
+        weight=3.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "good_min": 0.5,
+            "good_max": 5.0,
+            "decay": 5.0,
+        },
+    )
+    grasp_enclosure = RewTerm(
+        func=gr.reward_grasp_enclosure,
+        weight=3.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
+
     grasp_balance = RewTerm(
         func=gr.reward_grasp_balance,
         weight=2.0,
@@ -322,14 +402,26 @@ class RewardsCfg:
     grasp_hold = RewTerm(
         func=gr.reward_grasp_hold,
         weight=3.0,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces"),
-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
-            "object_cfg": SceneEntityCfg("apple"),
-            "mu": GRIP_FRICTION_MU,
-        },
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
     grasp_success_bonus = RewTerm(func=gr.reward_grasp_success, weight=95.0)
+
+    # Dense, within-episode gradient toward backing off BEFORE
+    # terminations_and_events.fruit_damaged's hard, instantaneous cutoff --
+    # added after the first real training run showed 21-76 N spikes on
+    # first contact and fruit_damaged firing in 93.75% of episodes at a
+    # median of just 11 control steps (0.22s) into the grasp phase, so
+    # close to hand-off that grasp_hold/grasp_success never once fired
+    # across 1407 iterations. See penalty_excess_hand_force's own docstring
+    # for the full diagnosis and why this scales to each episode's own
+    # randomized damage threshold instead of a fixed N band. Weight -2.0
+    # matches reach_rewards.penalty_excess_palm_force's precedent for the
+    # same shape of penalty; retune from the training curve.
+    excess_hand_force = RewTerm(
+        func=gr.penalty_excess_hand_force,
+        weight=-2.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
 
     # ── Action-space discipline: mostly fingers/wrist, arm as a light
     #    correction only. Weight order MUST match ActionsCfg's concatenation
@@ -348,8 +440,8 @@ class RewardsCfg:
     # dominate. Revisit upward once grasping is actually being learned.
     action_rate_weighted = RewTerm(
         func=gr.penalty_action_rate_weighted,
-        weight=-0.15,
-        params={"weights": [10.0, 10.0, 10.0, 10.0, 1.0, 1.0, 1.0,
+        weight=-0.25,
+        params={"weights": [10.0, 10.0, 10.0, 10.0, 3.0, 3.0, 3.0,
                              1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]},
     )
     posture_from_handoff = RewTerm(
@@ -363,12 +455,12 @@ class RewardsCfg:
 
     # ── Joint-limit safety, both arm and hand ─────────────────────────────
     arm_joint_limits = RewTerm(
-        func=mdp.joint_pos_limits,
+        func=gr.penalty_joint_pos_limits,
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS, preserve_order=True)},
     )
     hand_joint_limits = RewTerm(
-        func=mdp.joint_pos_limits,
+        func=gr.penalty_joint_pos_limits,
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_HAND_JOINTS, preserve_order=True)},
     )
@@ -424,11 +516,9 @@ class TerminationsCfg:
         func=task_mdp.grasp_success,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "hold_time": 0.5,
             "lift_margin": 0.03,
-            "mu": GRIP_FRICTION_MU,
         },
     )
 
@@ -437,12 +527,9 @@ class TerminationsCfg:
 class EventsCfg:
     """Event terms run in DECLARATION ORDER within a mode.
 
-    reach_autoplay_handoff MUST be last among the "reset" events -- it needs
-    the apple already placed at its final randomized position (randomize_tree)
-    and the per-episode damage-force/grip-setpoint already sampled
-    (randomize_fruit_damage_force isn't actually read by autoplay itself, but
-    keeping all per-episode sampling before the hand-off keeps the ordering
-    easy to reason about).
+    reset_reach_grasp_phase MUST come after randomize_tree among the
+    "reset" events -- it records the freshly placed apple pose as this
+    episode's pin pose. Kept last so all per-episode sampling happens first.
     """
 
     # ── Fixed once per env, before the GPU tensor views exist (raw USD
@@ -528,56 +615,44 @@ class EventsCfg:
         },
     )
 
-    # ── Reach -> grasp hand-off (MUST be last among "reset" events) ───────
-    reach_autoplay_handoff = EventTerm(
-        func=ga.reach_autoplay_handoff,
+    # ── Reach -> grasp phase bookkeeping (MUST be last among "reset") ────
+    reset_reach_grasp_phase = EventTerm(
+        func=ga.reset_reach_grasp_phase,
         mode="reset",
         params={
-            "arm_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS, preserve_order=True),
-            "robot_body_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
+            "robot_cfg": SceneEntityCfg("robot"),
+        },
+    )
+
+    # ── Every control step (interval_range_s=(0.0, 0.0) makes Isaac Lab's
+    #    EventManager fire these for every env, every step, after resets and
+    #    before the observation). Declaration order matters: first-closure
+    #    is latched before the phase switch, so a closure the reach policy
+    #    happens to cause on its last step never counts for the trainee. ──
+    update_first_closure = EventTerm(
+        func=ga.update_first_closure,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={"sensor_cfg": SceneEntityCfg("contact_forces"), "min_steps": 5},
+    )
+    update_reach_grasp_phase = EventTerm(
+        func=ga.update_reach_grasp_phase,
+        mode="interval",
+        interval_range_s=(0.0, 0.0),
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "object_cfg": SceneEntityCfg("apple"),
+            "handoff_mode": REACH_HANDOFF_MODE,
+            "handoff_time_s": REACH_HANDOFF_TIME_S,
+            # Only used in "converged" mode -- same neighbourhood as the
+            # reach task's own reach_success termination.
             "offset_z": GRASP_OFFSET_Z,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": PALM_LOCAL_OFFSET,
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
             "hold_time": 0.5,
-            # Tightened from 2.0s -- caps the worst-case per-reset-batch cost
-            # (the whole batch's autoplay loop runs until its SLOWEST env
-            # converges or watchdogs, so this bounds a real, measured
-            # training-throughput cost, not just a per-env nicety). The
-            # narrowed GRASP_TRAIN_REACH_* range was chosen specifically for
-            # reliable/fast convergence, so this should rarely be hit in the
-            # common case.
-            "watchdog_s": 1.2,
-            "scale": 0.5,
-            "clip_val": 3.0,
-            "max_velocity": 2.0,
-            "max_acceleration": 15.0,
-            # policy_path left at "" (auto-resolve latest AppleGrasp-v0
-            # export) -- override via env var DEX3_RL_BASE_DIR if the repo
-            # root differs from grasp_autoplay.py's default, or pass an
-            # explicit path here to pin a specific reach checkpoint.
-        },
-    )
-
-    # ── Keep the apple "attached" until the policy first grips it ─────────
-    # mode="interval" with interval_range_s=(0.0, 0.0) fires every single
-    # control step, for every env -- the function itself decides per-env
-    # whether to actually re-pin, based on env._grasp_ever_closed. Continues
-    # reach_autoplay_handoff's own pin into the trainee's real, counted
-    # env.step() calls: no gravity/time pressure while the policy is still
-    # working on establishing a grip; apple_fell_from_grip/grasp_success
-    # only become meaningful the moment closure is first achieved.
-    hold_apple_until_first_closure = EventTerm(
-        func=ga.hold_apple_until_first_closure,
-        mode="interval",
-        interval_range_s=(0.0, 0.0),
-        params={
-            "object_cfg": SceneEntityCfg("apple"),
-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
-            "sensor_cfg": SceneEntityCfg("contact_forces"),
-            "mu": GRIP_FRICTION_MU,
         },
     )
 
@@ -589,10 +664,10 @@ class EventsCfg:
 @configclass
 class AppleGraspGraspEnvCfg(ManagerBasedRLEnvCfg):
     """Grasp-phase env: dynamic apple, 14-dim action, tactile observations,
-    reach-autoplay hand-off every episode."""
+    in-episode reach phase + hand-off every episode."""
 
     scene: AppleGraspGraspSceneCfg = AppleGraspGraspSceneCfg(
-        num_envs=64,
+        num_envs=32,
         env_spacing=2.5,
     )
     observations: ObservationsCfg = ObservationsCfg()
@@ -604,12 +679,9 @@ class AppleGraspGraspEnvCfg(ManagerBasedRLEnvCfg):
     def __post_init__(self):
         self.sim.dt = 0.005
         self.decimation = 4
-        # Longer than the reach phase's 5.0s: reach-autoplay adds a (bounded,
-        # per-reset) overhead on top of the grasp policy's own control
-        # window, so a longer episode keeps that overhead a smaller fraction
-        # of each env's lifetime. Retune from measured iterations/sec (see
-        # the plan's verification step 3) before trusting this number.
-        self.episode_length_s = 7.0
+        # The reach phase is now part of the episode, so the time limit
+        # covers both it and the trainee's own window.
+        self.episode_length_s = REACH_HANDOFF_TIME_S + GRASP_WINDOW_S
         self.sim.render_interval = self.decimation
 
         self.scene.head_camera = None
