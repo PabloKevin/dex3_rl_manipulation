@@ -431,3 +431,27 @@ def randomize_tree_and_apple(
     apple.write_root_state_to_sim(root_state, env_ids=env_ids)
 
     env._stem_anchor_pos[env_ids] = env_origins + apple_pos_local
+
+def randomize_closure_threshold(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor,
+    thresh_scale_range: tuple[float, float] = (0.6, 1.6),
+) -> None:
+    """Per-episode scale on the grip detector's contact threshold
+    (grasp_rewards._closure_state).
+
+    Models the one real uncertainty left in that detector: the
+    pressure-to-newton calibration of the Dex3-1 pads, which
+    scripts/tactile_layout.py openly flags as an unverified placeholder
+    (SIM_FORCE_TO_RAW_GAIN). Scaling it per episode stops the policy
+    depending on a grip being declared at one exact force, the way it would
+    if the threshold were a constant it could memorise.
+
+    Episode-level on purpose: a calibration is unknown across robots but
+    stable within a grasp -- a detector that flickers step to step is a
+    different (and worse) problem, not this one.
+    """
+    if not hasattr(env, "_closure_thresh_scale"):
+        env._closure_thresh_scale = torch.ones(env.num_envs, device=env.device)
+    lo, hi = thresh_scale_range
+    env._closure_thresh_scale[env_ids] = torch.empty(len(env_ids), device=env.device).uniform_(lo, hi)

@@ -155,6 +155,17 @@ FRUIT_DAMAGE_APPLE_WEIGHT_PCT = 0.6
 APPLE_MASS_NOMINAL = 0.15   # matches apple_grasp_env_cfg.py's _jitter(0.15) nominal
 GRIP_FRICTION_MU = 0.5      # assumed -- no PhysX material explicitly configured on the apple
 
+# The hand's GRASP POCKET: where the fruit centre sits, in right_hand_palm_
+# link's own frame, when the hand is actually holding it. MEASURED, not
+# chosen: across every scripted curl combination that both latched a grip
+# and still held the apple 1 s after the stem released, the centre landed
+# here to within 4-6 mm (n=45). For reference the reach hand-off leaves the
+# apple at roughly (0.080, 0.055, 0.000) -- about 3.3 cm off along the
+# palm's lateral axis, which is the gap RewardsCfg.apple_centered exists to
+# close. Re-measure (scripted power grasps, apple pose in palm frame 1 s
+# after latch) if the hand, the fruit radius or PALM_LOCAL_OFFSET change.
+GRASP_CENTER_LOCAL = (0.066, 0.054, 0.033)
+
 
 # ─────────────────────────────────────────────
 #  SCENE: dynamic apple override
@@ -237,6 +248,11 @@ class ActionsCfg:
         reach_scale=0.5,
         palm_local_offset=PALM_LOCAL_OFFSET,
         pin_object="apple",
+        # Arm frozen at the hand-off pose until the fingers have a grip --
+        # see the action class for the measurements behind this. Until then
+        # this task is "close the fingers on an apple the stem is holding";
+        # after, the arm is free for the lift grasp_success requires.
+        unlock_with_grip=True,
     )
     # Weaker actuator than the arm (effort_limit=2.0 vs 87.0), so a smaller
     # scale and lower rate limits -- starting guesses, not measured/validated
@@ -280,14 +296,6 @@ class ObservationsCfg:
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_HAND_JOINTS, preserve_order=True)},
         )
 
-        apple_pos_palm = ObsTerm(
-            func=task_mdp.object_pos_relative_to_body,
-            params={
-                "object_cfg": SceneEntityCfg("apple"),
-                "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
-                "local_offset": PALM_LOCAL_OFFSET,
-            },
-        )
         palm_orientation_torso = ObsTerm(
             func=task_mdp.body_quat_relative_to_body,
             params={
@@ -320,6 +328,34 @@ class ObservationsCfg:
         # all rewards gated to 0), 1 after the hand-off -- without it the
         # critic can't tell the two apart from the rest of the state.
         grasp_phase = ObsTerm(func=ga.grasp_phase_obs)
+
+        # 1.0 once the fingers have a grip: the apple is off the stem and
+        # the arm is unlocked. Both of those change what the policy's own
+        # actions do, so it has to be observable.
+        grip_established = ObsTerm(func=ga.grip_established_obs)
+
+        # Fruit position in the PALM's own rotating frame, relative to the
+        # grasp pocket -- exactly what RewardsCfg.apple_centered scores, so
+        # the policy can see the error it is paid to close.
+        #
+        # This REPLACES the reach task's apple_pos_palm (kept there, and in
+        # grasp_autoplay._reach_obs, because that policy is frozen), which
+        # is the same difference vector expressed in WORLD axes. That form
+        # is only reproducible off-line because this task pins the base with
+        # identity rotation (fix_root_link, no init rot), which makes world
+        # axes and pelvis axes coincide -- a real robot would have to know
+        # its base orientation and would break the moment the pelvis yawed
+        # or tilted. Anchoring to the palm needs no such assumption: FK from
+        # the joint encoders plus the fruit pose from perception, both of
+        # which the robot has. Same dimensionality, so this costs nothing.
+        apple_pos_pocket = ObsTerm(
+            func=task_mdp.object_pos_in_body_frame,
+            params={
+                "object_cfg": SceneEntityCfg("apple"),
+                "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+                "ref_local": GRASP_CENTER_LOCAL,
+            },
+        )
 
         last_action = ObsTerm(func=mdp.last_action)  # action_name=None -> full 14-dim vector
 
@@ -358,6 +394,29 @@ class RewardsCfg:
             "std": 0.05,
         },
     )
+    # "Is the apple in the middle of the hand." The reward set had nothing
+    # asking for this: finger_approach averages fingertip distances (one
+    # close finger hides two far ones) and grasp_balance only pays once all
+    # three fingers already touch -- both satisfied by the observed failure
+    # pose, the apple caught on the index alone while middle and thumb close
+    # on nothing. See reward_apple_centered for the measurement behind
+    # GRASP_CENTER_LOCAL.
+    apple_centered = RewTerm(
+        func=gr.reward_apple_centered,
+        weight=4.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "object_cfg": SceneEntityCfg("apple"),
+            "center_local": GRASP_CENTER_LOCAL,
+            # 0.02 m: the hand-off leaves the fruit ~3.6 cm from the pocket
+            # (scores ~0.2) and a holding grasp sits within ~5 mm (~0.97).
+            # At 0.03 the basin was so broad that the off-centre "caught on
+            # the index" pose scored 0.66 against 0.87 for a centred one --
+            # too flat to steer anything.
+            "std": 0.02,
+        },
+    )
+
     grasp_setpoint_tracking = RewTerm(
         func=gr.reward_grasp_setpoint_tracking,
         weight=4.0,
@@ -388,9 +447,28 @@ class RewardsCfg:
             "decay": 5.0,
         },
     )
+    # Weight raised 3.0 -> 5.0: this is the term that actually separates a
+    # real grasp from the apple merely resting in the hand, and at equal
+    # weights a measured comparison had the degenerate pose scoring 2.21
+    # against 2.51 for a properly curled grasp -- too thin a margin to
+    # expect PPO to prefer the latter.
     grasp_enclosure = RewTerm(
         func=gr.reward_grasp_enclosure,
-        weight=3.0,
+        weight=5.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
+
+    # Bridges "finger open, not touching" -> "finger curled enough that
+    # touching pays": now that gentle_contact_groups scales by flexion, an
+    # open finger earns nothing for contact, and curling a finger that
+    # isn't touching yet earns nothing either, so without this there is a
+    # flat region between the two. Gated on palm contact (apple actually in
+    # the hand) so it can't be farmed by curling in mid-air. Weight kept
+    # UNDER gentle_contact_groups so curling is a stepping stone toward
+    # gentle contact, never a substitute for it.
+    finger_curl = RewTerm(
+        func=gr.reward_finger_curl,
+        weight=1.5,
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
 
@@ -442,7 +520,8 @@ class RewardsCfg:
         func=gr.penalty_action_rate_weighted,
         weight=-0.25,
         params={"weights": [10.0, 10.0, 10.0, 10.0, 3.0, 3.0, 3.0,
-                             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]},
+                             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                "arm_dims": 7},
     )
     posture_from_handoff = RewTerm(
         func=gr.penalty_joint_deviation_from_handoff,
@@ -613,6 +692,15 @@ class EventsCfg:
             "apple_mass_nominal": APPLE_MASS_NOMINAL,
             "mu": GRIP_FRICTION_MU,
         },
+    )
+
+    # The one real uncertainty left in the grip detector now that it reads
+    # only pads + encoders: the pressure->newton calibration it thresholds
+    # against (see grasp_rewards._pad_state).
+    randomize_closure_threshold = EventTerm(
+        func=dr.randomize_closure_threshold,
+        mode="reset",
+        params={},
     )
 
     # ── Reach -> grasp phase bookkeeping (MUST be last among "reset") ────

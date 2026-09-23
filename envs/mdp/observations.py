@@ -14,7 +14,7 @@ import torch
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import matrix_from_quat, quat_conjugate, quat_mul
+from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_conjugate, quat_mul
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -441,6 +441,35 @@ def object_pos_relative_to_body(
     body_local = body_pos_w - env_origins
 
     return apple_local - body_local  # [num_envs, 3]
+
+
+def object_pos_in_body_frame(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    ref_local: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> torch.Tensor:
+    """Object position expressed IN the body link's own rotating frame,
+    minus ref_local -- i.e. the error vector from a reference point fixed
+    in that link to the object.
+
+    Distinct from object_pos_relative_to_body above, which is only
+    translated (world-axis aligned) and so mixes the palm's orientation
+    into every component. For "is the apple in the middle of the hand" the
+    palm-frame vector is the natural signal: it is exactly the quantity
+    grasp_rewards.reward_apple_centered scores, so the policy can see the
+    error it is being paid to close.
+
+    Shape: [num_envs, 3]
+    """
+    obj: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    body_id = robot_cfg.body_ids[0]
+    quat = robot.data.body_quat_w[:, body_id]
+    delta = obj.data.root_pos_w - robot.data.body_pos_w[:, body_id]
+    local = quat_apply(quat_conjugate(quat), delta)
+    ref = torch.tensor(ref_local, device=env.device, dtype=local.dtype)
+    return local - ref
 
 
 def body_quat_relative_to_body(

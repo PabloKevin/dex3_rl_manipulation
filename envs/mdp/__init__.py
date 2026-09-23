@@ -28,6 +28,7 @@ from .observations import (
     fingertip_contact_normals,
     object_pos_world,
     object_pos_relative_to_body,
+    object_pos_in_body_frame,
     object_vel_world,
     body_quat_relative_to_body,
     tactile_slip,
@@ -68,4 +69,5 @@ from .domain_randomization import (
     randomize_tree_geometry,
     randomize_tactile_gain,
     randomize_fruit_damage_force,
+    randomize_closure_threshold,
 )

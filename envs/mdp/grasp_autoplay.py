@@ -179,6 +179,24 @@ def grasp_phase_active(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return env._grasp_phase_active
 
 
+def grip_established(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[num_envs] bool: has the trainee held a closure long enough this
+    episode for the stem to let go (env._grasp_ever_closed)? All-False
+    before the first reset has created the state."""
+    if not hasattr(env, "_grasp_ever_closed"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return env._grasp_ever_closed
+
+
+def grip_established_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """Policy observation: 1.0 once the grip is established (and so the arm
+    is unlocked and the apple is off the stem), 0.0 before.
+
+    Shape: [num_envs, 1]
+    """
+    return grip_established(env).float().unsqueeze(-1)
+
+
 def grasp_phase_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """Policy observation: 1.0 in the grasp phase, 0.0 in the reach phase.
     Lets the critic tell the (action-independent) reach-phase steps apart.
@@ -378,6 +396,7 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         phase = grasp_phase_active(self._env).unsqueeze(-1)
+        grip = grip_established(self._env)
 
         # -- grasp-phase (trainee) target --
         offset = self._offset
@@ -387,7 +406,20 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
                 self._anchor[newly] = self._prev_target[newly]
                 self._anchored |= newly
             offset = torch.where(self._anchored.unsqueeze(-1), self._anchor, self._offset)
-        trainee_target = self._raw_actions * self._scale + offset
+        scale = self._scale
+        if self.cfg.unlock_with_grip:
+            # Arm stays FROZEN at the hand-off pose until the fingers have
+            # actually established a grip this episode, then unlocks (for
+            # the lift). The arm's 87 Nm actuators overpower the stem by
+            # more than 5x, so before a grip exists every arm motion just
+            # shoves the apple out of the hand: measured, PPO-scale
+            # exploration noise on the arm dragged the apple 7 cm off its
+            # anchor within 2.4 s at noise std 0.8, and 82 cm at std 1.5,
+            # ending the episode with no contact reward -- which removed the
+            # learning signal, which grew the noise further. Hand-only noise
+            # at the same scale left the apple within 0.4 cm.
+            scale = scale * grip.unsqueeze(-1).float()
+        trainee_target = self._raw_actions * scale + offset
 
         # -- reach-phase target --
         if self.cfg.drive_with_reach_policy and not bool(phase.all()):
@@ -433,14 +465,45 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         super().apply_actions()
         if self.cfg.pin_object is None or not hasattr(self._env, "_grasp_ever_closed"):
             return
-        pin = ~self._env._grasp_phase_active | ~self._env._grasp_ever_closed
-        if not pin.any():
-            return
-        ids = pin.nonzero(as_tuple=True)[0]
         obj: RigidObject = self._env.scene[self.cfg.pin_object]
-        pose = torch.cat([self._env._grasp_handoff_apple_pos[ids], self._env._grasp_handoff_apple_quat[ids]], dim=-1)
-        obj.write_root_pose_to_sim(pose, env_ids=ids)
-        obj.write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=self.device), env_ids=ids)
+        phase = self._env._grasp_phase_active
+        anchor = self._env._grasp_handoff_apple_pos
+
+        # REACH phase: rigid pin (teleport). The reach policy was trained
+        # against a kinematic, immovable apple, so this reproduces exactly
+        # the contact it learned on.
+        hard = ~phase
+        if hard.any():
+            ids = hard.nonzero(as_tuple=True)[0]
+            pose = torch.cat([anchor[ids], self._env._grasp_handoff_apple_quat[ids]], dim=-1)
+            obj.write_root_pose_to_sim(pose, env_ids=ids)
+            obj.write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=self.device), env_ids=ids)
+
+        # GRASP phase, before the first closure: a COMPLIANT STEM instead of
+        # the rigid pin -- a spring-damper pulling the apple back to the
+        # anchor, force-clamped. The rigid pin made the apple infinitely
+        # stiff AND infinitely heavy: closing fingers could not nudge or
+        # centre it the way they would a real fruit, so contacts landed on
+        # whatever single spot the sphere happened to occupy (measured: 3 of
+        # the 4 contact groups almost never engaged at once, with force
+        # spikes into the hundreds and once ~3800 N). Simply releasing it
+        # instead is no good either -- the hand-off leaves the palm tilted
+        # ~26 deg, so an unheld sphere rolls straight off before the fingers
+        # can close (measured: contacts drop to ~0.5 groups, nothing held).
+        # The stem is what the apple actually hangs from, and the scene
+        # already carries APPLE_STEM_BREAK_FORCE/TORQUE for the harvest
+        # phase, so this is also the physically honest version.
+        soft = phase & ~self._env._grasp_ever_closed
+        d = anchor - obj.data.root_pos_w
+        f = self.cfg.stem_stiffness * d - self.cfg.stem_damping * obj.data.root_lin_vel_w
+        f_mag = f.norm(dim=-1, keepdim=True)
+        f = f * (self.cfg.stem_max_force / f_mag.clamp(min=self.cfg.stem_max_force))
+        # Zero for every env past first closure, so the wrench buffer never
+        # keeps pulling on an apple the policy has already taken.
+        f = torch.where(soft.unsqueeze(-1), f, torch.zeros_like(f))
+        obj.permanent_wrench_composer.set_forces_and_torques(
+            forces=f.unsqueeze(1), torques=torch.zeros_like(f).unsqueeze(1), is_global=True
+        )
 
     def reset(self, env_ids=None) -> None:
         super().reset(env_ids)
@@ -473,3 +536,14 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     object_name: str = "apple"
     pin_object: str | None = None
+    unlock_with_grip: bool = False
+    # Compliant-stem spring-damper (grasp phase, before first closure).
+    # Softened from 200 N/m / 15 N: that resisted the fingers repositioning
+    # the apple nearly as stiffly as the old rigid pin, and 15 N is far
+    # more than a real stem holds (APPLE_STEM_BREAK_FORCE is ~2.5 N). At
+    # 100 N/m the 0.15 kg apple sags ~1.5 cm unsupported (it is resting on
+    # the palm here, so in practice much less), omega*dt ~ 0.13 per physics
+    # substep, damping ~0.5 critical.
+    stem_stiffness: float = 100.0
+    stem_damping: float = 4.0
+    stem_max_force: float = 6.0
