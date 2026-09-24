@@ -408,17 +408,35 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
             offset = torch.where(self._anchored.unsqueeze(-1), self._anchor, self._offset)
         scale = self._scale
         if self.cfg.unlock_with_grip:
-            # Arm stays FROZEN at the hand-off pose until the fingers have
-            # actually established a grip this episode, then unlocks (for
-            # the lift). The arm's 87 Nm actuators overpower the stem by
-            # more than 5x, so before a grip exists every arm motion just
-            # shoves the apple out of the hand: measured, PPO-scale
-            # exploration noise on the arm dragged the apple 7 cm off its
+            # PROXIMAL joints (all but the last cfg.pre_grip_free_dims of
+            # this term's own joint list, e.g. shoulder+elbow) stay FROZEN
+            # at the hand-off pose until the fingers have actually
+            # established a grip this episode, then unlock (for the lift).
+            # The arm's 87 Nm actuators overpower the stem by more than 5x,
+            # so before a grip exists proximal motion just shoves the apple
+            # out of the hand: measured, PPO-scale exploration noise on the
+            # (then fully unlocked) arm dragged the apple 7 cm off its
             # anchor within 2.4 s at noise std 0.8, and 82 cm at std 1.5,
             # ending the episode with no contact reward -- which removed the
-            # learning signal, which grew the noise further. Hand-only noise
-            # at the same scale left the apple within 0.4 cm.
-            scale = scale * grip.unsqueeze(-1).float()
+            # learning signal, which grew the noise further.
+            #
+            # DISTAL joints (the last pre_grip_free_dims, e.g. the 3 wrist
+            # joints) stay free even pre-grip. Freezing them too was a
+            # blunt fix that removed the ONE thing that can correct a badly
+            # aligned hand-off before any finger ever touches the apple --
+            # once fingers close, they can pull the apple around a little
+            # via the compliant stem, but they cannot re-point the palm.
+            # The wrist sits close to the palm, so a given joint angle
+            # produces much less hand TRANSLATION (and so much less pull on
+            # the stem) than the same angle at the shoulder -- verified
+            # empirically before enabling this (see the cfg field's own
+            # docstring for the measured numbers).
+            n_dims = self.action_dim
+            free = self.cfg.pre_grip_free_dims
+            gate = torch.ones(self._env.num_envs, n_dims, device=self.device)
+            if free < n_dims:
+                gate[:, : n_dims - free] = grip.unsqueeze(-1).float()
+            scale = scale * gate
         trainee_target = self._raw_actions * scale + offset
 
         # -- reach-phase target --
@@ -532,6 +550,24 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     anchor_to_handoff: bool = False
     reach_policy_path: str = PINNED_REACH_POLICY
     reach_scale: float = 0.5
+    # With unlock_with_grip, the LAST pre_grip_free_dims joints (in
+    # cfg.joint_names order) keep their normal scale even before the first
+    # grip; the rest are held at exactly the hand-off pose until then. For
+    # right_arm's 7 joints (shoulder x3, elbow, wrist x3 -- see
+    # RIGHT_ARM_JOINTS), 3 means the wrist. Measured (16 envs, wrist-only
+    # N(0, std) exploration noise, shoulder+elbow held exactly at hand-off,
+    # displacement of the apple from its stem anchor): std 0.8 stayed at
+    # ~0.65 cm at 2.4 s (0/16 episodes lost the apple) -- barely above the
+    # ~0.5 cm baseline sag with NO action at all. std 1.5 reached ~10.9 cm
+    # by 2.4 s (3/16 lost) -- real risk, but far short of the WHOLE-ARM
+    # number at the same std in process_actions's own comment (82 cm,
+    # 9/16). PPO's init_noise_std here is 0.8 (see
+    # AppleGraspGraspPPORunnerCfg), so the safe case is the common one; if
+    # Policy/mean_noise_std grows past ~1.2 during training the way it has
+    # before, watch apple_fell_from_grip for a repeat of the same collapse
+    # and consider a smaller, wrist-specific scale rather than reverting to
+    # a full freeze.
+    pre_grip_free_dims: int = 0
     palm_body_name: str = "right_hand_palm_link"
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     object_name: str = "apple"

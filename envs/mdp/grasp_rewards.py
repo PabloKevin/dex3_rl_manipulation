@@ -521,26 +521,48 @@ def reward_apple_centered(
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
     center_local: Sequence[float],
-    std: float = 0.03,
+    normal_axis_local: Sequence[float],
+    std_perp: float = 0.02,
+    std_along: float = 0.03,
 ) -> torch.Tensor:
-    """exp(-d^2 / 2 std^2) on the distance from the fruit centre to the
-    hand's GRASP POCKET -- a fixed point in the palm link's frame
-    (center_local), i.e. "is the apple in the middle of the hand".
+    """"Is the apple in the middle of the hand" -- distance from the fruit
+    centre to the measured grasp point (center_local, a fixed point in the
+    palm's local frame), split into the component ALONG the palm's normal
+    axis (normal_axis_local, e.g. PALM_NORMAL_AXIS -- depth into the hand)
+    and the component PERPENDICULAR to it (how far off to one side), each
+    with its OWN tolerance.
 
-    Nothing else in this reward set asks for this. reward_finger_approach
-    is a mean over fingertip distances, so one finger close to the apple
-    offsets two far from it; reward_grasp_balance only pays once all three
-    are already touching. Both are satisfied by the pose a policy actually
-    converged on: the apple caught off to one side on the index while the
-    middle and thumb close on nothing.
+    Nothing else in this reward set asks for this at all. reward_
+    finger_approach is a mean over fingertip distances, so one finger close
+    to the apple offsets two far from it; reward_grasp_balance only pays
+    once all three are already touching. Both are satisfied by the pose a
+    policy actually converged on: the apple caught off to one side on the
+    index while the middle and thumb close on nothing.
+
+    With std_perp == std_along this is EXACTLY the isotropic 3D Gaussian
+    this function's first version used (distance-to-a-point splits into
+    along/perp components by Pythagoras regardless of which axis you
+    decompose against, so the split alone changes nothing) -- what actually
+    matters is making them UNEQUAL. std_along > std_perp on purpose: how
+    deep the apple sits in the hand matters much less than how far it sits
+    off to one side, which is what directly determines whether the fingers
+    close on it symmetrically (the reported failure: caught on the index,
+    middle and thumb closing on air).
+
+    Note on hand orientation: this reward is computed entirely in the
+    palm's own rotating local frame (both center_local and the axis
+    decomposition), so it does not need the palm to point straight up, or
+    to hold any particular roll around its own normal, to be satisfiable --
+    only that the apple sits at the same point RELATIVE TO THE HAND. The
+    reach hand-off's own tolerance (ori_tol_rad=0.30 rad) permits some
+    orientation spread episode to episode; center_local's own measurement
+    (4-6mm spread across real hand-off episodes at that tolerance) is the
+    empirical check that this local-frame target still held across it.
 
     center_local is measured, not chosen (see the grasp env cfg's
     GRASP_CENTER_LOCAL): across every scripted curl combination that
     latched a grip AND still held the apple a second after the stem let go,
-    the fruit centre sat at the same point in the palm frame to within
-    4-6 mm. The reach hand-off leaves it ~3.3 cm off that point, so this
-    term is what asks the fingers to draw the apple into the pocket --
-    which the compliant stem now lets them do.
+    the fruit centre sat at the same point to within a few mm.
 
     Real-robot computable: palm pose from FK, fruit pose from the same
     perception estimate the reach policy already consumes as apple_pos_palm.
@@ -551,11 +573,22 @@ def reward_apple_centered(
     obj: RigidObject = env.scene[object_cfg.name]
     body_id = robot_cfg.body_ids[0]
     quat = robot.data.body_quat_w[:, body_id]
-    pocket = robot.data.body_pos_w[:, body_id] + quat_apply(
+    ref = robot.data.body_pos_w[:, body_id]
+
+    n_local = torch.tensor(normal_axis_local, device=env.device, dtype=quat.dtype)
+    n_local = n_local / (n_local.norm() + 1e-9)
+    n_world = quat_apply(quat, n_local.expand(env.num_envs, 3))
+
+    target_world = ref + quat_apply(
         quat, torch.tensor(center_local, device=env.device, dtype=quat.dtype).expand(env.num_envs, 3)
     )
-    d = torch.norm(obj.data.root_pos_w - pocket, dim=-1)
-    return torch.exp(-(d ** 2) / (2.0 * std ** 2)) * _grasp_mask(env)
+    err = obj.data.root_pos_w - target_world
+    along_err = (err * n_world).sum(dim=-1)
+    perp_dist = torch.norm(err - along_err.unsqueeze(-1) * n_world, dim=-1)
+
+    along = torch.exp(-(along_err ** 2) / (2.0 * std_along ** 2))
+    across = torch.exp(-(perp_dist ** 2) / (2.0 * std_perp ** 2))
+    return along * across * _grasp_mask(env)
 
 
 def reward_grasp_setpoint_tracking(
@@ -727,6 +760,7 @@ def penalty_action_rate_weighted(
     env: "ManagerBasedRLEnv",
     weights: Sequence[float],
     arm_dims: int = 0,
+    arm_free_dims: int = 0,
 ) -> torch.Tensor:
     """Per-joint-weighted first-difference penalty over the FULL concatenated
     action vector (arm 7 + hand 7 = 14-dim). Heavy weight on the 4 proximal
@@ -751,15 +785,19 @@ def penalty_action_rate_weighted(
     # `prev` is an ignored reach-phase action, so the difference means
     # nothing. prev_mask is last step's phase, cached here each call.
     if arm_dims:
-        # While the arm is locked (see ReachHandoffJointPositionAction's
-        # unlock_with_grip) its actions do nothing, so charging for their
-        # jitter is a penalty the policy cannot act on -- and this term was
-        # the single largest negative in the run where that noise was left
-        # unpriced. Arm columns only start counting once the arm can move.
+        # PROXIMAL arm columns (arm_dims - arm_free_dims, e.g. shoulder+
+        # elbow) are locked pre-grip (see ReachHandoffJointPositionAction's
+        # unlock_with_grip), so their actions do nothing then and charging
+        # for their jitter is a penalty the policy cannot act on -- this
+        # term was the single largest negative in the run where that noise
+        # was left unpriced. DISTAL arm columns (the trailing arm_free_dims,
+        # e.g. the wrist) stay free even pre-grip (pre_grip_free_dims), so
+        # they always count -- same reasoning as the hand columns below.
         from .grasp_autoplay import grip_established
         arm_gate = grip_established(env).float().unsqueeze(-1)
-        gate = torch.cat([arm_gate.expand(-1, arm_dims),
-                          torch.ones(env.num_envs, delta.shape[-1] - arm_dims, device=env.device)], dim=-1)
+        locked_dims = arm_dims - arm_free_dims
+        gate = torch.cat([arm_gate.expand(-1, locked_dims),
+                          torch.ones(env.num_envs, delta.shape[-1] - locked_dims, device=env.device)], dim=-1)
         delta = delta * gate
 
     mask = _grasp_mask(env)

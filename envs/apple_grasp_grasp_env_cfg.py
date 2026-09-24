@@ -253,6 +253,11 @@ class ActionsCfg:
         # this task is "close the fingers on an apple the stem is holding";
         # after, the arm is free for the lift grasp_success requires.
         unlock_with_grip=True,
+        # Wrist (last 3 of RIGHT_ARM_JOINTS) stays free even before a
+        # grip exists -- it is the only thing that can correct a badly
+        # aligned hand-off before any finger touches the apple; see the
+        # cfg field's own docstring for the measurement behind this.
+        pre_grip_free_dims=3,
     )
     # Weaker actuator than the arm (effort_limit=2.0 vs 87.0), so a smaller
     # scale and lower rate limits -- starting guesses, not measured/validated
@@ -408,12 +413,16 @@ class RewardsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "center_local": GRASP_CENTER_LOCAL,
-            # 0.02 m: the hand-off leaves the fruit ~3.6 cm from the pocket
-            # (scores ~0.2) and a holding grasp sits within ~5 mm (~0.97).
-            # At 0.03 the basin was so broad that the off-centre "caught on
-            # the index" pose scored 0.66 against 0.87 for a centred one --
-            # too flat to steer anything.
-            "std": 0.02,
+            "normal_axis_local": PALM_NORMAL_AXIS,
+            # std_perp=0.02 validated in the isotropic version: the failure
+            # poses (apple caught on the index alone, or resting against
+            # fully open fingers) scored 0.46-0.66 against 0.81-0.85 for a
+            # properly curled grasp. std_along loosened to 0.03 -- how deep
+            # the apple sits matters less than how far off to one side it
+            # is, which is what actually determines whether the fingers
+            # close on it symmetrically.
+            "std_perp": 0.02,
+            "std_along": 0.03,
         },
     )
 
@@ -521,7 +530,11 @@ class RewardsCfg:
         weight=-0.25,
         params={"weights": [10.0, 10.0, 10.0, 10.0, 3.0, 3.0, 3.0,
                              1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-                "arm_dims": 7},
+                "arm_dims": 7,
+                # Wrist (the trailing 3 of the 7 arm dims) matches
+                # ActionsCfg.right_arm's own pre_grip_free_dims=3 -- it is
+                # never locked, so its jitter always counts.
+                "arm_free_dims": 3},
     )
     posture_from_handoff = RewTerm(
         func=gr.penalty_joint_deviation_from_handoff,
