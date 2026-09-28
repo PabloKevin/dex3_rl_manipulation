@@ -130,6 +130,46 @@ def randomize_tactile_gain(
     env._tactile_gain[env_ids] = torch.empty(n, n_taxels, device=env.device).uniform_(lo, hi)
 
 
+def randomize_tactile_footprint(
+    env: "ManagerBasedRLEnv",
+    env_ids: torch.Tensor,
+    full_deg_range: tuple[float, float] = (15.0, 40.0),
+    falloff_deg_range: tuple[float, float] = (15.0, 35.0),
+) -> None:
+    """Per-episode, per-taxel sensing footprint of the pads: how far off the
+    pad normal a contact can land and still be read (observations.
+    _sensed_tactile_forces via contact_geometry.pad_face_weight).
+
+    Sets env._tactile_full_deg (read in full up to this angle) and
+    env._tactile_cut_deg (= full + falloff; read nothing beyond), [N, 9].
+
+    Why randomized: in sim the per-link sensor feels every face, the real
+    Dex3-1 pads only their pad face, and how far toward the edge they still
+    respond is unmeasured. The tripod grasp lands index/middle on their
+    pads' INNER EDGES (~20-26 deg off the normal, see contact_geometry's
+    TACTILE_*_DEFAULT note), right where that uncertainty is -- so a policy
+    that relied on edge contacts reading in full would be relying on a sim
+    artifact. The low end of full_deg_range (15 deg) makes those contacts
+    read only partly in some episodes; the high end of full+falloff (75 deg)
+    still never reads a pure side-face contact (~90 deg) or the back.
+
+    Grasp-phase-only, like randomize_tactile_gain; independent per taxel
+    for the same reason (pad-to-pad variation, not one shared factor).
+    """
+    import scripts.tactile_layout as tactile_layout
+
+    n_taxels = len(tactile_layout.TAXELS)
+    if not hasattr(env, "_tactile_full_deg"):
+        env._tactile_full_deg = torch.full((env.num_envs, n_taxels), 30.0, device=env.device)
+        env._tactile_cut_deg = torch.full((env.num_envs, n_taxels), 60.0, device=env.device)
+
+    n = len(env_ids)
+    full = torch.empty(n, n_taxels, device=env.device).uniform_(*full_deg_range)
+    falloff = torch.empty(n, n_taxels, device=env.device).uniform_(*falloff_deg_range)
+    env._tactile_full_deg[env_ids] = full
+    env._tactile_cut_deg[env_ids] = full + falloff
+
+
 def randomize_fruit_damage_force(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,

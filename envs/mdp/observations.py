@@ -254,37 +254,60 @@ def palm_contact_force(
 #  from the ContactSensor (see envs/mdp/grasp_rewards.py's own
 #  _per_finger_group_force), since privileged, uncalibrated info is fine for
 #  a training-only reward signal but would defeat the point if fed to the
-#  policy as an observation.
+#  policy as an observation. The one sanctioned exception is the grip
+#  DETECTOR (grasp_rewards._pad_state): it gates the arm and is observed as
+#  grip_established, so it has to be exactly what the real hand could
+#  compute, i.e. these sensed values.
+#
+#  Sensed also means PAD-ONLY: _sensed_tactile_forces models where on the
+#  link a real taxel can feel (see contact_geometry), whereas the rewards'
+#  safety terms read every face of every link.
 # ─────────────────────────────────────────────
 
 def _sensed_tactile_forces(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Apple-filtered, per-taxel force magnitude, WITH the per-env per-taxel
-    calibration gain applied (ground truth * env._tactile_gain).
+    """What each real taxel would read: apple-filtered force magnitude on its
+    link, times how much of that contact lands on the PAD, times the
+    per-env per-taxel calibration gain (env._tactile_gain).
 
-    Apple-filtered via apple_force_per_link (the per-link filtered sensors),
-    not net_forces_w — same reasoning as reach_rewards.
-    penalty_apple_contact_force: self-collision or tree contact must not
-    leak into a tactile reading.
+    The pad factor is contact_geometry.pad_face_weight on the contact's
+    angle off the pad normal: a real Dex3-1 taxel sits on the pad face, so
+    a contact on the link's back reads nothing and one on its side edge
+    reads partly or not at all -- where the sim's per-body sensor would
+    report both in full. The footprint (full/cut angles) is randomized per
+    episode and per taxel (domain_randomization.randomize_tactile_footprint)
+    because how far the real pads sense toward their edges is unmeasured;
+    this matters most for the tripod grasp, whose index/middle contacts sit
+    on the pads' inner edges.
+
+    Apple-filtered via the per-link filtered sensors, not net_forces_w —
+    same reasoning as reach_rewards.penalty_apple_contact_force:
+    self-collision or tree contact must not leak into a tactile reading.
 
     Note that several taxels share one sim link (palm_0/1/2 all map to
-    right_hand_palm_link), so those columns are identical by construction —
-    flagged on the monitor plot too (scripts/tactile_monitor.py).
+    right_hand_palm_link), so those columns are identical up to gain and
+    footprint — flagged on the monitor plot too (scripts/tactile_monitor.py).
 
     Shape: [num_envs, 9] (tactile_layout.TAXELS order).
     """
     import scripts.tactile_layout as tactile_layout
+    from .contact_geometry import (
+        apple_contact_faces, pad_face_weight, TACTILE_FULL_DEG_DEFAULT, TACTILE_CUT_DEG_DEFAULT,
+    )
 
-    ground_truth = apple_force_per_link(
+    force, cos_pad = apple_contact_faces(
         env, sensor_cfg, [t.link_name for t in tactile_layout.TAXELS]
-    )  # [N, 9]
+    )  # [N, 9, 3], [N, 9]
+    full = getattr(env, "_tactile_full_deg", TACTILE_FULL_DEG_DEFAULT)
+    cut = getattr(env, "_tactile_cut_deg", TACTILE_CUT_DEG_DEFAULT)
+    sensed = torch.norm(force, dim=-1) * pad_face_weight(cos_pad, full, cut)
 
     if not hasattr(env, "_tactile_gain"):
-        env._tactile_gain = torch.ones(env.num_envs, ground_truth.shape[-1], device=env.device)
+        env._tactile_gain = torch.ones(env.num_envs, sensed.shape[-1], device=env.device)
 
-    return ground_truth * env._tactile_gain
+    return sensed * env._tactile_gain
 
 
 def _taxel_finger_groups(env: ManagerBasedRLEnv) -> dict[str, list[int]]:

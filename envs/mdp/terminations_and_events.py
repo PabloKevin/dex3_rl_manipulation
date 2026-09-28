@@ -253,10 +253,13 @@ def fruit_damaged(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Hard, immediate failure: any per-finger-group contact force exceeds
-    the per-episode randomized env._fruit_damage_force (Li et al., 2026 +
+    """Hard, immediate failure: the apple force on any single hand link, on
+    any face of it (grasp_rewards._max_link_apple_force -- palm, all thumb
+    segments incl. the pad-less thumb_0, index, middle), exceeds the
+    per-episode randomized env._fruit_damage_force (Li et al., 2026 +
     broader pome-fruit literature range — see
-    domain_randomization.randomize_fruit_damage_force).
+    domain_randomization.randomize_fruit_damage_force). Privileged on
+    purpose: bruising does not care whether the contact landed on a taxel.
 
     Unlike grasp_success, this is NOT hold-counted — bio-yield is a
     near-instantaneous threshold effect (cellular rupture), not something to
@@ -265,14 +268,13 @@ def fruit_damaged(
 
     Shape: [num_envs] bool
     """
-    from .grasp_rewards import _per_finger_group_force
+    from .grasp_rewards import _max_link_apple_force
     from .grasp_autoplay import grasp_phase_active
 
     if not hasattr(env, "_fruit_damage_force"):
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
-    per_finger = _per_finger_group_force(env, sensor_cfg)  # [N, 3]
-    max_force = per_finger.max(dim=-1).values
+    max_force = _max_link_apple_force(env, sensor_cfg)
     # Grasp phase only: a hard reach-policy arrival isn't the trainee's doing.
     return (max_force > env._fruit_damage_force) & grasp_phase_active(env)
 

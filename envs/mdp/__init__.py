@@ -68,6 +68,7 @@ from .domain_randomization import (
     randomize_tree_and_apple,
     randomize_tree_geometry,
     randomize_tactile_gain,
+    randomize_tactile_footprint,
     randomize_fruit_damage_force,
     randomize_closure_threshold,
 )

@@ -155,16 +155,40 @@ FRUIT_DAMAGE_APPLE_WEIGHT_PCT = 0.6
 APPLE_MASS_NOMINAL = 0.15   # matches apple_grasp_env_cfg.py's _jitter(0.15) nominal
 GRIP_FRICTION_MU = 0.5      # assumed -- no PhysX material explicitly configured on the apple
 
+# Where the frozen reach policy is told the palm is, for the hand-off: the
+# point it drives under the apple (it observes apple - (palm + R*aim)).
+# PALM_LOCAL_OFFSET shifted -27 mm along the palm's lateral axis (local z,
+# the index/middle flexion axis).
+#
+# Why: with the reach task's own offset the hand-off leaves the apple at
+# palm-local z = +27 mm (measured, 16 envs) -- right on the INDEX finger's
+# flexion plane (z = +28.5 mm; middle is at -28.5 mm). From there no finger
+# curl can reach the middle finger to the apple at all (0 middle contacts
+# in 16 scripted closures), and the only grips that latch are thumb-index
+# pinches: the grasp this task kept converging to. With the shifted aim
+# the apple arrives at z = +2 mm, between the two fingers, in the thumb's
+# own flexion plane (thumb_0 = 0) -- and 8/16 scripted closures latch and
+# hold the apple 1 s after the stem releases, most as thumb + index +
+# middle tripods, vs 2/16 pinches before.
+#
+# For the reach policy this is just the apple appearing 2.7 cm to one
+# side, well inside its training distribution; the reach task itself is
+# untouched. A real-robot hand-off must use the same aim point.
+REACH_HANDOFF_AIM_LOCAL = (PALM_LOCAL_OFFSET[0], PALM_LOCAL_OFFSET[1], PALM_LOCAL_OFFSET[2] - 0.027)
+
 # The hand's GRASP POCKET: where the fruit centre sits, in right_hand_palm_
-# link's own frame, when the hand is actually holding it. MEASURED, not
-# chosen: across every scripted curl combination that both latched a grip
-# and still held the apple 1 s after the stem released, the centre landed
-# here to within 4-6 mm (n=45). For reference the reach hand-off leaves the
-# apple at roughly (0.080, 0.055, 0.000) -- about 3.3 cm off along the
-# palm's lateral axis, which is the gap RewardsCfg.apple_centered exists to
-# close. Re-measure (scripted power grasps, apple pose in palm frame 1 s
-# after latch) if the hand, the fruit radius or PALM_LOCAL_OFFSET change.
-GRASP_CENTER_LOCAL = (0.066, 0.054, 0.033)
+# link's own frame, when the hand is holding it in a TRIPOD -- laterally
+# centred between index and middle, so the thumb opposes the gap between
+# them. MEASURED, not chosen: across the scripted tripod closures (above)
+# that latched a grip and still held the apple 1 s after the stem released,
+# the centre sat at (0.073, 0.057, -0.002), spread 4-7 mm (n=8).
+#
+# The previous value, (0.066, 0.054, 0.033), was measured the same way
+# from the old hand-off, where every holding grasp was the pinch -- so it
+# sat on the index finger's plane, and apple_centered (weight 4) paid for
+# keeping the apple there. Re-measure if the hand, the fruit radius or
+# REACH_HANDOFF_AIM_LOCAL change.
+GRASP_CENTER_LOCAL = (0.073, 0.057, 0.0)
 
 
 # ─────────────────────────────────────────────
@@ -246,7 +270,7 @@ class ActionsCfg:
         drive_with_reach_policy=True,
         anchor_to_handoff=True,
         reach_scale=0.5,
-        palm_local_offset=PALM_LOCAL_OFFSET,
+        palm_local_offset=REACH_HANDOFF_AIM_LOCAL,
         pin_object="apple",
         # Arm frozen at the hand-off pose until the fingers have a grip --
         # see the action class for the measurements behind this. Until then
@@ -481,9 +505,24 @@ class RewardsCfg:
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
 
+    # Tripod, not pinch: index and middle sharing the load (thumb opposing
+    # the gap between them is grasp_enclosure's job). Replaces
+    # reward_grasp_balance, whose CV across all three fingers scored the
+    # observed index-thumb pinch (middle as a light base) about the same
+    # as a real tripod -- see reward_tripod_balance. Weight 2.0 -> 5.0: on
+    # scripted closures from the tripod hand-off, total per-step reward
+    # was 15.0 for tripods vs 14.0 for pinches at weight 3 (this term: 2.1
+    # vs 0.3 of it, weighted) -- too thin a margin; 5 roughly doubles it.
     grasp_balance = RewTerm(
-        func=gr.reward_grasp_balance,
-        weight=2.0,
+        func=gr.reward_tripod_balance,
+        weight=5.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
+    # Apple on the BACK of the palm or of a finger segment: the real pads
+    # cannot feel it, so only this privileged term can discourage it.
+    back_contact = RewTerm(
+        func=gr.penalty_back_contact,
+        weight=-1.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
     grasp_hold = RewTerm(
@@ -693,6 +732,14 @@ class EventsCfg:
         mode="reset",
         params={"gain_range": (0.7, 1.3)},
     )
+    # How far toward its edges each pad still reads a contact -- unmeasured
+    # on the real hand, and exactly where the tripod's index/middle
+    # contacts land (see dr.randomize_tactile_footprint).
+    randomize_tactile_footprint = EventTerm(
+        func=dr.randomize_tactile_footprint,
+        mode="reset",
+        params={"full_deg_range": (15.0, 40.0), "falloff_deg_range": (15.0, 35.0)},
+    )
     randomize_fruit_damage_force = EventTerm(
         func=dr.randomize_fruit_damage_force,
         mode="reset",
@@ -750,7 +797,7 @@ class EventsCfg:
             # reach task's own reach_success termination.
             "offset_z": GRASP_OFFSET_Z,
             "palm_normal_axis": PALM_NORMAL_AXIS,
-            "palm_local_offset": PALM_LOCAL_OFFSET,
+            "palm_local_offset": REACH_HANDOFF_AIM_LOCAL,
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
             "hold_time": 0.5,
@@ -787,6 +834,17 @@ class AppleGraspGraspEnvCfg(ManagerBasedRLEnvCfg):
 
         self.scene.head_camera = None
         self.scene.replicate_physics = False
+
+        # Contact POINTS on every per-link, apple-filtered sensor, so
+        # contact_geometry can tell a pad contact from a side-edge or back
+        # one (the sensor alone reports force per body). Grasp scene only:
+        # the reach task's scene, and its trained policy, are untouched.
+        # 8 buffered contacts per link and env: a sphere against one convex
+        # piece of a finger rarely produces more than 4.
+        for link in task_mdp.observations.RIGHT_HAND_CONTACT_LINKS:
+            sensor = getattr(self.scene, task_mdp.observations.link_sensor_name("contact_forces", link))
+            sensor.track_contact_points = True
+            sensor.max_contact_data_count_per_prim = 8
 
         self.viewer.eye = (1.5, -1.5, 1.8)
         self.viewer.lookat = (0.5, -0.25, 1.0)

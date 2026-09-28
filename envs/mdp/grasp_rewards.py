@@ -59,11 +59,12 @@ def _per_finger_group_force(
     apple-filtered (via observations.apple_force_per_link, not net_forces_w —
     same reasoning as reach_rewards.penalty_apple_contact_force).
 
-    Shared by reward_grasp_balance / reward_grasp_setpoint_tracking /
-    terminations_and_events.fruit_damaged, so they all agree on the same
-    underlying quantity — the ground-truth counterpart of
-    observations.tactile_force_level (that one is calibration-gained, this
-    one is not, by design).
+    Used by reward_grasp_setpoint_tracking (and the legacy
+    reward_grasp_balance) — the ground-truth counterpart of
+    observations.tactile_force_level (that one is calibration-gained and
+    pad-only, this one is neither, by design). The safety terms use
+    _max_link_apple_force instead: a per-finger MEAN halves a force one
+    segment carries alone.
     """
     import scripts.tactile_layout as tactile_layout
     from .observations import apple_force_per_link
@@ -83,6 +84,79 @@ def _per_finger_group_force(
     return torch.stack(
         [ground_truth[:, idx[f]].mean(dim=-1) for f in ("thumb", "index", "middle")], dim=-1
     )  # [N, 3]
+
+
+def _max_link_apple_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """[N] largest apple-filtered force on ANY single hand link, on ANY face
+    of it -- the privileged "is the fruit being hurt" quantity, shared by
+    penalty_excess_hand_force and terminations_and_events.fruit_damaged.
+
+    Every link in observations.RIGHT_HAND_CONTACT_LINKS: palm, all three
+    thumb segments (thumb_0, the opposition knuckle, has no taxel but can
+    still press on the fruit), and both segments of index and middle.
+    Bruising does not care which face pressed, so no pad weighting here.
+
+    Per-LINK max rather than the per-finger MEAN _per_finger_group_force
+    gives (which halved a force carried by one segment alone): bruising is
+    local, so the most heavily loaded contact is what counts.
+
+    Edge contacts are not scaled up for their smaller area on purpose: the
+    damage threshold (env._fruit_damage_force) is a texture-analyzer PROBE
+    force from the literature, i.e. already a concentrated load on a small
+    tip, so it is conservative for a flat pad and comparable for a pad
+    edge.
+    """
+    from .observations import apple_force_per_link, RIGHT_HAND_CONTACT_LINKS
+
+    return apple_force_per_link(env, sensor_cfg, RIGHT_HAND_CONTACT_LINKS).max(dim=-1).values
+
+
+def _finger_grip_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """[N, 3] privileged GRIPPING force per finger (thumb, index, middle):
+    apple-filtered force on the finger's pad links, each weighted by how
+    squarely it lands on the pad (contact_geometry.pad_face_weight over
+    GRIP_FULL_DEG..GRIP_CUT_DEG), summed per finger.
+
+    The weighting is wide on purpose: the tripod's inner-pad-edge contacts
+    (~20-30 deg off the pad normal) count in full, a side-face contact
+    (~60-90 deg, e.g. a finger lying beside the apple) counts little or
+    nothing, the back never. Ground truth, no calibration gain -- a reward
+    input, not an observation.
+    """
+    from .contact_geometry import (
+        FINGER_PAD_LINKS, apple_contact_faces, pad_face_weight, GRIP_FULL_DEG, GRIP_CUT_DEG,
+    )
+
+    links = [l for f in ("thumb", "index", "middle") for l in FINGER_PAD_LINKS[f]]
+    force, cos_pad = apple_contact_faces(env, sensor_cfg, links)          # [N, 6, 3], [N, 6]
+    grip = force.norm(dim=-1) * pad_face_weight(cos_pad, GRIP_FULL_DEG, GRIP_CUT_DEG)
+    return grip.view(env.num_envs, 3, 2).sum(dim=-1)
+
+
+def _back_contact_force(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    full_deg: float = 120.0,
+    start_deg: float = 95.0,
+) -> torch.Tensor:
+    """[N, L] privileged apple force on the BACK of each padded link (palm,
+    thumb_1/2, index_0/1, middle_0/1): counted from start_deg off the pad
+    normal, in full past full_deg. The grasp-phase, per-link-normal
+    counterpart of reach_rewards._palmar_dorsal_force (which uses the palm
+    normal for every link)."""
+    from .contact_geometry import PAD_NORMAL_LOCAL, apple_contact_faces, pad_face_weight
+
+    links = list(PAD_NORMAL_LOCAL.keys())
+    force, cos_pad = apple_contact_faces(env, sensor_cfg, links)
+    # Mirror the pad weighting: -cos_pad is the cosine off the BACK normal.
+    back = pad_face_weight(-cos_pad, 180.0 - full_deg, 180.0 - start_deg)
+    return force.norm(dim=-1) * back
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -208,30 +282,6 @@ def _force_closure_ok(
     return (n_contact >= 3) & (mean_push < max_mean_push)
 
 
-# Outward normal of each taxel pad, in ITS OWN LINK's frame -- a fixed
-# geometric property of the hand, so the real robot gets these in the world
-# frame from its own joint encoders + URDF, with no perception and no
-# calibration. Measured in sim (scratch probe, ~23k contact samples over 40+
-# scripted grasp poses): for each link, mean of the unit contact force it
-# received, negated (a compressive contact pushes the link along -n_out).
-# Angular spread around these means was 2-10 deg median, and the palm's
-# (+0.18, +0.98, +0.12) independently reproduces apple_grasp_env_cfg's
-# PALM_NORMAL_AXIS = (0, 1, 0), which is a good sanity check on the method.
-#
-# middle_0 never registered a single contact in any probed pose (nor did
-# thumb_1 in the second sweep), so it carries its own finger's distal-link
-# normal as a documented fallback -- it is very nearly unused in practice.
-_PAD_NORMAL_LOCAL = {
-    "right_hand_palm_link":     (0.176, 0.977, 0.121),
-    "right_hand_thumb_1_link":  (0.986, 0.000, -0.169),
-    "right_hand_thumb_2_link":  (0.937, 0.176, -0.301),
-    "right_hand_index_0_link":  (-0.088, 0.996, 0.018),
-    "right_hand_index_1_link":  (0.129, 0.990, 0.050),
-    "right_hand_middle_0_link": (0.222, 0.401, 0.889),   # fallback: middle_1's
-    "right_hand_middle_1_link": (0.222, 0.401, 0.889),
-}
-
-
 def _pad_state(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,
@@ -245,13 +295,17 @@ def _pad_state(
     pressure (unitree_hg PressSensorState_, 9 taxels: 3 palm, 2 per
     finger -- see scripts/tactile_layout.py), so:
 
-    - magnitude: the UNFILTERED net contact force on each taxel's link
-      (what a pad feels, whatever touched it -- not the apple-filtered
-      sensor, which is simulator-only knowledge), scaled per taxel by
-      env._tactile_gain so the same calibration randomization the tactile
-      OBSERVATIONS get also perturbs this, then averaged per group.
+    - magnitude: exactly what the tactile OBSERVATIONS see (observations.
+      _sensed_tactile_forces): apple force on the taxel's link, counted
+      only as far as it lands on the PAD (a side-edge or back contact reads
+      partly or not at all, as on the real pads -- see contact_geometry),
+      with the same per-episode gain and footprint randomization, then
+      averaged per group. This used to be the unfiltered net force on the
+      whole link, which read a contact on any face in full.
     - direction: from forward kinematics, not from force. Each pad's
-      outward normal is fixed in its own link frame (_PAD_NORMAL_LOCAL),
+      outward normal is fixed in its own link frame (contact_geometry.
+      PAD_NORMAL_LOCAL, geometric -- see there for why the earlier
+      contact-averaged middle-finger normal was the side face),
       so rotating it by that link's orientation gives the direction the pad
       presses -- joint encoders and the URDF, both of which the real robot
       has. No perception estimate is needed. The per-group direction is its
@@ -265,33 +319,28 @@ def _pad_state(
       it at 12/16.
     """
     import scripts.tactile_layout as tactile_layout
+    from .contact_geometry import PAD_NORMAL_LOCAL
+    from .observations import _sensed_tactile_forces
 
     robot: Articulation = env.scene["robot"]
-    sensor = env.scene[sensor_cfg.name]
 
     if not hasattr(env, "_pad_cache"):
         taxels = tactile_layout.TAXELS
         group_names = list(_CLOSURE_GROUPS.keys())
-        # taxel -> its group, and the link ids it reads (sensor + articulation)
-        sensor_bodies = list(sensor.body_names)
+        # taxel -> its group, and the articulation body it rotates with
         t_group = [group_names.index("palm" if t.finger == "palm" else t.finger) for t in taxels]
-        t_sensor_id = [sensor_bodies.index(t.link_name) for t in taxels]
         t_body_id = [robot.data.body_names.index(t.link_name) for t in taxels]
-        n = torch.tensor([_PAD_NORMAL_LOCAL[t.link_name] for t in taxels], device=env.device)
+        n = torch.tensor([PAD_NORMAL_LOCAL[t.link_name] for t in taxels], device=env.device)
         env._pad_normals = n / n.norm(dim=-1, keepdim=True)
         env._pad_cache = (
             torch.tensor(t_group, device=env.device),
-            torch.tensor(t_sensor_id, device=env.device),
             torch.tensor(t_body_id, device=env.device),
             len(group_names),
         )
-    t_group, t_sensor_id, t_body_id, n_groups = env._pad_cache
+    t_group, t_body_id, n_groups = env._pad_cache
 
-    # -- magnitude per taxel: unfiltered net force on its link, gained --
-    net = sensor.data.net_forces_w[:, t_sensor_id, :]               # [N, T, 3]
-    mag_t = torch.norm(net, dim=-1)                                  # [N, T]
-    if hasattr(env, "_tactile_gain") and env._tactile_gain.shape[-1] == mag_t.shape[-1]:
-        mag_t = mag_t * env._tactile_gain
+    # -- magnitude per taxel: what the pad itself reads --
+    mag_t = _sensed_tactile_forces(env, sensor_cfg)                  # [N, T]
 
     # -- direction per taxel: its pad normal, rotated by FK --
     quats = robot.data.body_quat_w[:, t_body_id, :]                  # [N, T, 4]
@@ -329,9 +378,10 @@ def _closure_state(
     input but an OBSERVATION (grip_established) and an interlock on the arm
     -- both of which deployment has to reproduce from real signals. The
     SAFETY terms deliberately do not go through here: fruit_damaged and
-    penalty_excess_hand_force keep reading true, apple-filtered force
-    (_per_finger_group_force), because "am I bruising the fruit" must not
-    depend on an uncalibrated sensor.
+    penalty_excess_hand_force keep reading true, apple-filtered force on
+    every face of every link (_max_link_apple_force), because "am I
+    bruising the fruit" must not depend on an uncalibrated sensor or on
+    whether the contact happened to land on a taxel.
 
     A FINGER group only counts as a contact if it is also curled at least
     min_flex (as _finger_flexion scores it, so 0.5 means ~15% of the joint
@@ -382,6 +432,61 @@ def reward_grasp_balance(
     cv = per_finger.std(dim=-1) / (mean_f + 1e-6)
     balance = torch.exp(-cv)
     return balance * (n_contact / 3.0) * _grasp_mask(env)
+
+
+def reward_tripod_balance(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    min_force: float = 0.3,
+) -> torch.Tensor:
+    """Tripod grasp: thumb opposing the GAP between index and middle, which
+    load the fruit about equally. Privileged (_finger_grip_force: ground
+    truth, pad and pad-edge contacts only).
+
+        (fingers gripping / 3) * min(F_index, F_middle) / max(F_index, F_middle)
+
+    Replaces reward_grasp_balance's coefficient of variation across all
+    three fingers, which could not tell the tripod from the pinch it was
+    meant to prevent: a tripod's thumb carries roughly the sum of the two
+    fingers' pushes (it opposes both), CV(2, 1, 1) -> 0.70, while the
+    observed index-thumb pinch with the middle finger as a light base
+    scored about the same, CV(1, 1, 0.3) -> 0.65. Index-vs-middle symmetry
+    is the property that actually separates the two: 1.0 when both carry
+    the same load, 0 when one carries it all. The thumb is left to
+    grasp_enclosure (it has to oppose) and gentle_contact_groups (it has to
+    touch).
+
+    The (fingers gripping / 3) factor keeps partial credit on the way in,
+    same reasoning as reward_grasp_balance: no cliff before all three
+    touch.
+
+    Shape: [num_envs], in [0, 1]
+    """
+    grip = _finger_grip_force(env, sensor_cfg)                         # [N, 3]
+    n_grip = (grip > min_force).sum(dim=-1).float()
+    f_i, f_m = grip[:, 1], grip[:, 2]
+    sym = torch.minimum(f_i, f_m) / torch.maximum(f_i, f_m).clamp(min=min_force)
+    return (n_grip / 3.0) * sym * _grasp_mask(env)
+
+
+def penalty_back_contact(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    cap: float = 3.0,
+) -> torch.Tensor:
+    """Apple force on the BACK of any padded link (palm or finger segment),
+    each link capped at `cap` N and normalised, summed over links. Use a
+    NEGATIVE weight. Privileged: the real pads cannot feel the back of the
+    hand at all, which is exactly why the policy needs telling in training.
+
+    Grasp-phase counterpart of reach_rewards' dorsal-contact penalty, but
+    measured against each link's OWN pad normal (the reach version uses the
+    palm normal for every link, which misreads a curled finger).
+
+    Shape: [num_envs], in [0, L]
+    """
+    back = _back_contact_force(env, sensor_cfg)                        # [N, L]
+    return (back.clamp(max=cap) / cap).sum(dim=-1) * _grasp_mask(env)
 
 
 def reward_finger_approach(
@@ -445,25 +550,30 @@ def reward_gentle_contact_groups(
     the fingers learned to press hard enough to bruise the apple in 72% of
     episodes while never once enclosing it.
 
+    Force is the PRIVILEGED per-finger gripping force (_finger_grip_force):
+    ground truth, pad-and-pad-edge contacts only. It used to be the grip
+    detector's sensed magnitude, which (before contact_geometry) counted a
+    contact on any face of a finger link in full -- so a finger lying with
+    its side against the apple was paid like one gripping it with its pad.
+
     Shape: [num_envs], in [0, 1]
     """
-    mag, _, _ = _closure_state(env, sensor_cfg, contact_threshold=good_min)
+    mag = _finger_grip_force(env, sensor_cfg)                          # [N, 3]
     ramp_up = (mag / good_min).clamp(max=1.0)
     ramp_down = (1.0 - (mag - good_max) / decay).clamp(min=0.0, max=1.0)
-    band = ramp_up * ramp_down                                         # [N, 4]
+    band = ramp_up * ramp_down                                         # [N, 3]
 
-    # FINGERS ONLY (columns 1..3 of _CLOSURE_GROUPS), each scaled by how
-    # curled that finger is. Two things this rules out, both observed:
-    # contact paying the same whether the finger was wrapped around the
-    # apple or lying straight against it (a policy converged on the apple
-    # resting against the base of a fully open index and middle, thumb
-    # closing on nothing); and the palm alone -- which touches the apple
-    # from the moment of hand-off, for free -- carrying this term. Keeping
-    # the apple seated on the palm is still rewarded, by reward_finger_curl
-    # (gated on palm contact) and by reward_grasp_enclosure (which counts
-    # the palm as one of its groups).
+    # FINGERS ONLY, each scaled by how curled that finger is. Two things
+    # this rules out, both observed: contact paying the same whether the
+    # finger was wrapped around the apple or lying straight against it (a
+    # policy converged on the apple resting against the base of a fully
+    # open index and middle, thumb closing on nothing); and the palm alone
+    # -- which touches the apple from the moment of hand-off, for free --
+    # carrying this term. Keeping the apple seated on the palm is still
+    # rewarded, by reward_finger_curl (gated on palm contact) and by
+    # reward_grasp_enclosure (which counts the palm as one of its groups).
     flex = _finger_flexion(env, full_credit_flex)                      # [N, 3]
-    return (band[:, 1:] * flex).mean(dim=-1) * _grasp_mask(env)
+    return (band * flex).mean(dim=-1) * _grasp_mask(env)
 
 
 def reward_finger_curl(
@@ -482,10 +592,17 @@ def reward_finger_curl(
     that gap. The palm-contact gate is what stops it being farmed by
     curling the fingers in mid-air with the apple nowhere near the hand.
 
+    "In the hand" is the palm touching it OR at least two fingers gripping
+    it (_finger_grip_force): a tripod often lifts the fruit off the palm
+    entirely, and a palm-only gate then withdrew this term exactly when the
+    grasp got better (measured on scripted closures: 0.39 for tripods vs
+    1.37 for pinches that kept the apple on the palm).
+
     Shape: [num_envs], in [0, 1]
     """
     mag, _, _ = _closure_state(env, sensor_cfg, contact_threshold=palm_contact_min)
-    apple_in_hand = (mag[:, 0] > palm_contact_min).float()             # palm group
+    fingers_gripping = (_finger_grip_force(env, sensor_cfg) > palm_contact_min).sum(dim=-1) >= 2
+    apple_in_hand = ((mag[:, 0] > palm_contact_min) | fingers_gripping).float()
     return _finger_flexion(env, full_credit_flex).mean(dim=-1) * apple_in_hand * _grasp_mask(env)
 
 
@@ -693,10 +810,13 @@ def penalty_excess_hand_force(
     for the palm rather than relying solely on "the episode ended early"
     (a sparse, delayed signal PPO had 1407 iterations to learn nothing
     from).
+
+    Reads _max_link_apple_force (every link, every face, per-link max), the
+    same quantity fruit_damaged terminates on.
     """
     if not hasattr(env, "_fruit_damage_force"):
         return torch.zeros(env.num_envs, device=env.device)
-    force = _per_finger_group_force(env, sensor_cfg).max(dim=-1).values
+    force = _max_link_apple_force(env, sensor_cfg)
     threshold = env._fruit_damage_force
     start = start_frac * threshold
     span = (cap_frac - start_frac) * threshold
