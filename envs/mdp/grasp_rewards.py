@@ -114,29 +114,61 @@ def _max_link_apple_force(
     return apple_force_per_link(env, sensor_cfg, RIGHT_HAND_CONTACT_LINKS).max(dim=-1).values
 
 
+def _finger_segment_contacts(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Privileged per-SEGMENT contact state of the three fingers.
+
+    Returns (force [N, 3, 2], quality [N, 3, 2]), fingers (thumb, index,
+    middle) x segments (proximal, distal) -- contact_geometry.
+    FINGER_PAD_LINKS order:
+      force   -- apple-filtered force magnitude on the segment, any face, N.
+      quality -- how squarely it lands on the pad, in [0, 1]
+                 (contact_geometry.pad_face_weight over that finger's
+                 GRIP_BAND_DEG): 1 on the pad (or, for index/middle, the
+                 pad's inner edge), 0 on the side or back.
+    Ground truth, no calibration gain -- a reward input, not an observation.
+    """
+    from .contact_geometry import FINGER_PAD_LINKS, GRIP_BAND_DEG, apple_contact_faces, pad_face_weight
+
+    fingers = ("thumb", "index", "middle")
+    links = [l for f in fingers for l in FINGER_PAD_LINKS[f]]
+    force, cos_pad = apple_contact_faces(env, sensor_cfg, links)          # [N, 6, 3], [N, 6]
+    band = torch.tensor([GRIP_BAND_DEG[f] for f in fingers for _ in range(2)], device=env.device)  # [6, 2]
+    quality = pad_face_weight(cos_pad, band[:, 0], band[:, 1])
+    return force.norm(dim=-1).view(-1, 3, 2), quality.view(-1, 3, 2)
+
+
+def _finger_grip(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per finger: (total apple force on its pad links [N, 3], force-weighted
+    mean contact quality [N, 3]).
+
+    Quality is kept as a separate MULTIPLIER rather than folded into the
+    force because the terms that use it saturate in force (bands, contact
+    thresholds): a thumb pressing its side into the apple at 7 N with
+    quality 0.25 still has 1.75 N of "quality-weighted force", enough to
+    pass any contact threshold -- which gives no gradient toward turning
+    the pad onto the fruit. Multiplying the saturated score by quality
+    does, continuously in the contact angle.
+    """
+    force, quality = _finger_segment_contacts(env, sensor_cfg)
+    total = force.sum(dim=-1)
+    q_mean = (force * quality).sum(dim=-1) / total.clamp(min=1e-6)
+    return total, q_mean
+
+
 def _finger_grip_force(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """[N, 3] privileged GRIPPING force per finger (thumb, index, middle):
-    apple-filtered force on the finger's pad links, each weighted by how
-    squarely it lands on the pad (contact_geometry.pad_face_weight over
-    GRIP_FULL_DEG..GRIP_CUT_DEG), summed per finger.
-
-    The weighting is wide on purpose: the tripod's inner-pad-edge contacts
-    (~20-30 deg off the pad normal) count in full, a side-face contact
-    (~60-90 deg, e.g. a finger lying beside the apple) counts little or
-    nothing, the back never. Ground truth, no calibration gain -- a reward
-    input, not an observation.
-    """
-    from .contact_geometry import (
-        FINGER_PAD_LINKS, apple_contact_faces, pad_face_weight, GRIP_FULL_DEG, GRIP_CUT_DEG,
-    )
-
-    links = [l for f in ("thumb", "index", "middle") for l in FINGER_PAD_LINKS[f]]
-    force, cos_pad = apple_contact_faces(env, sensor_cfg, links)          # [N, 6, 3], [N, 6]
-    grip = force.norm(dim=-1) * pad_face_weight(cos_pad, GRIP_FULL_DEG, GRIP_CUT_DEG)
-    return grip.view(env.num_envs, 3, 2).sum(dim=-1)
+    """[N, 3] privileged GRIPPING force per finger: segment force times its
+    contact quality, summed per finger (see _finger_segment_contacts)."""
+    force, quality = _finger_segment_contacts(env, sensor_cfg)
+    return (force * quality).sum(dim=-1)
 
 
 def _back_contact_force(
@@ -458,15 +490,54 @@ def reward_tripod_balance(
 
     The (fingers gripping / 3) factor keeps partial credit on the way in,
     same reasoning as reward_grasp_balance: no cliff before all three
-    touch.
+    touch. Each finger counts as ramp(force / min_force) TIMES its contact
+    quality (_finger_grip), not a hard count: with a hard count, a thumb
+    pressing its side into the apple counted as a full third of the
+    tripod, and the trained policy did exactly that.
 
     Shape: [num_envs], in [0, 1]
     """
-    grip = _finger_grip_force(env, sensor_cfg)                         # [N, 3]
-    n_grip = (grip > min_force).sum(dim=-1).float()
-    f_i, f_m = grip[:, 1], grip[:, 2]
-    sym = torch.minimum(f_i, f_m) / torch.maximum(f_i, f_m).clamp(min=min_force)
-    return (n_grip / 3.0) * sym * _grasp_mask(env)
+    total, q = _finger_grip(env, sensor_cfg)                           # [N, 3], [N, 3]
+    gripping = (total / min_force).clamp(max=1.0) * q
+    g_i, g_m = total[:, 1] * q[:, 1], total[:, 2] * q[:, 2]
+    sym = torch.minimum(g_i, g_m) / torch.maximum(g_i, g_m).clamp(min=min_force)
+    return (gripping.sum(dim=-1) / 3.0) * sym * _grasp_mask(env)
+
+
+def reward_finger_wrap(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    full_force: float = 0.5,
+) -> torch.Tensor:
+    """Each finger wrapped around the fruit: BOTH its proximal and distal
+    segment on it, pad-side (_finger_segment_contacts). Per finger,
+
+        min over its 2 segments of  ramp(force / full_force) * quality
+
+    averaged over thumb, index and middle.
+
+    Nothing else asks for this: gentle_contact_groups and tripod_balance
+    read a finger's TOTAL force, so a fingertip-only pinch scores the same
+    as a finger wrapped around the fruit. A trained policy settled on
+    exactly that -- index/middle distal segments on the apple 84-90% of the
+    time, proximal ones 3%, fingertips curled to ~1.4 rad -- and a thumb
+    touching with one segment only. Base-plus-tip contact spreads the load
+    along the finger and holds the fruit from more directions, which is
+    what should survive the tugs of harvesting.
+
+    Reachable, measured: scripted closures with index/middle at ~0.5 rad
+    proximal / ~0.9 rad distal put both segments on the apple (22-37 deg
+    off the pad, the tripod's inner-edge contact), as did thumb_1 ~0,
+    thumb_2 ~-0.5 for the thumb.
+
+    min() on purpose: one segment alone earns nothing here (it is already
+    paid by gentle_contact_groups); this term is only the second one.
+
+    Shape: [num_envs], in [0, 1]
+    """
+    force, quality = _finger_segment_contacts(env, sensor_cfg)         # [N, 3, 2]
+    seg = (force / full_force).clamp(max=1.0) * quality
+    return seg.min(dim=-1).values.mean(dim=-1) * _grasp_mask(env)
 
 
 def penalty_back_contact(
@@ -550,18 +621,21 @@ def reward_gentle_contact_groups(
     the fingers learned to press hard enough to bruise the apple in 72% of
     episodes while never once enclosing it.
 
-    Force is the PRIVILEGED per-finger gripping force (_finger_grip_force):
-    ground truth, pad-and-pad-edge contacts only. It used to be the grip
-    detector's sensed magnitude, which (before contact_geometry) counted a
-    contact on any face of a finger link in full -- so a finger lying with
-    its side against the apple was paid like one gripping it with its pad.
+    Force is PRIVILEGED (_finger_grip): the finger's total apple force (any
+    face -- the band's upper edge is about not squeezing too hard, and a
+    side contact squeezes too), and the band score is multiplied by the
+    contact quality, so only pad (and, for index/middle, pad-edge) contact
+    is paid. It used to be the grip detector's sensed magnitude, which
+    (before contact_geometry) counted a contact on any face in full -- so a
+    finger lying with its side against the apple was paid like one gripping
+    it with its pad.
 
     Shape: [num_envs], in [0, 1]
     """
-    mag = _finger_grip_force(env, sensor_cfg)                          # [N, 3]
+    mag, quality = _finger_grip(env, sensor_cfg)                       # [N, 3], [N, 3]
     ramp_up = (mag / good_min).clamp(max=1.0)
     ramp_down = (1.0 - (mag - good_max) / decay).clamp(min=0.0, max=1.0)
-    band = ramp_up * ramp_down                                         # [N, 3]
+    band = ramp_up * ramp_down * quality                               # [N, 3]
 
     # FINGERS ONLY, each scaled by how curled that finger is. Two things
     # this rules out, both observed: contact paying the same whether the
@@ -764,8 +838,11 @@ def reward_grasp_hold(
 
 
 def reward_grasp_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """Large one-time bonus on the step terminations_and_events.grasp_success
-    fires. Does NOT recompute the check itself — reads env._grasp_success,
+    """1.0 on every step terminations_and_events.grasp_success's check
+    holds. With that termination's terminate=True this is a one-time bonus
+    (the episode ends on that step); with terminate=False (the grasp env's
+    setting) it is a PER-STEP reward for keeping the fruit lifted in a
+    closed grasp -- weight it like one. Does NOT recompute the check itself — reads env._grasp_success,
     cached by that termination (mirrors reach_rewards.reward_reach_success's
     pattern exactly, including the "terminations before rewards" ordering
     guarantee it relies on).

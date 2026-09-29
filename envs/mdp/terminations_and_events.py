@@ -188,6 +188,7 @@ def grasp_success(
     hold_time: float = 0.5,
     lift_margin: float = 0.03,
     contact_threshold: float = 0.5,
+    terminate: bool = True,
 ) -> torch.Tensor:
     """Terminate once the hand has enclosed the apple (see
     grasp_rewards._force_closure_ok for the proxy used) and that has held
@@ -246,6 +247,17 @@ def grasp_success(
     hold_steps_required = max(1, round(hold_time / env.step_dt))
     success = env._grasp_hold_counter >= hold_steps_required
     env._grasp_success = success   # read by grasp_rewards.reward_grasp_success
+    if not terminate:
+        # Checked every step, never ends the episode: env._grasp_success
+        # then stays True for as long as the lifted grasp keeps holding, so
+        # reward_grasp_success pays PER STEP for holding it. Ending the
+        # episode on success cost the policy all the reward it would have
+        # collected by continuing (~0.22/step of shaping terms, worth ~20
+        # over the grasp window at gamma = 0.99) against a one-off bonus
+        # of 95 * dt = 1.9 -- i.e. it taught the policy NOT to succeed.
+        # Holding the fruit to the end of the episode is also closer to
+        # what harvesting needs than "held it for 0.5 s once".
+        return torch.zeros_like(success)
     return success
 
 

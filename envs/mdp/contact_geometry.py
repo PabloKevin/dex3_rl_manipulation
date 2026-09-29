@@ -177,11 +177,23 @@ def angle_deg(cos_pad: torch.Tensor) -> torch.Tensor:
 TACTILE_FULL_DEG_DEFAULT = 30.0
 TACTILE_CUT_DEG_DEFAULT = 60.0
 
-# Privileged "is this a gripping contact" band, for rewards: generous on
-# purpose -- the tripod's pad-edge contacts must count fully -- but a side
-# or back contact must not.
-GRIP_FULL_DEG = 45.0
-GRIP_CUT_DEG = 75.0
+# Privileged "is this a gripping contact" band per finger, for rewards:
+# (full_deg, cut_deg) as in pad_face_weight.
+#   - index/middle: generous on purpose. They only flex in their own
+#     planes, so on a centred apple their pads' INNER EDGES are the contact
+#     (measured 22-37 deg on scripted tripods) and must count fully; a side
+#     or back contact must not.
+#   - thumb: strict. It is the one digit that can meet the apple squarely
+#     (scripted tripods: 4-9 deg off its pad). With the index/middle band a
+#     trained policy found it cheaper to swing thumb_0 to its limit and
+#     press the thumb's SIDE into the apple (41 deg, 10 mm off the pad
+#     centreline) than to flex the thumb from its open pose -- and was paid
+#     in full for it.
+GRIP_BAND_DEG: dict[str, tuple[float, float]] = {
+    "thumb": (25.0, 45.0),
+    "index": (45.0, 75.0),
+    "middle": (45.0, 75.0),
+}
 
 __all__ = [
     "PAD_NORMAL_LOCAL",
@@ -191,6 +203,5 @@ __all__ = [
     "angle_deg",
     "TACTILE_FULL_DEG_DEFAULT",
     "TACTILE_CUT_DEG_DEFAULT",
-    "GRIP_FULL_DEG",
-    "GRIP_CUT_DEG",
+    "GRIP_BAND_DEG",
 ]

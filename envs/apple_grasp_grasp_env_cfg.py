@@ -518,6 +518,14 @@ class RewardsCfg:
         weight=5.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
+    # Base AND tip of each finger on the fruit, not just the tip: see
+    # reward_finger_wrap for the trained-policy measurement behind it
+    # (index/middle proximal segments on the apple 3% of the time).
+    finger_wrap = RewTerm(
+        func=gr.reward_finger_wrap,
+        weight=3.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
     # Apple on the BACK of the palm or of a finger segment: the real pads
     # cannot feel it, so only this privileged term can discourage it.
     back_contact = RewTerm(
@@ -530,7 +538,16 @@ class RewardsCfg:
         weight=3.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
     )
-    grasp_success_bonus = RewTerm(func=gr.reward_grasp_success, weight=95.0)
+    # PER STEP while the fruit is held lifted in a closed grasp (grasp_
+    # success no longer ends the episode -- see TerminationsCfg). Was a
+    # 95-weight one-off bonus on a terminating success: 95 * dt = 1.9,
+    # against ~20 of shaping reward the policy forfeited by ending the
+    # episode, so succeeding was a net LOSS. 10/step is on the order of all
+    # the shaping terms together (~11/step for the last trained policy),
+    # so a lifted, held grasp roughly doubles the rate -- and it is the
+    # only term that requires the grip to have latched, i.e. the apple to
+    # be off the stem. Episode_Reward/lifted_hold / 10 = seconds held.
+    lifted_hold = RewTerm(func=gr.reward_grasp_success, weight=10.0)
 
     # Dense, within-episode gradient toward backing off BEFORE
     # terminations_and_events.fruit_damaged's hard, instantaneous cutoff --
@@ -650,6 +667,11 @@ class TerminationsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "hold_time": 0.5,
             "lift_margin": 0.03,
+            # Checked (and cached for RewardsCfg.lifted_hold) every step,
+            # but never ends the episode -- see the function's terminate
+            # note. Episode_Termination/grasp_success therefore reads 0;
+            # watch Episode_Reward/lifted_hold for success instead.
+            "terminate": False,
         },
     )
 
