@@ -11,7 +11,11 @@ from .apple_grasp_grasp_env_cfg import (
     AppleGraspGraspEnvCfg,
     AppleGraspGraspEnvCfg_PLAY,
 )
-from .agents.rsl_rl_ppo_cfg import AppleGraspPPORunnerCfg, AppleGraspGraspPPORunnerCfg
+from .apple_grasp_harvest_env_cfg import (
+    AppleGraspHarvestEnvCfg,
+    AppleGraspHarvestEnvCfg_PLAY,
+)
+from .agents.rsl_rl_ppo_cfg import AppleGraspPPORunnerCfg, AppleGraspGraspPPORunnerCfg, AppleGraspHarvestPPORunnerCfg
 
 gym.register(
     id="AppleGrasp-v0",
@@ -56,6 +60,26 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleGraspGraspEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleGraspGraspPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspHarvest-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspHarvestEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspHarvestPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspHarvest-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspHarvestEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspHarvestPPORunnerCfg,
     },
     disable_env_checker=True,
 )

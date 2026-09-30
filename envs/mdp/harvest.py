@@ -102,20 +102,27 @@ class BreakableStem:
     def _u(self, rng, ids):
         return torch.empty(len(ids), device=self.env.device).uniform_(*rng)
 
-    def engage(self, env_ids: torch.Tensor, axis_w: torch.Tensor | None = None) -> None:
-        """Attach the stem to the apple's CURRENT pose (no preload): the
-        pivot sits `length` beyond the apple surface along axis_w (default
-        world +Z, i.e. hanging from above)."""
+    def engage(self, env_ids: torch.Tensor, axis_w: torch.Tensor | None = None,
+               pos: torch.Tensor | None = None, quat: torch.Tensor | None = None,
+               preload: torch.Tensor | None = None) -> None:
+        """Attach the stem to the apple's CURRENT pose (or the given pos /
+        quat, e.g. one just written at reset) with no preload: the pivot
+        sits `length` beyond the apple surface along axis_w (default world
+        +Z, i.e. hanging from above)."""
         ids = env_ids
         if len(ids) == 0:
             return
-        pos = self.obj.data.root_pos_w[ids]
-        quat = self.obj.data.root_quat_w[ids]
+        pos = self.obj.data.root_pos_w[ids] if pos is None else pos
+        quat = self.obj.data.root_quat_w[ids] if quat is None else quat
+        radius = getattr(self.env, "_apple_radius", None)
+        if isinstance(radius, torch.Tensor):
+            self.radius_env = radius
+        r = self.radius_env[ids] if hasattr(self, "radius_env") else torch.full((len(ids),), self.radius, device=self.env.device)
         if axis_w is None:
             axis_w = torch.tensor([0.0, 0.0, 1.0], device=self.env.device).expand(len(ids), 3)
         axis_w = normalize(axis_w)
         length = self._u(self.p.length, ids)
-        self.pivot[ids] = pos + axis_w * (self.radius + length).unsqueeze(-1)
+        self.pivot[ids] = pos + axis_w * (r + length).unsqueeze(-1)
         self.axis[ids] = axis_w
         self.end_local[ids] = quat_apply(quat_conjugate(quat), self.pivot[ids] - pos)
         self.quat0[ids] = quat
@@ -135,6 +142,12 @@ class BreakableStem:
         self.f_break[ids] = self._u(self.p.break_pull, ids)
         self.m_bend_break[ids] = self._u(self.p.break_bend, ids)
         self.m_twist_break[ids] = self._u(self.p.break_twist, ids)
+        if preload is not None:
+            # Start already applying `preload` (world N): shift the pivot so
+            # the springs are stretched by K^-1 * preload at this pose.
+            f_ax = (preload * axis_w).sum(-1, keepdim=True) * axis_w
+            shift = f_ax / self.k_pull[ids].unsqueeze(-1) + (preload - f_ax) / self.k_lat[ids].unsqueeze(-1)
+            self.pivot[ids] = self.pivot[ids] + shift
         self.active[ids] = True
         self.broken[ids] = False
         self.break_cause[ids] = 0
