@@ -179,6 +179,59 @@ def grasp_phase_active(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return env._grasp_phase_active
 
 
+def stem_released(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[num_envs] bool: has the compliant stem let go of the apple this
+    episode -- on the trainee's first latched grip OR once this episode's
+    randomized release time after hand-off has passed, whichever is first
+    (see update_first_closure). Falls back to grip_established when the
+    timed release isn't configured."""
+    if not hasattr(env, "_stem_released"):
+        return grip_established(env)
+    return env._stem_released
+
+
+def shaping_active(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[num_envs] bool: may the grasp-shaping rewards pay this step? True
+    once the stem has let go (the hand holds the fruit itself), and before
+    that only for env._shaping_grace_s after the hand-off. All-True when no
+    grace is configured, or before the first reset created the state."""
+    grace = getattr(env, "_shaping_grace_s", None)
+    if grace is None or not hasattr(env, "_grasp_handoff_step"):
+        return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    if isinstance(grace, (tuple, list)):
+        grace = _grace_schedule(env, *grace)
+    since_handoff = (env.episode_length_buf - env._grasp_handoff_step).float() * env.step_dt
+    return stem_released(env) | (since_handoff < grace)
+
+
+def _grace_schedule(
+    env: "ManagerBasedRLEnv",
+    start_s: float,
+    end_s: float,
+    start_step: int,
+    end_step: int,
+) -> float:
+    """Training curriculum for the shaping grace: start_s until
+    env.common_step_counter reaches start_step, then linearly to end_s at
+    end_step, end_s after. common_step_counter counts env.step() calls
+    (one per PPO rollout step), so with num_steps_per_env = 64,
+    iteration i is step 64 * i.
+
+    Why a curriculum: a fixed 2 s grace from the first iteration cut the
+    signal for closing the fingers to 2 of the 5 s grasp window, and a
+    fresh policy needs most of that just to close -- 400 iterations
+    learned nothing. Earlier runs, with no grace, learned to close within
+    ~100 iterations; the grace is only needed once there is a grasp to
+    keep undetected.
+    """
+    t = env.common_step_counter
+    if t <= start_step:
+        return start_s
+    if t >= end_step:
+        return end_s
+    return start_s + (end_s - start_s) * (t - start_step) / (end_step - start_step)
+
+
 def grip_established(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """[num_envs] bool: has the trainee held a closure long enough this
     episode for the stem to let go (env._grasp_ever_closed)? All-False
@@ -189,12 +242,16 @@ def grip_established(env: "ManagerBasedRLEnv") -> torch.Tensor:
 
 
 def grip_established_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """Policy observation: 1.0 once the grip is established (and so the arm
-    is unlocked and the apple is off the stem), 0.0 before.
+    """Policy observation: 1.0 once the stem has let go of the apple (so the
+    hand alone holds it and the arm is unlocked), 0.0 before. That is the
+    grip latching OR the per-episode release deadline, whichever came
+    first (stem_released) -- both change what the policy's actions do, so
+    it has to see it. Name kept for the observation layout; before the
+    timed release existed the two were the same thing.
 
     Shape: [num_envs, 1]
     """
-    return grip_established(env).float().unsqueeze(-1)
+    return stem_released(env).float().unsqueeze(-1)
 
 
 def grasp_phase_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
@@ -211,6 +268,10 @@ def reset_reach_grasp_phase(
     env_ids: torch.Tensor,
     object_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg,
+    stem_release_time_range: tuple[float, float] | None = None,
+    shaping_grace_s: float | tuple[float, float, int, int] | None = None,
+    stem_release_schedule: tuple[float, float, int, int, float] | None = None,
+    release_on_latch: bool = True,
 ) -> None:
     """mode="reset" event -- MUST come after the apple placement event
     (randomize_tree), since it records the apple's freshly-placed pose as
@@ -226,7 +287,23 @@ def reset_reach_grasp_phase(
       _grasp_handoff_joint_pos  -> placeholder until the real hand-off
                                    (penalty_joint_deviation_from_handoff is
                                    gated off until then anyway)
+      _stem_release_time        -> seconds after hand-off at which the stem
+                                   lets go even without a latched grip,
+                                   sampled from stem_release_time_range
+                                   (inf when None: release on latch only)
+      _stem_released            -> False
+    Also stores shaping_grace_s as env._shaping_grace_s (see
+    shaping_active): seconds, or (start_s, end_s, start_step, end_step)
+    for a training curriculum (_grace_schedule); None disables it.
+
+    stem_release_schedule = (start_s, end_s, start_step, end_step, jitter_s)
+    samples each episode's release time as _grace_schedule(...) +
+    U(0, jitter_s) instead -- a curriculum on WHEN the stem lets go.
+    release_on_latch=False makes the stem (and so the arm unlock, which
+    follows it) ignore the grip latch entirely: see update_first_closure.
     """
+    env._shaping_grace_s = shaping_grace_s
+    env._stem_release_on_latch = release_on_latch
     apple: RigidObject = env.scene[object_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
     device = env.device
@@ -239,8 +316,19 @@ def reset_reach_grasp_phase(
         env._grasp_handoff_apple_pos = torch.zeros(env.num_envs, 3, device=device)
         env._grasp_handoff_apple_quat = torch.zeros(env.num_envs, 4, device=device)
         env._grasp_handoff_joint_pos = robot.data.joint_pos.clone()
+        env._grasp_handoff_step = torch.zeros(env.num_envs, dtype=torch.long, device=device)
+        env._stem_release_time = torch.full((env.num_envs,), float("inf"), device=device)
+        env._stem_released = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
 
     env._grasp_phase_active[ids] = False
+    env._stem_released[ids] = False
+    if stem_release_schedule is not None:
+        s0, s1, t0, t1, jitter = stem_release_schedule
+        base = _grace_schedule(env, s0, s1, t0, t1)
+        env._stem_release_time[ids] = base + torch.empty(len(ids), device=device).uniform_(0.0, jitter)
+    elif stem_release_time_range is not None:
+        lo, hi = stem_release_time_range
+        env._stem_release_time[ids] = torch.empty(len(ids), device=device).uniform_(lo, hi)
     env._grasp_ever_closed[ids] = False
     env._reach_phase_hold_counter[ids] = 0.0
     # write_root_pose_to_sim updates the data buffers immediately, so this
@@ -309,6 +397,7 @@ def update_reach_grasp_phase(
     ids = switch.nonzero(as_tuple=True)[0]
     robot: Articulation = env.scene[robot_cfg.name]
     env._grasp_handoff_joint_pos[ids] = robot.data.joint_pos[ids].clone()
+    env._grasp_handoff_step[ids] = env.episode_length_buf[ids]
     env._grasp_phase_active[ids] = True
 
 
@@ -329,6 +418,18 @@ def update_first_closure(
     Closure must hold for min_steps consecutive control steps before the
     apple is released, so a one-step contact blip while the fingers are
     still moving can't drop it into a grip that doesn't exist yet.
+
+    Also updates env._stem_released: the latch above, OR this episode's
+    randomized release time after hand-off having passed. Releasing ONLY
+    on the latch let the policy keep the stem holding the fruit forever by
+    never letting its grip be detected -- and a trained policy did exactly
+    that: it held index_1 at its open limit (commanded 0.9 rad past it) and
+    kept the apple off the palm, the two cheapest ways to keep the
+    detector's contact groups below three, because every latch it did allow
+    released the stem into a grip that then failed (apple_fell_from_grip
+    in 10-19% of training episodes) and cost it the rest of the episode.
+    With a deadline, not being detected no longer keeps the apple up; being
+    detected still unlocks the arm for the lift (unlock_with_grip).
     """
     if not hasattr(env, "_grasp_ever_closed"):
         return
@@ -341,6 +442,20 @@ def update_first_closure(
         closure_now & env._grasp_phase_active, env._closure_streak + 1, torch.zeros_like(env._closure_streak)
     ))
     env._grasp_ever_closed |= env._closure_streak >= min_steps
+
+    if hasattr(env, "_stem_released"):
+        since_handoff = (env.episode_length_buf - env._grasp_handoff_step).float() * env.step_dt
+        deadline = env._grasp_phase_active & (since_handoff >= env._stem_release_time)
+        # With release_on_latch=False the latch changes NOTHING the policy
+        # could fear -- stem, arm unlock and the observed flag all follow
+        # the deadline alone -- so being detected is pure bonus
+        # (grasp_hold). Every variant that released on the latch taught a
+        # policy to dodge detection by withholding one contact group: first
+        # index_1, then (with the deadline removed) the thumb, commanded
+        # ~0.6 rad past its open limit so the palm + index + middle, which
+        # all push from one side, could never reach closure.
+        latch = env._grasp_ever_closed if getattr(env, "_stem_release_on_latch", True) else False
+        env._stem_released |= latch | deadline
 
 
 # ─────────────────────────────────────────────
@@ -382,6 +497,10 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         self._anchor = torch.zeros(n, j, device=self.device)
         self._anchored = torch.zeros(n, dtype=torch.bool, device=self.device)
         self._reach_prev_raw = torch.zeros(n, j, device=self.device)
+        self._grasp_offset = self._offset.clone() if isinstance(self._offset, torch.Tensor) \
+            else torch.full((n, j), float(self._offset), device=self.device)
+        for name, value in (cfg.grasp_offset or {}).items():
+            self._grasp_offset[:, self._joint_names.index(name)] = value
 
         if cfg.drive_with_reach_policy:
             # Resolved WITHOUT preserve_order, matching the reach task's own
@@ -396,10 +515,17 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
         phase = grasp_phase_active(self._env).unsqueeze(-1)
-        grip = grip_established(self._env)
+        # Proximal arm unlocks when the STEM lets go (grip latched, or the
+        # release deadline), not on the latch alone. Unlocking only on the
+        # latch made being detected the one thing that exposed the grasp to
+        # arm exploration noise -- which shook latched apples loose in
+        # 10-19% of training episodes -- so the policy learned to keep its
+        # grip undetected (index_1 held open, apple kept off the palm) and
+        # the arm frozen. Now both paths reach the same free arm.
+        grip = stem_released(self._env)
 
         # -- grasp-phase (trainee) target --
-        offset = self._offset
+        offset = self._grasp_offset
         if self.cfg.anchor_to_handoff:
             newly = grasp_phase_active(self._env) & ~self._anchored
             if newly.any():
@@ -511,7 +637,7 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         # The stem is what the apple actually hangs from, and the scene
         # already carries APPLE_STEM_BREAK_FORCE/TORQUE for the harvest
         # phase, so this is also the physically honest version.
-        soft = phase & ~self._env._grasp_ever_closed
+        soft = phase & ~stem_released(self._env)
         d = anchor - obj.data.root_pos_w
         f = self.cfg.stem_stiffness * d - self.cfg.stem_damping * obj.data.root_lin_vel_w
         f_mag = f.norm(dim=-1, keepdim=True)
@@ -573,6 +699,15 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     object_name: str = "apple"
     pin_object: str | None = None
     unlock_with_grip: bool = False
+    grasp_offset: dict[str, float] | None = None
+    """Joint name -> target (rad) that a ZERO trainee action means in the
+    grasp phase, replacing the default-pose offset for those joints (the
+    reach phase keeps the default pose). With the default offset every
+    Dex3 flexion joint sits at its OPEN limit at zero action, so exploration
+    noise around zero spends half its time in a dead zone past the limit;
+    for the thumb, the ~0.9 rad from there to the fruit was never crossed
+    in four training runs even when contact was worth ~2x the reward.
+    A pre-grasp offset centres exploration where the decision is."""
     # Compliant-stem spring-damper (grasp phase, before first closure).
     # Softened from 200 N/m / 15 N: that resisted the fingers repositioning
     # the apple nearly as stiffly as the old rigid pin, and 15 N is far

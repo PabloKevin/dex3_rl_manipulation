@@ -47,6 +47,27 @@ def _grasp_mask(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return grasp_phase_active(env).float()
 
 
+def _shaping_mask(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[N] float: _grasp_mask, and additionally 0.0 once the grasp has gone
+    UNDETECTED for longer than the shaping grace (grasp_autoplay.
+    shaping_active). Applied to the positive grasp-shaping terms only --
+    penalties, grasp_hold and lifted_hold keep _grasp_mask.
+
+    Why: the stem holds the apple until the grip detector latches, which
+    is what gives a learning policy drop-free time to discover closing
+    its fingers at all (a hard stem-release deadline instead left it 1-2 s
+    per episode, every episode ended in apple_fell_from_grip, and 1250
+    iterations learned nothing). But unlimited stem support made an
+    undetected grasp strictly safer than a detected one, and a trained
+    policy exploited it (index_1 held open, apple kept off the palm) to
+    collect shaping reward on a stem-held apple for the whole episode.
+    Past the grace, an undetected grasp earns no shaping: latching and
+    holding is then the only way to keep earning.
+    """
+    from .grasp_autoplay import shaping_active
+    return _grasp_mask(env) * shaping_active(env).float()
+
+
 # ═════════════════════════════════════════════════════════════════════════
 #  Shared ground-truth helpers
 # ═════════════════════════════════════════════════════════════════════════
@@ -463,7 +484,7 @@ def reward_grasp_balance(
     mean_f = per_finger.mean(dim=-1)
     cv = per_finger.std(dim=-1) / (mean_f + 1e-6)
     balance = torch.exp(-cv)
-    return balance * (n_contact / 3.0) * _grasp_mask(env)
+    return balance * (n_contact / 3.0) * _shaping_mask(env)
 
 
 def reward_tripod_balance(
@@ -501,7 +522,7 @@ def reward_tripod_balance(
     gripping = (total / min_force).clamp(max=1.0) * q
     g_i, g_m = total[:, 1] * q[:, 1], total[:, 2] * q[:, 2]
     sym = torch.minimum(g_i, g_m) / torch.maximum(g_i, g_m).clamp(min=min_force)
-    return (gripping.sum(dim=-1) / 3.0) * sym * _grasp_mask(env)
+    return (gripping.sum(dim=-1) / 3.0) * sym * _shaping_mask(env)
 
 
 def reward_finger_wrap(
@@ -537,7 +558,81 @@ def reward_finger_wrap(
     """
     force, quality = _finger_segment_contacts(env, sensor_cfg)         # [N, 3, 2]
     seg = (force / full_force).clamp(max=1.0) * quality
-    return seg.min(dim=-1).values.mean(dim=-1) * _grasp_mask(env)
+    return seg.min(dim=-1).values.mean(dim=-1) * _shaping_mask(env)
+
+
+def reward_palm_support(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    good_min: float = 0.3,
+    good_max: float = 4.0,
+    decay: float = 4.0,
+    full_deg: float = 40.0,
+    cut_deg: float = 70.0,
+    finger_min: float = 0.5,
+) -> torch.Tensor:
+    """The fruit resting on the PALM face while the fingers hold it: a
+    trapezoid on the apple-filtered palm force (ramp to good_min, flat to
+    good_max, decaying over `decay` N), times how squarely it lands on the
+    palm face (contact_geometry.pad_face_weight). Privileged.
+
+    Nothing asked for palm contact during the grasp, and the trained policy
+    kept the apple ~2 mm above the palm in every episode (0 N) -- partly
+    because the palm is one of the grip detector's contact groups, so
+    touching it brought the latch, and with it the stem release, closer.
+    Scripted closures from the same hand-off put the palm on the fruit
+    together with finger segments (a power grasp), so it is reachable, and
+    a palm under the fruit resists the downward and outward tugs of
+    harvesting that fingertips alone resist worst.
+
+    Shape: [num_envs], in [0, 1]
+    """
+    from .contact_geometry import apple_contact_faces, pad_face_weight
+
+    force, cos_pad = apple_contact_faces(env, sensor_cfg, ["right_hand_palm_link"])
+    mag = force.norm(dim=-1)[:, 0]
+    ramp_up = (mag / good_min).clamp(max=1.0)
+    ramp_down = (1.0 - (mag - good_max) / decay).clamp(min=0.0, max=1.0)
+    palm = ramp_up * ramp_down * pad_face_weight(cos_pad[:, 0], full_deg, cut_deg)
+    # ...WHILE THE FINGERS HOLD IT: at least two fingers gripping, each
+    # counted as ramp(force / finger_min) x contact quality (the same soft
+    # count reward_tripod_balance uses). Without this gate the apple
+    # already rests on the palm at hand-off, so an open, motionless hand
+    # earned nearly all of this term -- and closing the fingers, which
+    # tends to lift the fruit off the palm, only lost it: a 400-iteration
+    # run never closed a finger.
+    total, q = _finger_grip(env, sensor_cfg)
+    fingers = ((total / finger_min).clamp(max=1.0) * q).sum(dim=-1)
+    return palm * (fingers - 1.0).clamp(0.0, 1.0) * _shaping_mask(env)
+
+
+def penalty_hand_motion_while_gripping(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    grip_min: float = 0.5,
+) -> torch.Tensor:
+    """Sum of squared hand joint velocities (rad/s)^2, only while at least
+    two fingers grip the fruit (_finger_grip_force > grip_min). Use a
+    NEGATIVE weight.
+
+    "Find a grasp, then keep it": the next phase (harvest) is meant to
+    freeze the finger joints and move only the arm, which needs the grasp
+    to be a still pose, not a fidget. The trained policy kept the fingers
+    moving after the grasp had formed (settled |dq| 0.5-1.0 rad/s on
+    middle_1 / thumb_2). Gated on gripping so closing the hand -- which has
+    to be fast -- is never charged; action_rate_weighted already prices
+    raw action changes, but a policy commanding targets far past contact
+    (as this one does, e.g. index_0 target 1.23 vs 0.85 reached) turns tiny
+    action changes into force changes, so the joint velocity is what has
+    to be priced directly.
+
+    Shape: [num_envs]
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    dq = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    gripping = ((_finger_grip_force(env, sensor_cfg) > grip_min).sum(dim=-1) >= 2).float()
+    return (dq ** 2).sum(dim=-1) * gripping * _grasp_mask(env)
 
 
 def penalty_back_contact(
@@ -560,36 +655,77 @@ def penalty_back_contact(
     return (back.clamp(max=cap) / cap).sum(dim=-1) * _grasp_mask(env)
 
 
+# Where each fingertip segment touches the fruit in a good tripod, in that
+# link's own frame (m): median contact points measured on scripted and
+# trained tripod closures. The link ORIGINS sit at the joints, ~2 cm from
+# the pads; index/middle points are on the pads' inner edges (z = -/+13 mm),
+# which is where those fingers meet a centred fruit.
+_FINGER_PAD_POINT_LOCAL = {
+    "thumb": (0.0081, 0.0196, 0.0024),
+    "index": (0.0195, 0.0069, -0.0131),
+    "middle": (0.0193, 0.0070, 0.0129),
+}
+
+
 def reward_finger_approach(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    std: float = 0.05,
+    std: float = 0.03,
 ) -> torch.Tensor:
-    """Dense shaping: exp(-mean_fingertip_to_apple_dist^2 / 2std^2) across
-    the 3 finger-tip links (_FINGER_TIP_LINKS) — gradient toward closing the
-    gap to the apple even before ANY contact registers. Without this,
-    grasp_balance/grasp_hold/grasp_setpoint_tracking are all exactly zero
-    (or, for setpoint_tracking, actively favor near-zero force on low-target
-    episodes — see that function's own note) until contact happens at all,
-    so a policy that hasn't discovered contact yet has NOTHING pulling it
-    toward the apple. Same "gradient at every distance" reasoning as
-    reach_rewards.reward_reach_gaussian — this is the grasp-phase
-    equivalent of that term.
+    """Dense shaping toward contact, PER FINGER: mean over thumb, index and
+    middle of exp(-gap_f^2 / 2 std^2) * facing_f, where gap_f = distance
+    from that finger's tip-segment pad point (_FINGER_PAD_POINT_LOCAL) to
+    the fruit SURFACE (centre distance minus this episode's apple radius),
+    clamped at 0, and facing_f = ((1 + cos a_f) / 2)^4, a_f the angle
+    between the pad's outward normal (contact_geometry.PAD_NORMAL_LOCAL)
+    and the direction from the pad point to the fruit centre: 1 facing it
+    squarely, ~0.5 at 45 deg, ~0.06 side-on.
+
+    facing_f is there because distance alone was gamed within 400
+    iterations: the policy swung thumb_0 to near its limit, parking the
+    thumb's pad point beside the fruit, side-on and unflexed, and collected
+    ~85% of this term without ever touching. Smooth rather than a hard
+    angle band so it adds a gradient toward turning the pad in from
+    anywhere, instead of a new flat region.
+
+    Each finger gets its own gradient. The previous version was one
+    Gaussian of the MEAN fingertip-to-centre distance, measured from link
+    origins: with index and middle already on the fruit it barely moved as
+    the thumb closed (+0.1 of 2.0 between thumb fully open and touching),
+    so the ~0.9 rad the thumb has to travel before contact pays anything
+    was a flat plateau. Measured on scripted poses: thumb open 7.9/step,
+    thumb halfway 7.5, thumb on the fruit 14-18 -- and two trained policies
+    parked the thumb open (commanded past its limit), where exploration
+    noise could never find the payoff.
     """
     apple: RigidObject = env.scene[object_cfg.name]
     robot: Articulation = env.scene[robot_cfg.name]
-    if not hasattr(env, "_finger_tip_robot_ids"):
-        env._finger_tip_robot_ids = {
-            f: robot.data.body_names.index(link) for f, link in _FINGER_TIP_LINKS.items()
-        }
     fingers = ("thumb", "index", "middle")
-    points = torch.stack(
-        [robot.data.body_pos_w[:, env._finger_tip_robot_ids[f], :] for f in fingers], dim=1
-    )  # [N, 3, 3]
-    dist = torch.norm(points - apple.data.root_pos_w.unsqueeze(1), dim=-1)  # [N, 3]
-    mean_dist = dist.mean(dim=-1)
-    return torch.exp(-(mean_dist ** 2) / (2.0 * std ** 2)) * _grasp_mask(env)
+    if not hasattr(env, "_finger_pad_point_cache"):
+        from .contact_geometry import PAD_NORMAL_LOCAL
+        n = torch.tensor([PAD_NORMAL_LOCAL[_FINGER_TIP_LINKS[f]] for f in fingers], device=env.device)
+        env._finger_pad_point_cache = (
+            [robot.data.body_names.index(_FINGER_TIP_LINKS[f]) for f in fingers],
+            torch.tensor([_FINGER_PAD_POINT_LOCAL[f] for f in fingers], device=env.device),
+            n / n.norm(dim=-1, keepdim=True),
+        )
+    ids, pts_local, normals_local = env._finger_pad_point_cache
+    quat = robot.data.body_quat_w[:, ids]                                      # [N, 3, 4]
+    pts = robot.data.body_pos_w[:, ids] + quat_apply(
+        quat.reshape(-1, 4), pts_local.unsqueeze(0).expand(env.num_envs, -1, -1).reshape(-1, 3)
+    ).reshape(env.num_envs, 3, 3)
+    to_apple = apple.data.root_pos_w.unsqueeze(1) - pts                        # [N, 3, 3]
+    dist = torch.norm(to_apple, dim=-1)                                        # [N, 3]
+    radius = getattr(env, "_apple_radius", None)
+    radius = radius.unsqueeze(-1) if isinstance(radius, torch.Tensor) else 0.0
+    gap = (dist - radius).clamp(min=0.0)
+    n_world = quat_apply(
+        quat.reshape(-1, 4), normals_local.unsqueeze(0).expand(env.num_envs, -1, -1).reshape(-1, 3)
+    ).reshape(env.num_envs, 3, 3)
+    cos = (n_world * to_apple).sum(dim=-1) / dist.clamp(min=1e-6)
+    facing = ((1.0 + cos) / 2.0) ** 4
+    return (torch.exp(-(gap ** 2) / (2.0 * std ** 2)) * facing).mean(dim=-1) * _shaping_mask(env)
 
 
 def reward_gentle_contact_groups(
@@ -647,7 +783,7 @@ def reward_gentle_contact_groups(
     # rewarded, by reward_finger_curl (gated on palm contact) and by
     # reward_grasp_enclosure (which counts the palm as one of its groups).
     flex = _finger_flexion(env, full_credit_flex)                      # [N, 3]
-    return (band * flex).mean(dim=-1) * _grasp_mask(env)
+    return (band * flex).mean(dim=-1) * _shaping_mask(env)
 
 
 def reward_finger_curl(
@@ -677,7 +813,7 @@ def reward_finger_curl(
     mag, _, _ = _closure_state(env, sensor_cfg, contact_threshold=palm_contact_min)
     fingers_gripping = (_finger_grip_force(env, sensor_cfg) > palm_contact_min).sum(dim=-1) >= 2
     apple_in_hand = ((mag[:, 0] > palm_contact_min) | fingers_gripping).float()
-    return _finger_flexion(env, full_credit_flex).mean(dim=-1) * apple_in_hand * _grasp_mask(env)
+    return _finger_flexion(env, full_credit_flex).mean(dim=-1) * apple_in_hand * _shaping_mask(env)
 
 
 def reward_grasp_enclosure(
@@ -704,7 +840,7 @@ def reward_grasp_enclosure(
     _, n_contact, mean_push = _closure_state(env, sensor_cfg, contact_threshold)
     contact_frac = (n_contact.float() / 3.0).clamp(max=1.0)
     opposition = (1.0 - mean_push).clamp(min=0.0)
-    return contact_frac * opposition * _grasp_mask(env)
+    return contact_frac * opposition * _shaping_mask(env)
 
 
 def reward_apple_centered(
@@ -779,7 +915,7 @@ def reward_apple_centered(
 
     along = torch.exp(-(along_err ** 2) / (2.0 * std_along ** 2))
     across = torch.exp(-(perp_dist ** 2) / (2.0 * std_perp ** 2))
-    return along * across * _grasp_mask(env)
+    return along * across * _shaping_mask(env)
 
 
 def reward_grasp_setpoint_tracking(
@@ -815,7 +951,7 @@ def reward_grasp_setpoint_tracking(
     if not hasattr(env, "_target_grip_level"):
         return torch.zeros(env.num_envs, device=env.device)
     err = level - env._target_grip_level
-    return torch.exp(-(err ** 2) / (2.0 * std ** 2)) * has_contact * _grasp_mask(env)
+    return torch.exp(-(err ** 2) / (2.0 * std ** 2)) * has_contact * _shaping_mask(env)
 
 
 def reward_grasp_hold(
@@ -990,8 +1126,9 @@ def penalty_action_rate_weighted(
         # was left unpriced. DISTAL arm columns (the trailing arm_free_dims,
         # e.g. the wrist) stay free even pre-grip (pre_grip_free_dims), so
         # they always count -- same reasoning as the hand columns below.
-        from .grasp_autoplay import grip_established
-        arm_gate = grip_established(env).float().unsqueeze(-1)
+        from .grasp_autoplay import stem_released
+        # Same gate as the unlock itself (ReachHandoffJointPositionAction).
+        arm_gate = stem_released(env).float().unsqueeze(-1)
         locked_dims = arm_dims - arm_free_dims
         gate = torch.cat([arm_gate.expand(-1, locked_dims),
                           torch.ones(env.num_envs, delta.shape[-1] - locked_dims, device=env.device)], dim=-1)

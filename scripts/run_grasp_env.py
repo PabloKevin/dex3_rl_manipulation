@@ -139,12 +139,15 @@ def main():
             level = float("nan")
         target = env._target_grip_level[0].item() if hasattr(env, "_target_grip_level") else float("nan")
         ever_closed = bool(env._grasp_ever_closed[0]) if hasattr(env, "_grasp_ever_closed") else False
+        # Stem let go (grip latched OR the per-episode release deadline
+        # passed): from here on the hand alone holds the fruit.
+        on_stem = not bool(env._stem_released[0]) if hasattr(env, "_stem_released") else not ever_closed
         apple = env.scene["apple"]
         apple_z = apple.data.root_pos_w[0, 2].item()
         handoff_z = env._grasp_handoff_apple_pos[0, 2].item() if hasattr(env, "_grasp_handoff_apple_pos") else float("nan")
         phase = "grasp" if getattr(env, "_grasp_phase_active", torch.ones(1, dtype=torch.bool))[0] else "reach"
         print(f"  phase={phase:5s}  force={level:5.2f} N  target={target:5.2f} N  "
-              f"ever_closed={ever_closed}  apple_drop={handoff_z - apple_z:+.3f} m")
+              f"ever_closed={ever_closed}  on_stem={on_stem}  apple_drop={handoff_z - apple_z:+.3f} m")
 
     global _reset_requested
     step = 0

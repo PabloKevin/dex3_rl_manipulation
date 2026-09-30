@@ -142,6 +142,10 @@ REACH_HANDOFF_TIME_S = 2.5
 # Trainee's own control window after the hand-off (in "fixed" mode; longer
 # in "converged" mode whenever the reach phase ends early).
 GRASP_WINDOW_S = 5.0
+# PPO rollout length per iteration (AppleGraspGraspPPORunnerCfg.
+# num_steps_per_env) -- the shaping-grace curriculum is scheduled in env
+# steps, and this converts iterations to them. Keep the two in sync.
+GRASP_PPO_STEPS_PER_ITER = 64
 
 # Literature-grounded per-episode bruising-force range (Li et al., 2026: Red
 # Fuji apple 24.33-26.38 N; broader pome-fruit literature 20-40 N) -- see
@@ -295,6 +299,18 @@ class ActionsCfg:
         clip={".*": (-3.0, 3.0)},
         max_velocity=3.0,
         max_acceleration=20.0,
+        # Grasp-phase zero action = thumb PRE-SHAPED in opposition, just
+        # short of the fruit (scripted: no contact at thumb_1 0.2 / thumb_2
+        # -0.3, grip closure at thumb_1 -0.3..0 / thumb_2 -0.5..-0.9, all
+        # with thumb_0 = 0). From the open default, four runs never brought
+        # the thumb in: they parked it open (commanded up to 0.6 rad past
+        # its limit) or swung thumb_0 sideways instead. Index and middle
+        # keep the default offset; they close on their own.
+        grasp_offset={
+            "right_hand_thumb_0_joint": 0.0,
+            "right_hand_thumb_1_joint": 0.1,
+            "right_hand_thumb_2_joint": -0.4,
+        },
     )
 
 
@@ -414,13 +430,17 @@ class RewardsCfg:
     # all, giving a purely-exploring policy nothing pulling it toward the
     # apple in the first place. See its own docstring for the reasoning
     # (same pattern as reach_rewards.reward_reach_gaussian).
+    # Per finger now (see reward_finger_approach): the thumb's 0.9 rad path
+    # to the fruit used to be a flat plateau. 4.0 so that path alone is
+    # worth up to ~1.3/step -- enough to pull an open thumb in, well under
+    # the ~7-10/step the contact terms add once it touches.
     finger_approach = RewTerm(
         func=gr.reward_finger_approach,
-        weight=2.0,
+        weight=4.0,
         params={
             "robot_cfg": SceneEntityCfg("robot"),
             "object_cfg": SceneEntityCfg("apple"),
-            "std": 0.05,
+            "std": 0.03,
         },
     )
     # "Is the apple in the middle of the hand." The reward set had nothing
@@ -525,6 +545,26 @@ class RewardsCfg:
         func=gr.reward_finger_wrap,
         weight=3.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
+    # Palm under the fruit while the fingers hold it (power grasp) -- the
+    # last policy never touched the palm at all; see reward_palm_support.
+    palm_support = RewTerm(
+        func=gr.reward_palm_support,
+        weight=2.0,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces")},
+    )
+    # Hold the grasp still once formed, so harvest can freeze the fingers
+    # and move only the arm. Settled finger velocities of the last policy
+    # (~1.5 (rad/s)^2 summed) cost ~0.45/step here, against ~13/step of
+    # grasp-quality reward -- enough to prefer stillness, not enough to
+    # prefer letting go.
+    hand_still = RewTerm(
+        func=gr.penalty_hand_motion_while_gripping,
+        weight=-0.3,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_HAND_JOINTS, preserve_order=True),
+        },
     )
     # Apple on the BACK of the palm or of a finger segment: the real pads
     # cannot feel it, so only this privileged term can discourage it.
@@ -792,6 +832,32 @@ class EventsCfg:
         params={
             "object_cfg": SceneEntityCfg("apple"),
             "robot_cfg": SceneEntityCfg("robot"),
+            # The stem lets go on a SCHEDULE the policy cannot influence --
+            # never on the grip latch (release_on_latch=False). History:
+            # - release on latch only: policies kept their grip undetected
+            #   (index_1 held open; later the thumb held ~0.6 rad past its
+            #   open limit), since the latch released the fruit and freed
+            #   the arm -- a cliff they had never been rewarded past.
+            # - fixed 1-2 s deadline from iteration 0: a fresh policy can't
+            #   close that fast; 100% apple_fell_from_grip, nothing learned.
+            # - latch release + shaping-grace curriculum: shaping faded,
+            #   the thumb-less grasp stayed, grasp_hold never fired.
+            # Now: effectively never released (past the 5 s window) for the
+            # first 400 iterations, so closing -- thumb included -- is
+            # learned against a held fruit, with grasp_hold paying for
+            # closure; then the release time shrinks to 2.5 s (+ up to 0.5 s
+            # per-episode jitter) by iteration 1200, so the grasp must hold
+            # the fruit under gravity for the rest of the window.
+            # Steps = iterations * num_steps_per_env.
+            "release_on_latch": False,
+            "stem_release_schedule": (
+                GRASP_WINDOW_S + 1.0, 2.5,
+                400 * GRASP_PPO_STEPS_PER_ITER, 1200 * GRASP_PPO_STEPS_PER_ITER,
+                0.5,
+            ),
+            # Shaping grace off: it existed only to punish hiding the grip
+            # from the latch, which no longer buys the policy anything.
+            "shaping_grace_s": None,
         },
     )
 
