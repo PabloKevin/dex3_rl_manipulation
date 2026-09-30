@@ -60,7 +60,8 @@ from isaaclab.managers import SceneEntityCfg
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import envs  # noqa: registers gym tasks
 
-from envs.apple_grasp_grasp_env_cfg import AppleGraspGraspEnvCfg_PLAY
+from envs.apple_grasp_grasp_env_cfg import AppleGraspGraspEnvCfg_PLAY, GRASP_CENTER_LOCAL
+from isaaclab.utils.math import quat_apply
 from envs.mdp.grasp_rewards import _per_finger_group_force
 
 # ── Terminal Reset Listener (identical pattern to scripts/run_env.py) ───────
@@ -146,8 +147,18 @@ def main():
         apple_z = apple.data.root_pos_w[0, 2].item()
         handoff_z = env._grasp_handoff_apple_pos[0, 2].item() if hasattr(env, "_grasp_handoff_apple_pos") else float("nan")
         phase = "grasp" if getattr(env, "_grasp_phase_active", torch.ones(1, dtype=torch.bool))[0] else "reach"
+        # Fruit centre to the palm's grasp point -- what apple_fell_from_grip
+        # checks (> 6 cm = left the hand). apple_drop is only the height
+        # change since hand-off, which the ARM can cause with the fruit held.
+        robot = env.scene["robot"]
+        palm = robot.data.body_names.index("right_hand_palm_link")
+        grasp_point = robot.data.body_pos_w[0, palm] + quat_apply(
+            robot.data.body_quat_w[0, palm], torch.tensor(GRASP_CENTER_LOCAL, device=env.device)
+        )
+        in_hand = torch.norm(apple.data.root_pos_w[0] - grasp_point).item()
         print(f"  phase={phase:5s}  force={level:5.2f} N  target={target:5.2f} N  "
-              f"ever_closed={ever_closed}  on_stem={on_stem}  apple_drop={handoff_z - apple_z:+.3f} m")
+              f"ever_closed={ever_closed}  on_stem={on_stem}  apple_to_hand={in_hand*100:4.1f} cm  "
+              f"apple_drop={handoff_z - apple_z:+.3f} m")
 
     global _reset_requested
     step = 0

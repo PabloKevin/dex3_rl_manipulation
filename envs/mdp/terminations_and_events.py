@@ -144,6 +144,9 @@ def apple_fell_from_grip(
     env: ManagerBasedRLEnv,
     object_cfg: SceneEntityCfg,
     drop_margin: float = 0.08,
+    robot_cfg: SceneEntityCfg | None = None,
+    center_local: tuple[float, float, float] | None = None,
+    leave_margin: float = 0.06,
 ) -> torch.Tensor:
     """True once the apple has fallen `drop_margin` metres below where the
     reach->grasp hand-off left it (env._grasp_handoff_apple_pos) -- the real
@@ -175,6 +178,22 @@ def apple_fell_from_grip(
     from .grasp_autoplay import grasp_phase_active
 
     apple: RigidObject = env.scene[object_cfg.name]
+    if robot_cfg is not None and center_local is not None:
+        # RELATIVE TO THE HAND: the fruit centre more than leave_margin
+        # from the palm's grasp point (a fixed point in the palm frame).
+        # The absolute-height version above counted a fruit held firmly in
+        # a hand that moved down as "fell from grip" -- which is exactly
+        # what happened once the stem let go and the arm unlocked: the
+        # fruit stayed within a millimetre of its place in the hand while
+        # the arm carried it 8 cm down.
+        from isaaclab.utils.math import quat_apply
+        robot = env.scene[robot_cfg.name]
+        body = robot_cfg.body_ids[0]
+        quat = robot.data.body_quat_w[:, body]
+        c = torch.tensor(center_local, device=env.device, dtype=quat.dtype).expand(env.num_envs, 3)
+        grasp_point = robot.data.body_pos_w[:, body] + quat_apply(quat, c)
+        fell = torch.norm(apple.data.root_pos_w - grasp_point, dim=-1) > leave_margin
+        return fell & grasp_phase_active(env)
     if not hasattr(env, "_grasp_handoff_apple_pos"):
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     fell = apple.data.root_pos_w[:, 2] < (env._grasp_handoff_apple_pos[:, 2] - drop_margin)

@@ -684,9 +684,19 @@ class TerminationsCfg:
     # meaningfully below where the reach->grasp hand-off left it, whether it
     # ends up on the ground, rolled aside, or anywhere else -- catches a
     # failed/slipping grasp promptly instead of idling out to time_out.
+    # "Left the hand", measured from the palm's grasp point -- not a drop
+    # in absolute height, which also fired when the arm carried a firmly
+    # held fruit downward. 6 cm: a held fruit sits within ~1.5 cm of
+    # GRASP_CENTER_LOCAL (hand-off included); one that has slipped out
+    # of the fingers is well past 6.
     apple_fell_from_grip = DoneTerm(
         func=task_mdp.apple_fell_from_grip,
-        params={"object_cfg": SceneEntityCfg("apple"), "drop_margin": 0.08},
+        params={
+            "object_cfg": SceneEntityCfg("apple"),
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "center_local": GRASP_CENTER_LOCAL,
+            "leave_margin": 0.06,
+        },
     )
 
     # Hard, immediate failure -- bio-yield is a near-instantaneous threshold
