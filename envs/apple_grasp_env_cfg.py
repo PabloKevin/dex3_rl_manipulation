@@ -115,30 +115,43 @@ STEM_RADIUS           = 0.003
 # right_shoulder_pitch_link (env-local (0.0, -0.10, 1.085)); see
 # domain_randomization.randomize_tree_and_apple.
 #
-# Sized for the side-on pose (palm facing the apple horizontally, fingers
-# up) with scripts/probe_side_reach.py (multi-seed IK on the real USD,
-# logs/probe_side_reach_wf*.npz). That pose is only kinematically available
-# with the target AT OR ABOVE shoulder height and fairly close: the forearm
-# has to stand roughly vertical under the hand, so below the shoulder the
-# palm cannot face the fruit at all (4-7 cm residual even with the fingers
-# free to point down), and beyond ~0.36 m the folded arm runs out of length.
-# Inside the box below, local IK reaches the pose for 83% of samples (78%
-# with no torso intrusion) -- a lower bound, since IK can stall in local
-# minima. The old palm-up box (0.30-0.42 m, -0.28..+0.19 m) is NOT reachable
-# in this pose. Re-run the probe if the arm, USD or PALM_LOCAL_OFFSET change.
+# Sized with scripts/probe_side_reach.py (multi-seed kinematic IK on the real
+# USD, logs/probe_side_reach_stem.npz) for the side-on pose: palm normal
+# parallel to the stem, finger direction free, every non-driven joint held
+# at its default. Freeing the fingers matters: with fingers forced up the
+# pose only existed for targets at/above shoulder height; with them free the
+# arm reaches low apples fingers-down and high ones fingers-up, and the box
+# below is 92% reachable (85% with no torso intrusion; a lower bound, IK can
+# stall in local minima). Beyond ~0.34 m the folded arm runs out of length.
+# Re-run the probe if the arm, USD, PALM_LOCAL_OFFSET or the pose change.
 #
 # Rule kept from the palm-up task: never sample targets the arm cannot
 # reach. Unreachable episodes are guaranteed-zero-contact data points that
 # dilute the touch rewards and push the arm to saturate chasing them.
-REACH_MIN = 0.20
-REACH_MAX = 0.36
+REACH_MIN = 0.24
+REACH_MAX = 0.34
 # Height of the grasp target above the shoulder. The apple centre sits at the
-# same height (horizontal stem), i.e. 1.085-1.365 m above the ground.
-REACH_TARGET_DZ_RANGE = (0.0, 0.28)
+# same height (horizontal stem), i.e. 0.79-1.37 m above the ground.
+REACH_TARGET_DZ_RANGE = (-0.30, 0.28)
 # Front-right of the robot, unchanged from the palm-up task (the probe found
-# no azimuth dependence across -95..+15 deg).
+# no strong azimuth dependence across -90..+15 deg).
 REACH_AZIMUTH_CENTER_DEG = -45.0
 REACH_AZIMUTH_SPAN_DEG = 65.0
+# Minimum forward (x) and horizontal distance of the grasp target from the
+# shoulder (resampled until met). The 3D distance alone lets a high or low
+# target sit almost on top of / beside the shoulder: reachable, but only with
+# the hand cramped against the body. Kept generous on purpose: on the real
+# robot an apple that close is handled by stepping back. With REACH_MIN
+# 0.24 the map still accepts ~86% of the box, every height band covered.
+REACH_MIN_FORWARD = 0.15
+REACH_MIN_HORIZONTAL = 0.18
+# Safe reach workspace (scripts/probe_side_reach.py): 5 cm cells of
+# grasp-target positions around the shoulder that the arm reaches with the
+# palm along the stem and NO self-collision (full-body sphere model, 1.5 cm
+# clearance). Placement only samples feasible cells; the box above is just
+# the bounding region. Regenerate whenever the arm, hand pose, USD,
+# PALM_LOCAL_OFFSET or the collision model change.
+REACH_WORKSPACE_MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "reach_workspace.npz")
 
 APPLE_STEM_BREAK_FORCE  = _jitter(2.5)
 APPLE_STEM_BREAK_TORQUE = _jitter(0.5)
@@ -158,9 +171,10 @@ RIGHT_ARM_JOINTS = [
 ]
  
 # Palm normal in the palm link's LOCAL frame (points out of the palm face).
-# The reach drives it along the horizontal shoulder->apple direction, and
-# the palm's wrist->fingertip axis (local +X, reach_rewards.PALM_FINGER_AXIS)
-# to world +Z: palm facing the fruit, fingers up.
+# The reach drives it along the (horizontal) stem direction: palm facing the
+# fruit from the side opposite the stem. Where the fingers point (rotation
+# about the normal) is left free -- up suits most apples, down or sideways
+# suits low or very lateral ones.
 PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 
 # Grasp reference point, in right_hand_palm_link's OWN local frame. The link
@@ -173,23 +187,42 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 # converged policy and want the exact contact point instead of an estimate.
 PALM_LOCAL_OFFSET = (0.08, 0.0, 0.0)
 
-# Half the palm link's thickness along its own local Y (= PALM_NORMAL_AXIS).
-# PALM_LOCAL_OFFSET has NO Y component, so the reference point sits on the
-# palm's mid-plane, not on its contact face. Estimate — re-probe against the
-# palm's collision geometry if the converged contact force sits off-band.
-_PALM_HALF_THICKNESS = 0.015
+# Where the apple starts touching the palm, measured in PhysX (the palm
+# collider is a convex hull of the mesh, so the visual mesh heights don't
+# apply): moving a 40 mm apple centred at PALM_LOCAL_OFFSET along the palm
+# normal, palm contact begins with its surface 16 mm from the reference
+# point (0.2 N); 13 mm gives ~1.2 N, 10 mm ~3 N, and nothing but the palm
+# touches. (The previous 20 mm target left the apple 4 mm off the palm: no
+# contact even at a perfect pose.) Centred at x = 0.06 instead, the thumb
+# base touches as soon as the palm is pressed, so x = 0.08 stays.
+_PALM_TOUCH_HEIGHT = 0.016
+# How far the target presses past first contact: ~1.2 N on the compliant
+# reach-phase apple (AppleGraspSceneCfg.apple).
+_TOUCH_PRESS = 0.003
 
-# Gap between the apple SURFACE and the grasp target, along the approach
-# direction (reach_rewards._grasp_target_pos): the palm reference point sits
-# one palm-half-thickness in front of the fruit, so at the target the palm
-# FACE is just touching it -- the reach scores contact, not just proximity,
-# and a target in clear air would make the touch terms unsatisfiable.
-GRASP_STANDOFF = _PALM_HALF_THICKNESS
+# Gap between the apple SURFACE and the palm reference point along the palm
+# normal at the target (reach_rewards._palm_target_dist): apple resting on
+# the palm with a light press -- the reach scores contact, not proximity.
+GRASP_STANDOFF = _PALM_TOUCH_HEIGHT - _TOUCH_PRESS
 
-# Success / hold also need the fingers within this of vertical. Looser than
-# the palm-facing tolerance (ori_tol_rad = 0.30): finger roll only has to be
-# roughly right for the grasp.
-FINGERS_UP_TOL_RAD = math.radians(45.0)
+# Palm contact force that counts as a gentle touch (hold, success, touch
+# reward); above the top a quadratic penalty takes over.
+TOUCH_FORCE_MIN = 0.3
+TOUCH_FORCE_MAX = 6.0
+
+# The apple is touched from a LATERAL so the harvest motion can be
+# horizontal: palm normal within this of horizontal (any heading -- which
+# side of the apple is free). Hold and success require it; reward_palm_lateral
+# shapes it.
+PALM_TILT_TOL_RAD = math.radians(20.0)
+
+# Compliant contact of the reach-phase (kinematic) apple: a real apple on its
+# stem yields when pushed. Without it a position-controlled arm touching an
+# immovable sphere spikes to ~20 N on contact (measured with the previous
+# policy), so "gentle" was nearly unreachable. With it the gentle band
+# (TOUCH_FORCE_MIN..MAX) spans ~1 cm of press (see _PALM_TOUCH_HEIGHT).
+APPLE_CONTACT_STIFFNESS = 1000.0
+APPLE_CONTACT_DAMPING = 30.0
 
 # Initial (pre-randomization) placement: nominal geometry at the centre of
 # the reach envelope. randomize_tree_and_apple overwrites all of it at reset.
@@ -470,6 +503,12 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(
                 contact_offset=0.002,
                 rest_offset=0.0,
+            ),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=0.8,
+                dynamic_friction=0.6,
+                compliant_contact_stiffness=APPLE_CONTACT_STIFFNESS,
+                compliant_contact_damping=APPLE_CONTACT_DAMPING,
             ),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.82, 0.06, 0.06),
@@ -780,38 +819,20 @@ class RewardsCfg:
         },
     )
 
-    # ── Orientation: palm faces the apple (normal along the horizontal
-    #    shoulder->apple direction) and fingers point up. Two terms so the
-    #    fingers-up preference can be looser than palm facing: facing the
-    #    fruit is what the touch and the grasp need; finger roll only has to
-    #    be roughly right. Both gated to zero beyond gate_dist so they cannot
-    #    be farmed from anywhere in the workspace instead of reaching.
-    #
-    # Lesson carried over from the palm-up version: the sparse
-    # reach_success bonus (95, one-time) is worth less than ~25 steps of a
-    # 4.0 dense term, so any dense term that can be farmed in a wrong pose
-    # will beat the success bonus outright. Keep dense terms gated on the
-    # pose being right.
-    palm_facing = RewTerm(
-        func=rr.reward_palm_facing,
-        weight=10.0,
+    # ── Orientation: palm facing SIDEWAYS (normal horizontal, any heading)
+    #    so the apple is touched from a lateral and the harvest motion can be
+    #    horizontal; never from above or below. Which side of the apple, and
+    #    where the fingers point, are free. The position terms already put
+    #    the apple centred ON the palm face (reach_rewards._palm_target_dist),
+    #    so the normal points at the apple. Gated to zero beyond gate_dist.
+    palm_lateral = RewTerm(
+        func=rr.reward_palm_lateral,
+        weight=6.0,
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "palm_normal_axis": PALM_NORMAL_AXIS,
-            "std_rad": 0.5,      # ~29 deg basin
-            "gate_dist": 0.55,   # metres
-            "standoff": GRASP_STANDOFF,
-            "palm_local_offset": PALM_LOCAL_OFFSET,
-        },
-    )
-    fingers_up = RewTerm(
-        func=rr.reward_fingers_up,
-        weight=5.0,
-        params={
-            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
-            "object_cfg": SceneEntityCfg("apple"),
-            "std_rad": 0.6,      # ~34 deg basin
+            "std_rad": 0.3,      # ~17 deg
             "gate_dist": 0.55,
             "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
@@ -837,20 +858,19 @@ class RewardsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
-            "ori_tol_rad": 0.30,
+            "tilt_tol_rad": PALM_TILT_TOL_RAD,
             "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": PALM_LOCAL_OFFSET,
-            "fingers_tol_rad": FINGERS_UP_TOL_RAD,
             "sensor_cfg": SceneEntityCfg("contact_forces"),
-            "pressure_min": 0.5,
-            "pressure_max": 5.0,
+            "pressure_min": TOUCH_FORCE_MIN,
+            "pressure_max": TOUCH_FORCE_MAX,
         },
     )
 
     # ── g1_arm_env's R_success (its largest term by far, 700 vs O(1-40)
     #    elsewhere) — one-time bonus paired with the reach_success termination
-    #    in TerminationsCfg below (same pos_tol/ori_tol_rad/hold_time there).
+    #    in TerminationsCfg below (same pos_tol/tilt_tol_rad/hold_time there).
     #    hold_time=0.5s at 50 Hz control = 25 steps, so a policy sitting in the
     #    hold neighbourhood the whole time earns 25*3.0=75 from `hold` alone
     #    before this fires — weight=75.0 roughly doubles that on success,
@@ -948,35 +968,28 @@ class RewardsCfg:
         },
     )
 
-    # Task-space arm-vs-torso guard. posture_box above is a JOINT-space
-    # proxy for the same failure (it boxes shoulder_roll at +0.35 rad); this
-    # is the general version, and the two are complementary rather than
-    # redundant -- the box is a cheap, sharp fence on the one DOF that
-    # usually picks the colliding IK branch, this one catches every OTHER
-    # way the upper arm and forearm can end up inside the torso, which is
-    # what happens when the apple is sampled close to the robot and the arm
-    # has to fold. Needed because enabled_self_collisions=False means PhysX
-    # never stops the arm from passing through the torso, so without a
-    # reward term nothing does.
-    #
-    # Geometry comes from the project's own cuRobo spherization (see
-    # reach_rewards.TORSO_CAPSULE_* / ARM_COLLISION_SPHERES), not from
-    # hand-tuned numbers.
+    # Task-space self-collision guard (envs/mdp/self_collision.py): right
+    # arm + Dex3 hand spheres vs. the rest of the body (pelvis, legs,
+    # torso/head, left arm), from the project's cuRobo spherization plus
+    # mesh-sized hand spheres. Replaces the torso-only capsule: low apples
+    # bring the hand down by the hips/thighs, high ones up by the head.
+    # posture_box above is a cheap joint-space fence on the one DOF that
+    # usually picks the colliding IK branch; this catches everything else.
+    # Needed because enabled_self_collisions=False means PhysX never stops
+    # the arm passing through the body. The reach envelope is restricted to
+    # placements reachable with NO intrusion (REACH_WORKSPACE_MAP), so this
+    # can always be driven to 0.
     #
     # Weight: `ref`=0.05 m means one sphere buried 5 cm past the required
     # clearance costs 1.0 before the weight, and depth grows smoothly from
     # zero, so -8.0 makes a real collision clearly worse than any posture
-    # gain while staying bounded and costing exactly nothing in the clear.
-    # Watch the curve: it should fall toward 0 and stay there. If it sits
-    # pinned above zero the arm is parked in the torso and `margin` is
-    # probably too big for the reachable workspace; if the arm still visibly
-    # brushes the mesh, raise `margin`.
-    torso_collision = RewTerm(
-        func=rr.penalty_torso_self_collision,
+    # gain while costing exactly nothing in the clear. The curve should
+    # fall to 0 and stay there.
+    self_collision = RewTerm(
+        func=task_mdp.penalty_self_collision,
         weight=-8.0,
         params={
-            "robot_cfg": SceneEntityCfg("robot"),
-            "margin": 0.02,   # metres of clearance on top of both radii
+            "margin": 0.015,  # metres of clearance on top of both radii (= probe)
             "ref": 0.05,      # metres of intrusion that costs 1.0
         },
     )
@@ -1042,12 +1055,12 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "palm_normal_axis": PALM_NORMAL_AXIS,
-            "good_min": 0.5,
-            "good_max": 5.0,
-            "link_names": [
-                "right_hand_palm_link",
-                "right_hand_thumb_0_link",
-            ],
+            "good_min": TOUCH_FORCE_MIN,
+            "good_max": TOUCH_FORCE_MAX,
+            # Palm face only: thumb_0 used to be in this group, and the side
+            # of the thumb pressed against the side of the apple was paid as
+            # a palm touch (see thumb_contact below).
+            "link_names": ["right_hand_palm_link"],
         },
     )
 
@@ -1058,8 +1071,8 @@ class RewardsCfg:
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "palm_normal_axis": PALM_NORMAL_AXIS,
-            "good_min": 0.5,
-            "good_max": 5.0,
+            "good_min": TOUCH_FORCE_MIN,
+            "good_max": TOUCH_FORCE_MAX,
             "link_names": [
                 "right_hand_index_0_link",
                 "right_hand_middle_0_link",
@@ -1135,6 +1148,27 @@ class RewardsCfg:
         },
     )
 
+    # Any thumb contact during the reach. The reach ends with the apple on
+    # the palm face and the thumb open (thumb_1 at its open limit, held by
+    # EventsCfg.hold_default_targets) below it on the wrist side, so a
+    # thumb touch always means a misplaced hand -- typically the side of
+    # the thumb against the side of the apple, which the old palm+digit-base
+    # touch group even rewarded. Weight -3.0: clearly worse than the 4.0 a
+    # palm touch pays, so the two cannot be traded.
+    thumb_contact = RewTerm(
+        func=rr.penalty_apple_contact_links,
+        weight=-3.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "link_names": [
+                "right_hand_thumb_0_link",
+                "right_hand_thumb_1_link",
+                "right_hand_thumb_2_link",
+            ],
+            "cap": 5.0,
+        },
+    )
+
     # Distinct from the soft shaping penalty above (apple_contact_force):
     # gentle contact (0.5-5 N at the palm+thumb-base) is now the GOAL (see
     # gentle_touch/reach_success's touch gate), so a term that costs a
@@ -1152,7 +1186,7 @@ class RewardsCfg:
         weight=-2.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
-            "start": 5.0,
+            "start": TOUCH_FORCE_MAX,
             "cap": 20.0,
         },
     )
@@ -1176,7 +1210,7 @@ class TerminationsCfg:
 
     # Reach success: palm held in the success neighbourhood for hold_time.
     # Params MUST match reach_rewards.reward_reach_success's RewardsCfg entry
-    # (reach_success_bonus below) — same pos_tol/ori_tol_rad/offset_z/
+    # (reach_success_bonus below) — same pos_tol/tilt_tol_rad/standoff/
     # palm_normal_axis/hold_time — since that reward reads the bool this
     # termination caches on env._reach_success rather than recomputing it.
     # (apple_lifted_success below is unrelated — a grasp/lift-phase criterion,
@@ -1187,12 +1221,16 @@ class TerminationsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
-            "ori_tol_rad": 0.30,
+            "tilt_tol_rad": PALM_TILT_TOL_RAD,
             "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "hold_time": 0.5,
             "palm_local_offset": PALM_LOCAL_OFFSET,
-            "fingers_tol_rad": FINGERS_UP_TOL_RAD,
+            # Success = arrived AND gently touching with the palm, same gate
+            # as the per-step hold reward.
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "pressure_min": TOUCH_FORCE_MIN,
+            "pressure_max": TOUCH_FORCE_MAX,
         },
     )
 
@@ -1238,6 +1276,13 @@ class EventsCfg:
             "position_range": (0.0, 0.0),
             "velocity_range": (0.0, 0.0),
         },
+    )
+    # Isaac Lab starts every PD target at 0; hold all joints that no action
+    # term drives (hand, waist, left arm, legs) at their defaults.
+    hold_default_targets = EventTerm(
+        func=task_mdp.hold_default_joint_targets,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
     reset_arm_jitter = EventTerm(
@@ -1298,6 +1343,9 @@ class EventsCfg:
             "reach_azimuth_center_deg": REACH_AZIMUTH_CENTER_DEG,
             "reach_azimuth_span_deg": REACH_AZIMUTH_SPAN_DEG,
             "target_dz_range": REACH_TARGET_DZ_RANGE,
+            "reach_min_forward": REACH_MIN_FORWARD,
+            "reach_min_horizontal": REACH_MIN_HORIZONTAL,
+            "workspace_map": REACH_WORKSPACE_MAP,
             "branch_yaw_spread_deg": BRANCH_YAW_SPREAD_DEG,
             "standoff": GRASP_STANDOFF,
         },

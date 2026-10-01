@@ -337,6 +337,9 @@ def randomize_tree_and_apple(
     target_dz_range: tuple[float, float],
     branch_yaw_spread_deg: float,
     standoff: float,
+    reach_min_forward: float = 0.0,
+    reach_min_horizontal: float = 0.0,
+    workspace_map: str | None = None,
     shoulder_body_name: str = "right_shoulder_pitch_link",
 ) -> None:
     """Per-episode (mode="reset") apple placement, reachability-aware, on a
@@ -345,18 +348,24 @@ def randomize_tree_and_apple(
 
     The GRASP TARGET (the point the palm's reference point is scored
     against, reach_rewards._grasp_target_pos: `standoff` beyond the apple
-    surface, back toward the shoulder) is sampled in the right shoulder's
-    own spherical coordinates:
+    surface, on the side opposite the stem) is sampled in the right
+    shoulder's own spherical coordinates:
       - height dz above the shoulder, uniform in target_dz_range;
       - 3D distance in [reach_min, reach_max] (solved for the horizontal
         radius given dz);
-      - azimuth in reach_azimuth_center_deg +- reach_azimuth_span_deg/2.
+      - azimuth in reach_azimuth_center_deg +- reach_azimuth_span_deg/2;
+      - and, by resampling, at least reach_min_forward in front of the
+        shoulder (x) and reach_min_horizontal away from it horizontally, so
+        a high target cannot sit almost on top of the shoulder (the 3D
+        distance alone allows that, and the arm then has to contort);
+      - and, if `workspace_map` is given, inside a FEASIBLE cell of that map
+        (scripts/probe_side_reach.py: reachable with the palm along the stem
+        and no self-collision).
     Measured at right_shoulder_pitch_link (env-local (0.0, -0.10, 1.085)).
 
-    The apple sits further out along the same azimuth, so shoulder, target
-    and apple are horizontally collinear and the approach direction is the
-    sampled azimuth. The branch points from the trunk back toward the robot,
-    yawed by up to +-branch_yaw_spread_deg (imperfect real trees), so the
+    The branch points from the trunk back toward the robot (toward the
+    shoulder), yawed by up to +-branch_yaw_spread_deg (imperfect real
+    trees). The apple then sits beyond the target along the stem, so the
     trunk is BEHIND the apple: tree position is derived, not sampled.
 
     Caches env._stem_anchor_pos (apple centre, for the lift reward /
@@ -393,6 +402,22 @@ def randomize_tree_and_apple(
         env._shoulder_local_xyz = (shoulder_world - origin0).clone()
     shoulder_x, shoulder_y, shoulder_z = env._shoulder_local_xyz.tolist()
 
+    feasible_cell = None
+    if workspace_map is not None:
+        if getattr(env, "_workspace_map_path", None) != workspace_map:
+            import numpy as np
+            m = np.load(workspace_map)
+            env._workspace_map = (m["x_edges"], m["y_edges"], m["z_edges"], m["feasible"])
+            env._workspace_map_path = workspace_map
+        xe, ye, ze, feas = env._workspace_map
+
+        def feasible_cell(x, y, z):
+            i = int(math.floor((x - xe[0]) / (xe[1] - xe[0])))
+            j = int(math.floor((y - ye[0]) / (ye[1] - ye[0])))
+            k = int(math.floor((z - ze[0]) / (ze[1] - ze[0])))
+            n = feas.shape
+            return 0 <= i < n[0] and 0 <= j < n[1] and 0 <= k < n[2] and bool(feas[i, j, k])
+
     radius = getattr(env, "_apple_radius", None)
     az_lo = reach_azimuth_center_deg - reach_azimuth_span_deg / 2.0
     az_hi = reach_azimuth_center_deg + reach_azimuth_span_deg / 2.0
@@ -406,24 +431,31 @@ def randomize_tree_and_apple(
         stem_len = env._stem_length[idx].item()
         trunk_h = env._trunk_height[idx].item()
 
-        dz = random.uniform(*target_dz_range)
-        r_xy_max = math.sqrt(max(reach_max ** 2 - dz ** 2, 1e-4))
-        r_xy_min = math.sqrt(max(reach_min ** 2 - dz ** 2, 0.0))
-        if r_xy_min >= r_xy_max:
-            # dz alone already eats (close to) the whole reach budget. Fall
-            # back to the smallest feasible horizontal radius rather than
-            # sampling an empty range.
-            r_xy_min, r_xy_max = 0.0, max(r_xy_max, 0.02)
-        r_xy = random.uniform(r_xy_min, r_xy_max) + r_apple + standoff
-        az = math.radians(random.uniform(az_lo, az_hi))
+        for _ in range(2000):
+            dz = random.uniform(*target_dz_range)
+            r_xy_max = math.sqrt(max(reach_max ** 2 - dz ** 2, 1e-4))
+            r_xy_min = math.sqrt(max(reach_min ** 2 - dz ** 2, 0.0))
+            r_xy_min = max(r_xy_min, reach_min_horizontal)
+            if r_xy_min >= r_xy_max:
+                continue
+            r_xy = random.uniform(r_xy_min, r_xy_max)
+            az = math.radians(random.uniform(az_lo, az_hi))
+            if r_xy * math.cos(az) < reach_min_forward:
+                continue
+            if feasible_cell is None or feasible_cell(r_xy * math.cos(az), r_xy * math.sin(az), dz):
+                break
+        else:
+            raise RuntimeError("randomize_tree_and_apple: reach envelope constraints are unsatisfiable")
+        target_x = shoulder_x + r_xy * math.cos(az)
+        target_y = shoulder_y + r_xy * math.sin(az)
 
-        apple_x = shoulder_x + r_xy * math.cos(az)
-        apple_y = shoulder_y + r_xy * math.sin(az)
-        apple_z = shoulder_z + dz
-
-        # Branch direction (trunk -> tip): back toward the robot, yawed.
+        # Branch direction (trunk -> tip): back toward the robot, yawed. The
+        # stem continues it, so the apple sits beyond the target along -b.
         b = az + math.pi + math.radians(random.uniform(-branch_yaw_spread_deg, branch_yaw_spread_deg))
         bx, by = math.cos(b), math.sin(b)
+        apple_x = target_x - bx * (r_apple + standoff)
+        apple_y = target_y - by * (r_apple + standoff)
+        apple_z = shoulder_z + dz
         tip_x = apple_x - bx * (r_apple + stem_len)
         tip_y = apple_y - by * (r_apple + stem_len)
         stem_mid = r_apple + stem_len / 2.0

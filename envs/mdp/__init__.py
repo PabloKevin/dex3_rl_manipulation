@@ -60,7 +60,10 @@ from .terminations_and_events import (
     grasp_success,
     fruit_damaged,
     apple_fell_from_grip,
+    hold_default_joint_targets,
 )
+
+from .self_collision import penalty_self_collision, self_collision_depth
 
 from .domain_randomization import (
     randomize_apple_scale,

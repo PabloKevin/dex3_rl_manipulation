@@ -199,11 +199,12 @@ def fingertip_contact_normals(
 #  reach_success's optional touch-gate compute against directly.
 # ─────────────────────────────────────────────
 
+# The palm only. It used to include the base segment of each digit (thumb_0,
+# index_0, middle_0), but then the side of the thumb pressed against the
+# side of the apple counted as a "palm touch" and was rewarded; the reach
+# goal is the apple resting gently on the palm face itself.
 _PALM_CONTACT_LINKS = [
     "right_hand_palm_link",
-    "right_hand_thumb_0_link",   # thumb base
-    "right_hand_index_0_link",   # index base
-    "right_hand_middle_0_link",  # middle base
 ]
 
 
@@ -211,16 +212,11 @@ def palm_contact_force(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Apple-filtered contact force magnitude, SUMMED across the palm and
-    the BASE (proximal) segment of each of the three digits (_PALM_CONTACT_
-    LINKS) -- "palm tactile sensing" for the reach phase, deliberately
-    scoped to the middle-of-the-hand/cupping region rather than the whole
-    hand. Explicitly excludes the more distal segments (thumb_1/thumb_2,
-    index_1, middle_1) -- an empirical per-link contact trace showed real
-    apple contact landing there too, but rewarding that would teach the
-    reach policy to arrive fingertip-first, which is the wrong hand-off
-    geometry for the grasp phase (want the apple settling into the middle
-    of an open hand, not caught on the fingertips).
+    """Apple-filtered contact force magnitude on the palm link
+    (_PALM_CONTACT_LINKS) -- "palm tactile sensing" for the reach phase.
+    Deliberately excludes every digit segment: the reach should end with
+    the apple resting on the palm face in the middle of an open hand, not
+    caught on the thumb or fingers.
 
     Apple-filtered (via apple_force_per_link, i.e. the per-link filtered
     sensors), same reasoning as reach_rewards.penalty_apple_contact_force:

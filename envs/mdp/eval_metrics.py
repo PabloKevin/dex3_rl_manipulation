@@ -38,7 +38,7 @@ import torch
 
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg, TerminationTermCfg
 
-from .reach_rewards import _palm_normal_angle, _palm_target_dist
+from .reach_rewards import _grasp_target_pos, _palm_normal_angle, _palm_target_dist
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -82,6 +82,7 @@ class EvalProbe(ManagerTermBase):
         # Geometry / state latched every step; at flush these hold the finished
         # episode's LAST step, which is the pose the policy actually reached.
         self._apple_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._target_w = torch.zeros(self.num_envs, 3, device=self.device)
         self._shoulder_w = torch.zeros(self.num_envs, 3, device=self.device)
         self._q_last = torch.zeros(self.num_envs, self.n_joints, device=self.device)
 
@@ -143,6 +144,7 @@ class EvalProbe(ManagerTermBase):
 
         robot = env.scene[robot_cfg.name]
         self._apple_w = env.scene[object_cfg.name].data.root_pos_w.clone()
+        self._target_w = _grasp_target_pos(env, object_cfg, standoff)
         # Use the SAME shoulder reference the sampler uses, not the live body
         # pose. right_shoulder_pitch_link's origin translates by several cm as
         # the shoulder rotates, whereas randomize_tree_and_apple caches
@@ -214,12 +216,11 @@ class EvalProbe(ManagerTermBase):
             torch.full_like(steps, float("nan"), dtype=torch.float32),
         )
 
-        delta = self._apple_w[e] - self._shoulder_w[e]
-        # Grasp target = `standoff` beyond the apple surface, back toward the
-        # shoulder, horizontally (reach_rewards._grasp_target_pos).
-        radius = getattr(self._env, "_apple_radius", None)
-        radius = radius[e] if isinstance(radius, torch.Tensor) else 0.04
-        r_xy = torch.norm(delta[:, :2], dim=-1) - radius - self.standoff
+        # Reach geometry of the grasp target (reach_rewards._grasp_target_pos),
+        # the point the envelope (REACH_MIN/MAX, REACH_TARGET_DZ_RANGE) is
+        # sampled on.
+        delta = self._target_w[e] - self._shoulder_w[e]
+        r_xy = torch.norm(delta[:, :2], dim=-1)
         az = torch.rad2deg(torch.atan2(delta[:, 1], delta[:, 0]))
         dz = delta[:, 2]
         r3d = torch.sqrt(r_xy ** 2 + dz ** 2)

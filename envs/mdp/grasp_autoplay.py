@@ -349,9 +349,8 @@ def update_reach_grasp_phase(
     palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     pos_tol: float = 0.04,
-    ori_tol_rad: float = 0.30,
+    tilt_tol_rad: float | None = None,
     hold_time: float = 0.5,
-    fingers_tol_rad: float | None = None,
 ) -> None:
     """Every-step interval event: switch envs from the reach phase to the
     grasp phase.
@@ -362,7 +361,7 @@ def update_reach_grasp_phase(
                      policy settling into a stable hold, which it was never
                      trained to do past reach_success.
       "converged" -- as soon as the palm has stayed inside the reach-success
-                     neighbourhood (pos_tol/ori_tol_rad, same test as the
+                     neighbourhood (pos_tol/tilt_tol_rad, same test as the
                      reach task's reach_success) for hold_time, with
                      handoff_time_s as a watchdog.
 
@@ -384,8 +383,8 @@ def update_reach_grasp_phase(
         from .reach_rewards import reach_neighbourhood
 
         inside = reach_neighbourhood(
-            env, robot_cfg, object_cfg, pos_tol, ori_tol_rad, standoff,
-            palm_normal_axis, palm_local_offset, fingers_tol_rad,
+            env, robot_cfg, object_cfg, pos_tol, tilt_tol_rad, standoff,
+            palm_normal_axis, palm_local_offset,
         )
         env._reach_phase_hold_counter.copy_(torch.where(
             inside & reaching, env._reach_phase_hold_counter + 1, torch.zeros_like(env._reach_phase_hold_counter)

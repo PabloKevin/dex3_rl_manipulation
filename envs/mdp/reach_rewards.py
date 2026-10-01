@@ -79,15 +79,19 @@ def _palm_ref_pos(
 
 
 # Side-on fruit (commercial fruiting-wall tree, see apple_grasp_env_cfg.py's
-# tree block): the hand approaches the apple HORIZONTALLY from the robot's
-# side, palm facing the fruit, fingers pointing up. The approach direction is
-# the horizontal line from the right shoulder to the apple centre -- it tracks
-# the apple across the whole azimuth range, and the policy can infer it from
-# what it observes (arm joints + apple position relative to the palm).
+# tree block). The reach ends with the apple centred on the palm and gently
+# touching it (_palm_target_dist, defined in the palm's own frame, so the
+# policy can see it from the apple position relative to the palm). Which side
+# the palm comes from and where the fingers point are NOT constrained: any
+# side gives a graspable apple. The stem direction (env._stem_dir, apple ->
+# branch tip) only defines the IDEAL pose used for placement and the
+# workspace probe (_grasp_target_pos / _approach_dir); it is not observed
+# and not rewarded.
+#: Fallback approach origin when a scene has no env._stem_dir.
 APPROACH_BODY = "right_shoulder_pitch_link"
 
 #: Palm-link local axis that points from the wrist toward the fingertips
-#: (probe_palm_offset.py: knuckles at local +X). Driven to world +Z.
+#: (probe_palm_offset.py: knuckles at local +X). Diagnostics only.
 PALM_FINGER_AXIS = (1.0, 0.0, 0.0)
 
 #: Fallback when the scene has no per-env apple radius (env._apple_radius).
@@ -95,19 +99,29 @@ DEFAULT_APPLE_RADIUS = 0.04
 
 
 def _approach_dir(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Horizontal unit vector from the right shoulder to the apple centre.
+    """Horizontal unit approach direction: the stem direction (apple ->
+    branch tip, env._stem_dir). The palm normal should point along it, and
+    the grasp target sits on the opposite side of the apple.
 
-    The palm normal should point along it, and the grasp target sits
-    `standoff` back along it from the apple centre.
+    Falls back to the horizontal shoulder -> apple direction where no stem
+    direction has been set (scenes without randomize_tree_and_apple).
 
     Returns: [num_envs, 3] (z = 0)
     """
-    robot: Articulation = env.scene["robot"]
-    if not hasattr(env, "_approach_body_id"):
-        env._approach_body_id = robot.data.body_names.index(APPROACH_BODY)
-    apple: RigidObject = env.scene[object_cfg.name]
-    d = apple.data.root_pos_w - robot.data.body_pos_w[:, env._approach_body_id, :]
-    d = torch.cat([d[:, :2], torch.zeros_like(d[:, :1])], dim=-1)
+    stem = getattr(env, "_stem_dir", None)
+    if isinstance(stem, torch.Tensor):
+        d = stem.clone()
+    else:
+        d = torch.zeros(env.num_envs, 3, device=env.device)
+    missing = d[:, :2].norm(dim=-1) < 0.5
+    if missing.any():
+        robot: Articulation = env.scene["robot"]
+        if not hasattr(env, "_approach_body_id"):
+            env._approach_body_id = robot.data.body_names.index(APPROACH_BODY)
+        apple: RigidObject = env.scene[object_cfg.name]
+        fallback = apple.data.root_pos_w - robot.data.body_pos_w[:, env._approach_body_id, :]
+        d = torch.where(missing.unsqueeze(-1), fallback, d)
+    d[:, 2] = 0.0
     return d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
 
@@ -116,9 +130,11 @@ def _grasp_target_pos(
     object_cfg: SceneEntityCfg,
     standoff: float,
 ) -> torch.Tensor:
-    """Where the palm's grasp reference point should sit: `standoff` metres
-    beyond the apple SURFACE, back along the approach direction (i.e. on the
-    robot's side of the fruit, at the apple's own height). Uses the per-env
+    """Where the palm's grasp reference point sits in the IDEAL pose:
+    `standoff` metres beyond the apple SURFACE, back along the stem, i.e. on
+    the side of the fruit opposite the stem, at the apple's own height.
+    Placement (domain_randomization) and the workspace probe use it; the
+    rewards use the palm-relative _palm_target_dist instead. Uses the per-env
     apple radius (domain_randomization.randomize_apple_scale) when present.
 
     Returns: [num_envs, 3]
@@ -137,14 +153,25 @@ def _palm_target_dist(
     object_cfg: SceneEntityCfg,
     standoff: float,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
 ) -> torch.Tensor:
-    """Distance from the palm's grasp reference point to the grasp target
-    (see _grasp_target_pos).
+    """How far the apple is from sitting centred on the palm, just touching:
+    distance between the apple centre and the point (radius + standoff)
+    out from the palm reference point along the palm normal. Expressed in
+    the palm's own frame, so it is observable (apple position relative to
+    the palm) and independent of the stem, so any approach side scores the
+    same. At the ideal (along-the-stem) pose it equals the distance to
+    _grasp_target_pos.
 
     Returns: [num_envs]
     """
-    palm_pos = _palm_ref_pos(env, robot_cfg, palm_local_offset)
-    return torch.norm(_grasp_target_pos(env, object_cfg, standoff) - palm_pos, dim=-1)
+    apple: RigidObject = env.scene[object_cfg.name]
+    radius = getattr(env, "_apple_radius", None)
+    if not isinstance(radius, torch.Tensor):
+        radius = torch.full((env.num_envs,), DEFAULT_APPLE_RADIUS, device=env.device)
+    n_world = _palm_normal_world(env, robot_cfg, palm_normal_axis)
+    seat = _palm_ref_pos(env, robot_cfg, palm_local_offset) + (radius + standoff).unsqueeze(-1) * n_world
+    return torch.norm(apple.data.root_pos_w - seat, dim=-1)
 
 
 def _palm_normal_angle(
@@ -154,7 +181,7 @@ def _palm_normal_angle(
     object_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Angle (rad) between the palm normal and the approach direction
-    (_approach_dir), i.e. how squarely the palm faces the apple.
+    (_approach_dir, the stem), i.e. how squarely the palm faces the apple.
 
     `palm_normal_axis` is the palm normal expressed in the palm link's OWN
     local frame. object_cfg defaults to the scene's "apple".
@@ -321,62 +348,39 @@ def reward_reach_gaussian(
     return torch.exp(-(d ** 2) / (2.0 * std ** 2))
 
 
-# ═════════════════════════════════════════════════════════════════════════
-#  Orientation: palm faces the apple, fingers point up
-# ═════════════════════════════════════════════════════════════════════════
-
-def _orientation_gate(env, robot_cfg, object_cfg, gate_dist, standoff, palm_local_offset):
-    """1 at the target, falling linearly to 0 at gate_dist. Without it an
-    orientation reward is collectable from ANYWHERE in the workspace and the
-    policy banks it instead of reaching."""
-    if gate_dist <= 0.0:
-        return 1.0
-    if object_cfg is None:
-        raise ValueError("gate_dist > 0 requires object_cfg")
-    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
-    return (1.0 - d / gate_dist).clamp(0.0, 1.0)
-
-
-def reward_palm_facing(
+def _palm_tilt(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
-    object_cfg: SceneEntityCfg | None = None,
     palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
-    std_rad: float = 0.5,
-    gate_dist: float = 0.0,
-    standoff: float = 0.015,
-    palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
-    """Reward the palm normal pointing along the approach direction (palm
-    facing the apple from the robot's side). Rotation about the normal is
-    left to reward_fingers_up, a separate, looser term.
+    """Angle (rad) between the palm normal and the horizontal plane:
+    0 = palm facing sideways (any heading), pi/2 = facing straight up/down.
 
-    Args:
-        palm_normal_axis: palm normal in the palm link's LOCAL frame.
-        std_rad: Gaussian width on the normal-vs-approach angle.
-        gate_dist: if > 0, scale the reward linearly to 0 as the palm gets
-            further than gate_dist from the grasp target.
+    Returns: [num_envs]
     """
-    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
-    r = torch.exp(-(theta ** 2) / (2.0 * std_rad ** 2))
-    return r * _orientation_gate(env, robot_cfg, object_cfg, gate_dist, standoff, palm_local_offset)
+    n_world = _palm_normal_world(env, robot_cfg, palm_normal_axis)
+    return torch.asin(n_world[:, 2].abs().clamp(max=1.0))
 
 
-def reward_fingers_up(
+def reward_palm_lateral(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
-    object_cfg: SceneEntityCfg | None = None,
-    finger_axis: Sequence[float] = PALM_FINGER_AXIS,
-    std_rad: float = 0.6,
-    gate_dist: float = 0.0,
+    object_cfg: SceneEntityCfg,
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
+    std_rad: float = 0.3,
+    gate_dist: float = 0.55,
     standoff: float = 0.015,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
-    """Reward the fingers pointing at the sky (the palm's rotation about its
-    own normal). Same gating as reward_palm_facing."""
-    phi = _fingers_up_angle(env, robot_cfg, finger_axis)
-    r = torch.exp(-(phi ** 2) / (2.0 * std_rad ** 2))
-    return r * _orientation_gate(env, robot_cfg, object_cfg, gate_dist, standoff, palm_local_offset)
+    """Reward the palm facing SIDEWAYS (normal horizontal, any heading), so
+    the apple is touched from a lateral and the harvest motion can be
+    horizontal. Gaussian on _palm_tilt, scaled linearly to 0 beyond
+    gate_dist from the touch pose so it cannot be farmed instead of reaching.
+    """
+    tilt = _palm_tilt(env, robot_cfg, palm_normal_axis)
+    r = torch.exp(-(tilt ** 2) / (2.0 * std_rad ** 2))
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis)
+    return r * (1.0 - d / gate_dist).clamp(0.0, 1.0)
 
 
 def reach_neighbourhood(
@@ -384,24 +388,22 @@ def reach_neighbourhood(
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
     pos_tol: float,
-    ori_tol_rad: float,
+    tilt_tol_rad: float | None,
     standoff: float,
     palm_normal_axis: Sequence[float],
     palm_local_offset: Sequence[float],
-    fingers_tol_rad: float | None = None,
 ) -> torch.Tensor:
-    """Palm at the grasp target (within pos_tol), facing the apple (within
-    ori_tol_rad) and, if fingers_tol_rad is given, fingers up within it.
-    Shared by reward_reach_hold, terminations_and_events.reach_success and
-    the grasp task's converged hand-off so they cannot disagree.
+    """Apple centred on the palm (_palm_target_dist within pos_tol) and, if
+    tilt_tol_rad is given, the palm normal within it of horizontal (lateral
+    approach, any heading; _palm_tilt). Shared by reward_reach_hold,
+    terminations_and_events.reach_success and the grasp task's converged
+    hand-off so they cannot disagree.
 
     Returns: [num_envs] bool
     """
-    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
-    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
-    inside = (d < pos_tol) & (theta < ori_tol_rad)
-    if fingers_tol_rad is not None:
-        inside = inside & (_fingers_up_angle(env, robot_cfg) < fingers_tol_rad)
+    inside = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis) < pos_tol
+    if tilt_tol_rad is not None:
+        inside = inside & (_palm_tilt(env, robot_cfg, palm_normal_axis) < tilt_tol_rad)
     return inside
 
 
@@ -410,11 +412,10 @@ def reward_reach_hold(
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
     pos_tol: float = 0.04,
-    ori_tol_rad: float = 0.30,
+    tilt_tol_rad: float | None = None,
     standoff: float = 0.015,
     palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
-    fingers_tol_rad: float | None = None,
     sensor_cfg: SceneEntityCfg | None = None,
     pressure_min: float = 0.5,
     pressure_max: float | None = 5.0,
@@ -437,8 +438,8 @@ def reward_reach_hold(
     phase's first training run, avoided here by construction.
     """
     in_neighbourhood = reach_neighbourhood(
-        env, robot_cfg, object_cfg, pos_tol, ori_tol_rad, standoff,
-        palm_normal_axis, palm_local_offset, fingers_tol_rad,
+        env, robot_cfg, object_cfg, pos_tol, tilt_tol_rad, standoff,
+        palm_normal_axis, palm_local_offset,
     )
 
     if sensor_cfg is not None:
@@ -476,8 +477,7 @@ def reward_gentle_touch(
     zero -- keeping this flat rather than peaked avoids fighting that
     penalty over exactly where the "good enough" boundary sits.
 
-    `link_names` (default: observations._PALM_CONTACT_LINKS, i.e. the old
-    palm + all three digit bases lumped together) exists so RewardsCfg can
+    `link_names` (default: observations._PALM_CONTACT_LINKS, the palm) exists so RewardsCfg can
     register this term MORE THAN ONCE over different parts of the hand at
     different weights -- "touching with the palm or thumb" is a better
     hand-off pose for the grasp phase than "touching with an index or
@@ -548,6 +548,29 @@ def penalty_back_of_hand_contact(
         env, robot_cfg, sensor_cfg, palm_normal_axis, link_names
     )
     return (dorsal.clamp(max=cap) / cap).sum(dim=-1)
+
+
+def penalty_apple_contact_links(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    link_names: Sequence[str],
+    cap: float = 5.0,
+) -> torch.Tensor:
+    """Penalise ANY apple contact on `link_names`, at any distance. Use a
+    NEGATIVE weight.
+
+    Used for the thumb during the reach: the reach ends with the apple
+    resting gently on the palm, the thumb open below it (on the wrist side),
+    so a thumb touch is always a misplaced hand -- typically the observed
+    "side of the thumb pressed against the side of the apple" pose, which
+    the old palm+digit-base touch group even paid for. Per-link force
+    clamped at `cap` (same reasoning as penalty_back_of_hand_contact).
+
+    Returns [num_envs], 0 when none of the links touch the apple.
+    """
+    from .observations import apple_force_per_link
+    force = apple_force_per_link(env, sensor_cfg, link_names)
+    return (force.clamp(max=cap) / cap).sum(dim=-1)
 
 
 def penalty_excess_palm_force(
@@ -650,7 +673,7 @@ def reward_reach_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
     env._reach_success, cached by reach_success. IsaacLab computes
     terminations before rewards each step (see ManagerBasedRLEnv.step), so
     that cache is always fresh here. Wire reach_success as a TerminationTermCfg
-    with the SAME pos_tol/ori_tol_rad/standoff/palm_normal_axis/hold_time as
+    with the SAME pos_tol/tilt_tol_rad/standoff/palm_normal_axis/hold_time as
     this reward's weight is meant to pay out on, or the two will disagree.
     """
     if not hasattr(env, "_reach_success"):
@@ -842,154 +865,5 @@ def penalty_joint_range_box(
 
     return (excess ** 2).sum(dim=-1)
 
-
-# ═════════════════════════════════════════════════════════════════════════
-#  Arm-vs-torso self-collision (task space)
-# ═════════════════════════════════════════════════════════════════════════
-#
-# The robot spawns with enabled_self_collisions=False (see ArticulationCfg
-# in apple_grasp_env_cfg.py), so PhysX will happily let the upper arm and
-# forearm pass straight through the torso — nothing in the sim stops it and
-# nothing in the reward noticed it either. The existing guard,
-# RewardsCfg.posture_box, boxes right_shoulder_roll_joint at +0.35 rad,
-# which is a JOINT-space proxy for "elbow swung in toward the chest". That
-# catches the one failure mode it was tuned against, but it cannot catch the
-# general case: with the apple close to the robot, shoulder_pitch/yaw and
-# elbow flexion can put the upper arm inside the torso at shoulder_roll
-# values the box considers perfectly legal.
-#
-# So this term works in TASK space instead, on the actual link poses.
-#
-# Geometry is NOT guessed — both the torso capsule and the arm sphere radii
-# below are read off the project's own cuRobo collision model,
-# envs/assets/cuRobo/g1_29dof_rev_1_0_spherized.yml, which is the same
-# spherization the CasADi/cuRobo planners in scripts/ already plan against.
-# Keeping the RL penalty and the planner on one collision model means a pose
-# the policy learns is clear is also a pose the planner considers clear.
-#
-# torso_link's three spheres in that file sit exactly on the link's local Z
-# axis (x = y = 0) at z = 0.0930 / 0.2149 / 0.3919 with radii 0.1045 /
-# 0.1170 / 0.1014 — i.e. a vertical capsule of radius ~0.117 (the largest,
-# taken as the conservative single radius) spanning that z range.
-
-#: Torso collision capsule, in torso_link's OWN local frame. From
-#: g1_29dof_rev_1_0_spherized.yml's torso_link spheres (see above).
-TORSO_CAPSULE_P0 = (0.0, 0.0, 0.0930)
-TORSO_CAPSULE_P1 = (0.0, 0.0, 0.3919)
-TORSO_CAPSULE_RADIUS = 0.1170
-
-#: Right-arm collision spheres as (link name, centre in that link's LOCAL
-#: frame, radius), lifted verbatim from the same spherized model.
-#:
-#: Deliberately starts at right_shoulder_yaw_link (the upper arm) and does
-#: NOT include right_shoulder_pitch/roll_link: those two sit at the shoulder
-#: itself, roughly 0.10 m off the torso centreline, so they are inside or
-#: touching the torso capsule in EVERY pose including the home pose. Adding
-#: them would contribute a near-constant offset with no usable gradient
-#: while making the term's magnitude impossible to read on a training curve.
-#: The links kept here are exactly the ones reported as colliding: the upper
-#: arm (shoulder_yaw) and the forearm (elbow), plus the wrist for free.
-ARM_COLLISION_SPHERES = [
-    ("right_shoulder_yaw_link", ( 0.0123,  0.0020, -0.0773), 0.0458),
-    ("right_shoulder_yaw_link", (-0.0046,  0.0000, -0.0114), 0.0431),
-    ("right_elbow_link",        ( 0.0843,  0.0000, -0.0101), 0.0415),
-    ("right_elbow_link",        ( 0.0391,  0.0000, -0.0085), 0.0415),
-    ("right_wrist_roll_link",   ( 0.0325,  0.0000,  0.0000), 0.0395),
-]
-
-
-def _point_segment_distance(
-    p: torch.Tensor, a: torch.Tensor, b: torch.Tensor
-) -> torch.Tensor:
-    """Distance from points `p` [N, S, 3] to the segment a->b ([N, 3] each).
-
-    Returns: [N, S]
-    """
-    ab = (b - a).unsqueeze(1)                                   # [N, 1, 3]
-    ap = p - a.unsqueeze(1)                                     # [N, S, 3]
-    denom = (ab * ab).sum(dim=-1).clamp(min=1e-12)              # [N, 1]
-    t = ((ap * ab).sum(dim=-1) / denom).clamp(0.0, 1.0)         # [N, S]
-    closest = a.unsqueeze(1) + t.unsqueeze(-1) * ab             # [N, S, 3]
-    return torch.norm(p - closest, dim=-1)                      # [N, S]
-
-
-def penalty_torso_self_collision(
-    env: "ManagerBasedRLEnv",
-    robot_cfg: SceneEntityCfg,
-    margin: float = 0.02,
-    ref: float = 0.05,
-    capsule_radius: float = TORSO_CAPSULE_RADIUS,
-) -> torch.Tensor:
-    """Quadratic penalty on the right arm intruding into the torso capsule.
-
-    For each arm collision sphere s (ARM_COLLISION_SPHERES):
-
-        depth_s = max(0, capsule_radius + r_s + margin - dist(c_s, torso axis))
-        penalty = sum_s (depth_s / ref)^2
-
-    Zero cost whenever the whole arm is clear, so every non-colliding IK
-    branch stays completely free — this only ever pushes the arm out of the
-    torso, it never expresses a preference between two clear postures (that
-    is home_excursion's job). Because it is a smooth function of link pose
-    rather than a joint box, it gives a real gradient that grows as the arm
-    goes deeper, which is what actually teaches "swing the elbow out" rather
-    than "this joint value is forbidden".
-
-    `margin` is clearance required ON TOP of the two collision radii, so the
-    arm is pushed to a visibly clear posture rather than to exact tangency.
-    `ref` normalises the depth so a `ref`-deep intrusion on one sphere costs
-    exactly 1.0 before the weight — pick the weight against that scale.
-
-    Both defaults are in metres. Raise `margin` if the arm still brushes the
-    torso mesh (the capsule is an approximation of a non-convex mesh, and
-    the shoulder end of the torso is where it fits worst).
-
-    `robot_cfg` selects the articulation only; the bodies come from
-    ARM_COLLISION_SPHERES / the torso capsule constants, so no body_names
-    are needed on it and none are read.
-
-    Returns: [num_envs]
-    """
-    robot: Articulation = env.scene[robot_cfg.name]
-
-    if not hasattr(env, "_torso_collision_ids"):
-        names = robot.data.body_names
-        env._torso_collision_ids = {
-            "torso": names.index("torso_link"),
-            "arm": [names.index(link) for link, _, _ in ARM_COLLISION_SPHERES],
-        }
-        env._arm_sphere_offsets = torch.tensor(
-            [c for _, c, _ in ARM_COLLISION_SPHERES],
-            device=env.device, dtype=torch.float32,
-        )                                                        # [S, 3]
-        env._arm_sphere_radii = torch.tensor(
-            [r for _, _, r in ARM_COLLISION_SPHERES],
-            device=env.device, dtype=torch.float32,
-        )                                                        # [S]
-
-    ids = env._torso_collision_ids
-
-    # Torso capsule endpoints, local -> world.
-    torso_pos = robot.data.body_pos_w[:, ids["torso"], :]                  # [N, 3]
-    torso_rot = matrix_from_quat(robot.data.body_quat_w[:, ids["torso"], :])  # [N, 3, 3]
-    p0 = torch.tensor(TORSO_CAPSULE_P0, device=env.device, dtype=torso_pos.dtype)
-    p1 = torch.tensor(TORSO_CAPSULE_P1, device=env.device, dtype=torso_pos.dtype)
-    a = torso_pos + torch.matmul(torso_rot, p0)                            # [N, 3]
-    b = torso_pos + torch.matmul(torso_rot, p1)                            # [N, 3]
-
-    # Arm sphere centres, local -> world. Each sphere rides its own link, so
-    # index the link poses per-sphere (a link with two spheres appears twice).
-    link_pos = robot.data.body_pos_w[:, ids["arm"], :]                     # [N, S, 3]
-    link_rot = matrix_from_quat(
-        robot.data.body_quat_w[:, ids["arm"], :].reshape(-1, 4)
-    ).reshape(link_pos.shape[0], len(ids["arm"]), 3, 3)                    # [N, S, 3, 3]
-    offsets = env._arm_sphere_offsets.to(link_pos.dtype)                   # [S, 3]
-    centres = link_pos + torch.matmul(
-        link_rot, offsets.unsqueeze(0).unsqueeze(-1)
-    ).squeeze(-1)                                                          # [N, S, 3]
-
-    dist = _point_segment_distance(centres, a, b)                          # [N, S]
-    clearance = capsule_radius + env._arm_sphere_radii.to(dist.dtype) + margin
-    depth = (clearance.unsqueeze(0) - dist).clamp(min=0.0)                 # [N, S]
-
-    return ((depth / ref) ** 2).sum(dim=-1)
+# Arm-vs-body self-collision lives in self_collision.py (full-body sphere
+# model, also used by scripts/probe_side_reach.py).

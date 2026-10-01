@@ -88,7 +88,7 @@ from .apple_grasp_env_cfg import (
     PALM_NORMAL_AXIS,
     PALM_LOCAL_OFFSET,
     GRASP_STANDOFF,
-    FINGERS_UP_TOL_RAD,
+    PALM_TILT_TOL_RAD,
     APPLE_RADIUS,
     APPLE_INIT_POS,
     TRUNK_HEIGHT_RANGE,
@@ -96,6 +96,9 @@ from .apple_grasp_env_cfg import (
     BRANCH_YAW_SPREAD_DEG,
     STEM_LENGTH_RANGE,
     REACH_TARGET_DZ_RANGE,
+    REACH_MIN_FORWARD,
+    REACH_MIN_HORIZONTAL,
+    REACH_WORKSPACE_MAP,
     BRANCH_RADIUS,
     APPLE_STEM_BREAK_FORCE,
     APPLE_STEM_BREAK_TORQUE,
@@ -775,6 +778,13 @@ class EventsCfg:
             "velocity_range": (0.0, 0.0),
         },
     )
+    # Isaac Lab starts every PD target at 0; hold all joints that no action
+    # term drives (hand, waist, left arm, legs) at their defaults.
+    hold_default_targets = EventTerm(
+        func=task_mdp.hold_default_joint_targets,
+        mode="reset",
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
     reset_arm_jitter = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
@@ -796,6 +806,9 @@ class EventsCfg:
             "reach_azimuth_center_deg": GRASP_TRAIN_REACH_AZIMUTH_CENTER_DEG,
             "reach_azimuth_span_deg": GRASP_TRAIN_REACH_AZIMUTH_SPAN_DEG,
             "target_dz_range": REACH_TARGET_DZ_RANGE,
+            "reach_min_forward": REACH_MIN_FORWARD,
+            "reach_min_horizontal": REACH_MIN_HORIZONTAL,
+            "workspace_map": REACH_WORKSPACE_MAP,
             "branch_yaw_spread_deg": BRANCH_YAW_SPREAD_DEG,
             "standoff": GRASP_STANDOFF,
         },
@@ -903,9 +916,8 @@ class EventsCfg:
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": REACH_HANDOFF_AIM_LOCAL,
             "pos_tol": 0.04,
-            "ori_tol_rad": 0.30,
+            "tilt_tol_rad": PALM_TILT_TOL_RAD,
             "hold_time": 0.5,
-            "fingers_tol_rad": FINGERS_UP_TOL_RAD,
         },
     )
 

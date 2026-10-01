@@ -63,17 +63,16 @@ def reach_success(
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
     pos_tol: float = 0.04,
-    ori_tol_rad: float = 0.30,
+    tilt_tol_rad: float | None = None,
     standoff: float = 0.015,
     palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
     hold_time: float = 0.5,
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    fingers_tol_rad: float | None = None,
     sensor_cfg: SceneEntityCfg | None = None,
     pressure_min: float = 0.5,
     pressure_max: float | None = 5.0,
 ) -> torch.Tensor:
-    """Terminate once the palm has held within [pos_tol, ori_tol_rad] of the
+    """Terminate once the palm has held within [pos_tol, tilt_tol_rad] of the
     grasp point for `hold_time` continuous seconds — the same neighbourhood
     check as reach_rewards.reward_reach_hold's per-step bonus, counted here
     toward a one-time terminal success instead. Mirrors g1_arm_env's
@@ -101,8 +100,8 @@ def reach_success(
     from .reach_rewards import reach_neighbourhood
 
     in_neighbourhood = reach_neighbourhood(
-        env, robot_cfg, object_cfg, pos_tol, ori_tol_rad, standoff,
-        palm_normal_axis, palm_local_offset, fingers_tol_rad,
+        env, robot_cfg, object_cfg, pos_tol, tilt_tol_rad, standoff,
+        palm_normal_axis, palm_local_offset,
     )
 
     if sensor_cfg is not None:
@@ -368,3 +367,22 @@ def reset_apple_pose(
 
     # Write back
     apple.write_root_state_to_sim(root_state, env_ids=env_ids)
+
+
+def hold_default_joint_targets(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Reset event: set every joint's PD position target to its default.
+
+    Isaac Lab initialises joint_pos_target to ZERO, and only joints driven by
+    an action term ever get a new target. Without this, every other joint is
+    pulled from its configured default to 0 as soon as the episode starts --
+    in the reach task that left the thumb sticking straight out of the palm
+    (thumb_1 0.6 -> 0), the waist upright (0.1 -> 0) and the left arm and
+    legs drooping. Action terms still overwrite their own joints every step.
+    Run it after the joint-state reset.
+    """
+    robot = env.scene[asset_cfg.name]
+    robot.set_joint_position_target(robot.data.default_joint_pos[env_ids], env_ids=env_ids)
