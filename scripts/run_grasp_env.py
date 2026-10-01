@@ -94,12 +94,12 @@ def _find_last_exported_grasp_policy() -> str:
         if os.path.isfile(path):
             if i > 0:
                 print(f"[Policy] WARNING: newer run(s) {runs[:i]} have no export -- using {run}. "
-                      f"To view the newest, first run:\n  scripts/play.py --task AppleGraspGrasp-Play-v0 "
+                      f"To view the newest, first run:\n  scripts/play.py --task AppleGrasp-Play-v1 "
                       f"--load_run {runs[0]}")
             return path
     raise FileNotFoundError(
         f"No exported grasp policy under {runs_dir}. Run scripts/play.py --task "
-        f"AppleGraspGrasp-Play-v0 once (it exports policy.pt), or pass --policy <path>."
+        f"AppleGrasp-Play-v1 once (it exports policy.pt), or pass --policy <path>."
     )
 
 
@@ -108,7 +108,7 @@ def main():
     reset_thread.start()
 
     cfg = AppleGraspGraspEnvCfg_PLAY()
-    env = gym.make("AppleGraspGrasp-Play-v0", cfg=cfg).unwrapped
+    env = gym.make("AppleGrasp-Play-v1", cfg=cfg).unwrapped
 
     print("\n" + "=" * 60)
     print("APPLE GRASP VIEWER (phase 2: reach -> grasp, chained)")

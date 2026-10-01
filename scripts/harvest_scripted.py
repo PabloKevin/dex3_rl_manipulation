@@ -82,7 +82,7 @@ for name in list(vars(cfg.terminations)):
         setattr(cfg.terminations, name, None)
 rp = cfg.events.reset_reach_grasp_phase.params
 rp.update(stem_release_schedule=None, stem_release_time_range=None, release_on_latch=False, shaping_grace_s=None)
-env = gym.make("AppleGraspGrasp-v0", cfg=cfg).unwrapped
+env = gym.make("AppleGrasp-v1", cfg=cfg).unwrapped
 N, dev, dt = env.num_envs, env.device, env.step_dt
 
 # ── grasp policy ──

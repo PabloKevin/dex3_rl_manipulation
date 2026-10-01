@@ -88,61 +88,55 @@ def _jitter(nominal: float, pct: float = RAND_PCT) -> float:
  
 APPLE_RADIUS    = 0.04 # _jitter(0.04)
 APPLE_MASS      = _jitter(0.15)
-TREE_POS        = (_jitter(0.55), _jitter(-0.5), 0.0)
-TREE_HEIGHT     = _jitter(1.25, 0.15) # 1.40
-BRANCH_LENGTH   = _jitter(0.50)
-BRANCH_RADIUS   = _jitter(0.04)
-BRANCH_ROTATION = _jitter(140.0)
- 
-# Reach envelope: apple xy is now sampled directly in the right shoulder's
-# own polar coordinates (see domain_randomization.randomize_tree_and_apple),
-# not derived incidentally from TREE_POS/BRANCH_LENGTH jitter — the old
-# scheme routinely placed the apple out of reach (or behind the robot).
-# Measured via probe_arm_reach.py: right_shoulder_pitch_link sits at
-# env-local (0.0, -0.10, 1.085) and the rigid chain shoulder->elbow->wrist->
-# palm sums to ~0.42 m (hard upper bound, before PALM_LOCAL_OFFSET's extra
-# ~0.14 m out toward the fingers). If you change the USD/arm or push
-# PALM_LOCAL_OFFSET further, re-run probe_arm_reach.py and update REACH_MAX
-# to match. REACH_MIN was raised 0.15 -> 0.25: below that the target sits
-# close enough to the shoulder that the elbow has to fold in toward the
-# torso to reach it, which is what was causing self-collision — reported
-# empirically, not derived from a measured self-collision boundary, so
-# tighten/loosen it based on what you actually see in play.py.
-# REACH_AZIMUTH_CENTER_DEG=-45 keeps the nominal direction this task always
-# used (front-right of the robot, matching the old TREE_POS); widen
-# REACH_AZIMUTH_SPAN_DEG for a policy that should generalise over more of
-# the workspace, narrow it (or watch play.py) if the arm still saturates
-# near the arc's edges.
-REACH_MIN = 0.30
-# Was pushed to 0.62 for wider generalisation, but the arm's measured
-# physical reach (probe_arm_reach.py: shoulder->elbow->wrist->palm chain)
-# is a HARD ~0.42 m ceiling, not a style knob. Above that, episodes
-# routinely spawn the apple out of reach; the arm maxes out its extension
-# chasing an unreachable target (reach_progress rewards ANY distance
-# reduction, even short of zero), leaving little wrist DOF budget left over
-# for orientation — this reproduces EXACTLY the symptom reported (palm
-# pointing the same wrong way regardless of which axis PALM_NORMAL_AXIS
-# targets, plus a consistent z-undershoot) because it's a kinematic
-# infeasibility problem, not a reward-shaping or axis-choice one. Don't
-# raise this past ~0.45 (small margin over the measured 0.42) without
-# re-running probe_arm_reach.py to confirm the arm/USD hasn't changed.
+
+# ── Tree: commercial fruiting wall (tall spindle) ──────────────────────────
+# A tall vertical trunk (leader) with SHORT, near-horizontal fruiting
+# branches; the apple sits at a branch tip on a horizontal stem, facing the
+# row, so nothing sits between the hand and the fruit. Replaces the earlier
+# model (long branch at the trunk top, apple hanging BELOW it), which is not
+# how commercial apple trees present fruit.
 #
-# 0.58 -> 0.42 (this constant, not the comment above -- it was already
-# correct and simply not being followed): once "reach" requires actual
-# palm contact rather than just getting close, this stops being a subtle
-# orientation/self-collision symptom and becomes a direct, measurable
-# blocker. Confirmed empirically: an episode spawned with the apple 0.506 m
-# from the shoulder (well within the old 0.58 ceiling) produced EXACTLY
-# ZERO contact force anywhere on the hand, across 400 steps of the trained
-# policy AND 400 steps of aggressive random actions (which can't "learn"
-# avoidance -- ruling out a policy-behavior or reward-function explanation
-# and pointing squarely at reachability). Every training episode that spawns
-# beyond the arm's real envelope contributes a guaranteed-zero-contact data
-# point regardless of policy quality, which was diluting/masking whatever
-# progress the touch-related rewards might otherwise show. Set to the
-# measured hard ceiling itself (no margin) rather than the comment's ~0.45,
-# since contact -- not just proximity -- is what now has to fit inside it.
-REACH_MAX = 0.42
+# The branch points from the trunk back toward the robot, yawed by up to
+# +-BRANCH_YAW_SPREAD_DEG to emulate real-tree imperfections, so the trunk is
+# BEHIND the apple. Tree, trunk and stem are visual-only. Placement is
+# apple-first (domain_randomization.randomize_tree_and_apple): the trunk
+# position is derived from the sampled apple position, so it moves around
+# much more than with the old long branch.
+TRUNK_HEIGHT_RANGE    = (2.0, 2.5)     # m, per env (prestartup)
+TRUNK_RADIUS          = 0.06
+BRANCH_LENGTH         = 0.12           # m, +-20% per env (prestartup)
+BRANCH_RADIUS         = 0.015
+BRANCH_YAW_SPREAD_DEG = 30.0           # branch yaw vs. pointing at the shoulder
+STEM_LENGTH_RANGE     = (0.02, 0.04)   # m, apple surface -> branch tip (matches harvest.StemParams.length)
+STEM_RADIUS           = 0.003
+ 
+# Reach envelope of the GRASP TARGET (reach_rewards._grasp_target_pos),
+# sampled in the right shoulder's own spherical coordinates around
+# right_shoulder_pitch_link (env-local (0.0, -0.10, 1.085)); see
+# domain_randomization.randomize_tree_and_apple.
+#
+# Sized for the side-on pose (palm facing the apple horizontally, fingers
+# up) with scripts/probe_side_reach.py (multi-seed IK on the real USD,
+# logs/probe_side_reach_wf*.npz). That pose is only kinematically available
+# with the target AT OR ABOVE shoulder height and fairly close: the forearm
+# has to stand roughly vertical under the hand, so below the shoulder the
+# palm cannot face the fruit at all (4-7 cm residual even with the fingers
+# free to point down), and beyond ~0.36 m the folded arm runs out of length.
+# Inside the box below, local IK reaches the pose for 83% of samples (78%
+# with no torso intrusion) -- a lower bound, since IK can stall in local
+# minima. The old palm-up box (0.30-0.42 m, -0.28..+0.19 m) is NOT reachable
+# in this pose. Re-run the probe if the arm, USD or PALM_LOCAL_OFFSET change.
+#
+# Rule kept from the palm-up task: never sample targets the arm cannot
+# reach. Unreachable episodes are guaranteed-zero-contact data points that
+# dilute the touch rewards and push the arm to saturate chasing them.
+REACH_MIN = 0.20
+REACH_MAX = 0.36
+# Height of the grasp target above the shoulder. The apple centre sits at the
+# same height (horizontal stem), i.e. 1.085-1.365 m above the ground.
+REACH_TARGET_DZ_RANGE = (0.0, 0.28)
+# Front-right of the robot, unchanged from the palm-up task (the probe found
+# no azimuth dependence across -95..+15 deg).
 REACH_AZIMUTH_CENTER_DEG = -45.0
 REACH_AZIMUTH_SPAN_DEG = 65.0
 
@@ -163,7 +157,10 @@ RIGHT_ARM_JOINTS = [
     "right_wrist_yaw_joint",
 ]
  
-# Palm normal in the palm link's LOCAL frame. 
+# Palm normal in the palm link's LOCAL frame (points out of the palm face).
+# The reach drives it along the horizontal shoulder->apple direction, and
+# the palm's wrist->fingertip axis (local +X, reach_rewards.PALM_FINGER_AXIS)
+# to world +Z: palm facing the fruit, fingers up.
 PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 
 # Grasp reference point, in right_hand_palm_link's OWN local frame. The link
@@ -176,69 +173,40 @@ PALM_NORMAL_AXIS = (0.0, 1.0, 0.0)
 # converged policy and want the exact contact point instead of an estimate.
 PALM_LOCAL_OFFSET = (0.08, 0.0, 0.0)
 
-# Vertical gap between the apple centre and the "grasp point" every reach
-# reward/termination scores against (target_z = apple_z - GRASP_OFFSET_Z).
-# 0.08 was too shallow: it only accounted for PALM_LOCAL_OFFSET's horizontal
-# (local X) component, not the thumb. probe_palm_offset.py measured
-# right_hand_thumb_2_link at local offset (0.023, 0.065, 0) from the palm —
-# 0.065 m along local Y, the SAME axis as PALM_NORMAL_AXIS. Near the goal
-# the palm normal is driven to point at world +Z (reward_palm_normal_up), so
-# that 0.065 m becomes a near-vertical protrusion ABOVE the reference point
-# reach_progress/hold/etc. actually track. At the old offset_z=0.08 the
-# converged pose put the thumb at apple_z - 0.08 + 0.065 = apple_z - 0.015 —
-# well inside the apple's own radius (~0.04 m) — so the thumb speared the
-# apple even at a "perfect" reach, no reward-shaping bug required. Sized to
-# clear: thumb's own protrusion + the apple's radius + the worst-case slack
-# a converged policy can sit at (anywhere within pos_tol=0.04 of the target
-# still counts as "reached") + a small margin.
-_THUMB_UP_LOCAL_OFFSET = 0.0 #0.065   # measured via probe_palm_offset.py
-
 # Half the palm link's thickness along its own local Y (= PALM_NORMAL_AXIS).
 # PALM_LOCAL_OFFSET has NO Y component, so the reference point sits on the
-# palm's mid-plane, not on its contact face; near the goal the normal is
-# driven to world +Z, so the face that actually touches the apple is this
-# much ABOVE the reference point. Estimate — re-probe against the palm's
-# collision geometry if the converged contact force sits off-band.
+# palm's mid-plane, not on its contact face. Estimate — re-probe against the
+# palm's collision geometry if the converged contact force sits off-band.
 _PALM_HALF_THICKNESS = 0.015
 
-# The reach phase now scores CONTACT, not just proximity (see RewardsCfg's
-# gentle_touch / hold and TerminationsCfg.reach_success), so the target has
-# to be a pose where the palm is actually touching the apple — otherwise the
-# distance terms and the force terms pull in opposite directions and the
-# force terms are unsatisfiable.
-#
-# The previous value, _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS * 1.75 = 0.07,
-# put the target 7 cm below the apple centre while the apple's bottom
-# surface is only 4 cm below it — i.e. ~3 cm of clear air, and the palm face
-# a further 1.5 cm above the reference point on top of that. A perfectly
-# converged policy sitting exactly on target was guaranteed NOT to touch,
-# which is precisely the observed behaviour ("reaches near the apple, never
-# touches it"). The 1.75 padding factor was there to clear the thumb's
-# vertical protrusion; _THUMB_UP_LOCAL_OFFSET was later zeroed but the
-# padding was left behind.
-#
-# Now sized so the nominal converged pose is a LIGHT TOUCH: reference point
-# one palm-half-thickness below the apple's bottom surface, putting the palm
-# face right on it. pos_tol=0.04 then gives slack on both sides rather than
-# all of it on the no-contact side.
-GRASP_OFFSET_Z = _THUMB_UP_LOCAL_OFFSET + APPLE_RADIUS + _PALM_HALF_THICKNESS
+# Gap between the apple SURFACE and the grasp target, along the approach
+# direction (reach_rewards._grasp_target_pos): the palm reference point sits
+# one palm-half-thickness in front of the fruit, so at the target the palm
+# FACE is just touching it -- the reach scores contact, not just proximity,
+# and a target in clear air would make the touch terms unsatisfiable.
+GRASP_STANDOFF = _PALM_HALF_THICKNESS
+
+# Success / hold also need the fingers within this of vertical. Looser than
+# the palm-facing tolerance (ori_tol_rad = 0.30): finger roll only has to be
+# roughly right for the grasp.
+FINGERS_UP_TOL_RAD = math.radians(45.0)
+
+# Initial (pre-randomization) placement: nominal geometry at the centre of
+# the reach envelope. randomize_tree_and_apple overwrites all of it at reset.
+_SHOULDER_LOCAL = (0.0, -0.10, 1.085)
+_az0 = math.radians(REACH_AZIMUTH_CENTER_DEG)
+_r0 = 0.5 * (REACH_MIN + REACH_MAX) + APPLE_RADIUS + GRASP_STANDOFF
+_stem0 = 0.5 * sum(STEM_LENGTH_RANGE)
+APPLE_INIT_POS = (_SHOULDER_LOCAL[0] + _r0 * math.cos(_az0), _SHOULDER_LOCAL[1] + _r0 * math.sin(_az0), _SHOULDER_LOCAL[2])
+_branch_yaw0 = _az0 + math.pi
+_bx0, _by0 = math.cos(_branch_yaw0), math.sin(_branch_yaw0)
+_tip0 = (APPLE_INIT_POS[0] - _bx0 * (APPLE_RADIUS + _stem0), APPLE_INIT_POS[1] - _by0 * (APPLE_RADIUS + _stem0))
+TREE_POS = (_tip0[0] - _bx0 * BRANCH_LENGTH, _tip0[1] - _by0 * BRANCH_LENGTH, 0.0)
+_TRUNK_HEIGHT0 = 0.5 * sum(TRUNK_HEIGHT_RANGE)
+_YAW_QUAT0 = (math.cos(_branch_yaw0 / 2), 0.0, 0.0, math.sin(_branch_yaw0 / 2))
 
 # Robot root height (metres). G1 pelvis in standing pose ≈ 0.79 m.
 # With fix_root_link the pelvis is fixed here in world frame.
-# Branch pivot calculations — rotates around trunk junction
-branch_mid_x = TREE_POS[0] + (BRANCH_LENGTH / 2.0) * math.cos(math.radians(BRANCH_ROTATION))
-branch_mid_y = TREE_POS[1] + (BRANCH_LENGTH / 2.0) * math.sin(math.radians(BRANCH_ROTATION))
-
-# Apple hangs below the branch tip
-# Branch tip X = TREE_POS[0] + BRANCH_LENGTH = 0.55 + 0.50 = 1.05
-# But we want apple at ~0.55 in front of robot, so set TREE_POS[0] = 0.05
-# and BRANCH_LENGTH = 0.50  →  branch tip at 0.55, apple directly below.
-#APPLE_INIT_POS = (0.55, 0.00, TREE_HEIGHT - 0.15)  # 15 cm below branch
-
-branch_tip_x = TREE_POS[0] + BRANCH_LENGTH * math.cos(math.radians(BRANCH_ROTATION))
-branch_tip_y = TREE_POS[1] + BRANCH_LENGTH * math.sin(math.radians(BRANCH_ROTATION))
-APPLE_INIT_POS = (branch_tip_x, branch_tip_y, TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS)
-
 ROBOT_ROOT_HEIGHT = 0.793  # G1 pelvis height in standing pose (metres)
 
 
@@ -418,12 +386,12 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # ── Tree: vertical trunk ─────────────────────────────────────────────
+    # ── Tree: vertical trunk (leader) ────────────────────────────────────
     tree_trunk: AssetBaseCfg = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/TreeTrunk",
         spawn=sim_utils.CylinderCfg(
-            radius=0.06,
-            height=TREE_HEIGHT,
+            radius=TRUNK_RADIUS,
+            height=_TRUNK_HEIGHT0,
             axis="Z",
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.35, 0.20, 0.08),   # brown bark
@@ -431,34 +399,52 @@ class AppleGraspSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(TREE_POS[0], TREE_POS[1], TREE_HEIGHT / 2.0),
+            pos=(TREE_POS[0], TREE_POS[1], _TRUNK_HEIGHT0 / 2.0),
         ),
     )
 
-    # ── Tree: horizontal branch (green) ──────────────────────────────────
-    # Extends from trunk top toward the apple position along X axis.
+    # ── Tree: short horizontal fruiting branch (green) ───────────────────
+    # From the trunk back toward the robot, at the apple's height.
     tree_branch: AssetBaseCfg = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/TreeBranch",
         spawn=sim_utils.CylinderCfg(
             radius=BRANCH_RADIUS,
             height=BRANCH_LENGTH,
-            axis="X",               # extends along X toward the robot
+            axis="X",               # yawed about Z to the branch direction
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.13, 0.42, 0.08),   # green branch
                 roughness=0.9,
             ),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(
-            # Centre of branch: halfway between trunk top and apple X position
-            pos=(branch_mid_x, branch_mid_y, TREE_HEIGHT),
-            rot=(math.cos(math.radians(BRANCH_ROTATION)/2), 0.0, 0.0, math.sin(math.radians(BRANCH_ROTATION)/2)),  # rotation around Z axis (quaternion)
+            pos=(_tip0[0] - _bx0 * BRANCH_LENGTH / 2.0, _tip0[1] - _by0 * BRANCH_LENGTH / 2.0, APPLE_INIT_POS[2]),
+            rot=_YAW_QUAT0,
+        ),
+    )
+
+    # ── Stem: horizontal, from the branch tip to the apple surface ───────
+    apple_stem: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/AppleStem",
+        spawn=sim_utils.CylinderCfg(
+            radius=STEM_RADIUS,
+            height=_stem0,
+            axis="X",
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.30, 0.22, 0.10),
+                roughness=0.9,
+            ),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=(APPLE_INIT_POS[0] - _bx0 * (APPLE_RADIUS + _stem0 / 2.0),
+                 APPLE_INIT_POS[1] - _by0 * (APPLE_RADIUS + _stem0 / 2.0), APPLE_INIT_POS[2]),
+            rot=_YAW_QUAT0,
         ),
     )
 
     # ── Apple (red sphere, kinematic — reach-only phase) ───────────────────
     # Reach-only phase: the apple is kinematic (tensor-API pose-driven, not
-    # affected by gravity/collisions/joints) and simply teleported to the
-    # branch-tip target every reset by randomize_tree_and_apple. It stays
+    # affected by gravity/collisions/joints) and simply teleported to its
+    # place at the branch tip every reset by randomize_tree_and_apple. It stays
     # exactly there for the whole episode — no breakable stem joint needed.
     #
     # We tried a real dynamic apple held by a PhysX FixedJoint to a kinematic
@@ -691,9 +677,9 @@ class ObservationsCfg:
             },
         )
 
-        # Palm orientation relative to torso — same frame reward_palm_normal_up
-        # scores against (via world-Z, but torso-relative gives the policy a
-        # richer signal than the reward alone).
+        # Palm orientation relative to torso (the orientation rewards score
+        # it in world frame against the approach direction / world up; the
+        # torso-relative quaternion gives the policy a richer signal).
         palm_orientation_torso = ObsTerm(
             func=task_mdp.body_quat_relative_to_body,
             params={
@@ -757,7 +743,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -767,7 +753,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -777,7 +763,7 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "std": 0.25,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
@@ -788,45 +774,46 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "std": 0.04,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
 
-    # ── Orientation: palm normal -> world up, yaw and roll of the palm
-    #    around that normal are left FREE (per your spec: fingers can point
-    #    at the horizon or follow the arm's own z-rotation). Gated to zero
-    #    beyond gate_dist so it cannot be farmed from anywhere in the
-    #    workspace instead of reaching.
-    #    weight raised 1.5->3.0 and gate_dist loosened 0.25->0.40: at the old
-    #    values this term was small next to reach_coarse/fine (1.0/4.0) AND
-    #    gave literally zero orientation gradient until the palm was already
-    #    within 25 cm of the target -- i.e. the policy had to almost finish
-    #    reaching before it got any signal to also orient correctly, on top
-    #    of REACH_MAX previously allowing unreachable targets (see REACH_MAX
-    #    above) that made orientation kinematically impossible regardless.
-    #    Re-tighten gate_dist if this starts getting farmed away from the
-    #    target instead of reaching once REACH_MAX is respected.
-    # Weight RAISED 3.0 -> 6.0. Orientation was being outcompeted: the dense
-    # per-step touch terms (4.0 + 1.0) were collectable without facing the
-    # apple at all once a backhand counted as a touch, and a per-step 3.0 for
-    # orientation is a weak pull against that. The palmar-only fix removes
-    # the degenerate option outright, so this is belt-and-braces -- but the
-    # broader lesson holds regardless: the sparse reach_success bonus (95,
-    # one-time) is worth less than ~25 steps of a 4.0 dense term, so any
-    # dense term that can be farmed in a wrong pose will beat the success
-    # bonus outright. Keep dense terms gated on the pose being right.
-    palm_up = RewTerm(
-        func=rr.reward_palm_normal_up,
+    # ── Orientation: palm faces the apple (normal along the horizontal
+    #    shoulder->apple direction) and fingers point up. Two terms so the
+    #    fingers-up preference can be looser than palm facing: facing the
+    #    fruit is what the touch and the grasp need; finger roll only has to
+    #    be roughly right. Both gated to zero beyond gate_dist so they cannot
+    #    be farmed from anywhere in the workspace instead of reaching.
+    #
+    # Lesson carried over from the palm-up version: the sparse
+    # reach_success bonus (95, one-time) is worth less than ~25 steps of a
+    # 4.0 dense term, so any dense term that can be farmed in a wrong pose
+    # will beat the success bonus outright. Keep dense terms gated on the
+    # pose being right.
+    palm_facing = RewTerm(
+        func=rr.reward_palm_facing,
         weight=10.0,
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
-            "palm_normal_axis": PALM_NORMAL_AXIS,   # verify with play_debug_patch probe
+            "palm_normal_axis": PALM_NORMAL_AXIS,
             "std_rad": 0.5,      # ~29 deg basin
             "gate_dist": 0.55,   # metres
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
+        },
+    )
+    fingers_up = RewTerm(
+        func=rr.reward_fingers_up,
+        weight=5.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "object_cfg": SceneEntityCfg("apple"),
+            "std_rad": 0.6,      # ~34 deg basin
+            "gate_dist": 0.55,
+            "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -851,9 +838,10 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": PALM_LOCAL_OFFSET,
+            "fingers_tol_rad": FINGERS_UP_TOL_RAD,
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "pressure_min": 0.5,
             "pressure_max": 5.0,
@@ -913,7 +901,7 @@ class RewardsCfg:
             "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
             "object_cfg": SceneEntityCfg("apple"),
             "brake_dist": 0.15,
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -1008,7 +996,7 @@ class RewardsCfg:
     # self-collision/tree contact can't trigger it.
     # ref=5.0 N: a light touch costs little (squared penalty), pressing
     # harder costs much more than linearly. Tune weight from the training
-    # curve -- start small since this stacks with GRASP_OFFSET_Z already
+    # curve -- start small since this stacks with GRASP_STANDOFF already
     # keeping the hand clear of the apple in the nominal converged pose.
     apple_contact_force = RewTerm(
         func=rr.penalty_apple_contact_force,
@@ -1119,7 +1107,7 @@ class RewardsCfg:
             "gate_dist": 0.10,
             "ramp": 0.03,
             "cap": 5.0,
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
         },
     )
@@ -1200,10 +1188,11 @@ class TerminationsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "hold_time": 0.5,
             "palm_local_offset": PALM_LOCAL_OFFSET,
+            "fingers_tol_rad": FINGERS_UP_TOL_RAD,
         },
     )
 
@@ -1267,8 +1256,9 @@ class EventsCfg:
         func=dr.randomize_tree_geometry,
         mode="prestartup",
         params={
-            "tree_height_nominal": TREE_HEIGHT,
+            "trunk_height_range": TRUNK_HEIGHT_RANGE,
             "branch_length_nominal": BRANCH_LENGTH,
+            "stem_length_range": STEM_LENGTH_RANGE,
         },
     )
 
@@ -1292,26 +1282,24 @@ class EventsCfg:
         },
     )
 
-    # ── Per-episode variation: whole tree translates + branch rotates, apple
-    #    stays attached at the branch tip (see randomize_tree_and_apple) ──────
+    # ── Per-episode variation: apple position/height and branch yaw are
+    #    sampled, the tree follows (see randomize_tree_and_apple) ───────────
     randomize_tree = EventTerm(
         func=dr.randomize_tree_and_apple,
         mode="reset",
         params={
             "object_cfg": SceneEntityCfg("apple"),
-            "branch_radius_nominal": BRANCH_RADIUS,
-            "branch_rotation_deg_nominal": BRANCH_ROTATION,
             "apple_radius_nominal": APPLE_RADIUS,
-            "tree_height_nominal": TREE_HEIGHT,
-            "branch_length_nominal": BRANCH_LENGTH,
-            # Reach envelope around right_shoulder_pitch_link — see
-            # probe_arm_reach.py / randomize_tree_and_apple's docstring for
-            # how these were derived (measured max chain length ~0.42 m).
+            # Reach envelope of the GRASP TARGET around
+            # right_shoulder_pitch_link — see REACH_MAX / REACH_TARGET_DZ_RANGE
+            # and randomize_tree_and_apple's docstring.
             "reach_min": REACH_MIN,
             "reach_max": REACH_MAX,
             "reach_azimuth_center_deg": REACH_AZIMUTH_CENTER_DEG,
             "reach_azimuth_span_deg": REACH_AZIMUTH_SPAN_DEG,
-            "offset_z": GRASP_OFFSET_Z,
+            "target_dz_range": REACH_TARGET_DZ_RANGE,
+            "branch_yaw_spread_deg": BRANCH_YAW_SPREAD_DEG,
+            "standoff": GRASP_STANDOFF,
         },
     )
 
@@ -1381,7 +1369,7 @@ class AppleGraspEnvCfg_PLAY(AppleGraspEnvCfg):
         # kinematic so apple_dropped can't trigger either) — so
         # play_debug_patch.py's reset-verification block ("RESET -> q=...")
         # will not print here. To actually exercise and verify the reset
-        # path, run play.py against AppleGraspEnvCfg (or AppleGrasp-v0)
+        # path, run play.py against AppleGraspEnvCfg (or AppleReach-v1)
         # instead of the -Play variant, or temporarily comment out these two
         # lines.
         self.events.reset_all_exact = None

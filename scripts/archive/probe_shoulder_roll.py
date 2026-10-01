@@ -21,7 +21,7 @@ import envs  # noqa
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg_PLAY, RIGHT_ARM_JOINTS
 
 cfg = AppleGraspEnvCfg_PLAY()
-env = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
+env = gym.make("AppleReach-v1", cfg=cfg).unwrapped
 env.reset()
 
 robot = env.scene["robot"]

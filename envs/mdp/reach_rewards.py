@@ -78,43 +78,107 @@ def _palm_ref_pos(
     return palm_pos + offset_world
 
 
+# Side-on fruit (commercial fruiting-wall tree, see apple_grasp_env_cfg.py's
+# tree block): the hand approaches the apple HORIZONTALLY from the robot's
+# side, palm facing the fruit, fingers pointing up. The approach direction is
+# the horizontal line from the right shoulder to the apple centre -- it tracks
+# the apple across the whole azimuth range, and the policy can infer it from
+# what it observes (arm joints + apple position relative to the palm).
+APPROACH_BODY = "right_shoulder_pitch_link"
+
+#: Palm-link local axis that points from the wrist toward the fingertips
+#: (probe_palm_offset.py: knuckles at local +X). Driven to world +Z.
+PALM_FINGER_AXIS = (1.0, 0.0, 0.0)
+
+#: Fallback when the scene has no per-env apple radius (env._apple_radius).
+DEFAULT_APPLE_RADIUS = 0.04
+
+
+def _approach_dir(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Horizontal unit vector from the right shoulder to the apple centre.
+
+    The palm normal should point along it, and the grasp target sits
+    `standoff` back along it from the apple centre.
+
+    Returns: [num_envs, 3] (z = 0)
+    """
+    robot: Articulation = env.scene["robot"]
+    if not hasattr(env, "_approach_body_id"):
+        env._approach_body_id = robot.data.body_names.index(APPROACH_BODY)
+    apple: RigidObject = env.scene[object_cfg.name]
+    d = apple.data.root_pos_w - robot.data.body_pos_w[:, env._approach_body_id, :]
+    d = torch.cat([d[:, :2], torch.zeros_like(d[:, :1])], dim=-1)
+    return d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+
+def _grasp_target_pos(
+    env: "ManagerBasedRLEnv",
+    object_cfg: SceneEntityCfg,
+    standoff: float,
+) -> torch.Tensor:
+    """Where the palm's grasp reference point should sit: `standoff` metres
+    beyond the apple SURFACE, back along the approach direction (i.e. on the
+    robot's side of the fruit, at the apple's own height). Uses the per-env
+    apple radius (domain_randomization.randomize_apple_scale) when present.
+
+    Returns: [num_envs, 3]
+    """
+    apple: RigidObject = env.scene[object_cfg.name]
+    radius = getattr(env, "_apple_radius", None)
+    if not isinstance(radius, torch.Tensor):
+        radius = torch.full((env.num_envs,), DEFAULT_APPLE_RADIUS, device=env.device)
+    back = (radius + standoff).unsqueeze(-1)
+    return apple.data.root_pos_w - back * _approach_dir(env, object_cfg)
+
+
 def _palm_target_dist(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    offset_z: float,
+    standoff: float,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
-    """Distance from the palm's grasp reference point to the grasp target.
-
-    The grasp point is `offset_z` metres BELOW the apple centre, i.e. where
-    the hand sits when cupping the apple from underneath.
+    """Distance from the palm's grasp reference point to the grasp target
+    (see _grasp_target_pos).
 
     Returns: [num_envs]
     """
-    apple: RigidObject = env.scene[object_cfg.name]
-
     palm_pos = _palm_ref_pos(env, robot_cfg, palm_local_offset)
-    target = apple.data.root_pos_w.clone()
-    target[:, 2] -= offset_z
-    return torch.norm(target - palm_pos, dim=-1)
+    return torch.norm(_grasp_target_pos(env, object_cfg, standoff) - palm_pos, dim=-1)
 
 
 def _palm_normal_angle(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     palm_normal_axis: Sequence[float],
+    object_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Angle (rad) between the palm normal and world +Z (up).
+    """Angle (rad) between the palm normal and the approach direction
+    (_approach_dir), i.e. how squarely the palm faces the apple.
 
     `palm_normal_axis` is the palm normal expressed in the palm link's OWN
-    local frame. Run the probe in play_debug_patch.py to find it for your USD.
+    local frame. object_cfg defaults to the scene's "apple".
 
-    Returns: [num_envs], 0 = palm facing straight up, pi = facing straight down.
+    Returns: [num_envs], 0 = palm facing the apple, pi = facing away.
     """
+    if object_cfg is None:
+        object_cfg = SceneEntityCfg("apple")
     n_world = _palm_normal_world(env, robot_cfg, palm_normal_axis)
-    cos_up = n_world[:, 2].clamp(-1.0, 1.0)                       # dot with [0,0,1]
-    return torch.acos(cos_up)
+    cos = (n_world * _approach_dir(env, object_cfg)).sum(dim=-1).clamp(-1.0, 1.0)
+    return torch.acos(cos)
+
+
+def _fingers_up_angle(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    finger_axis: Sequence[float] = PALM_FINGER_AXIS,
+) -> torch.Tensor:
+    """Angle (rad) between the palm's wrist->fingertip axis and world +Z.
+
+    Returns: [num_envs], 0 = fingers straight up.
+    """
+    f_world = _palm_normal_world(env, robot_cfg, finger_axis)
+    return torch.acos(f_world[:, 2].clamp(-1.0, 1.0))
 
 
 def _palm_normal_world(
@@ -195,7 +259,7 @@ def reward_reach_progress(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    offset_z: float = 0.08,
+    standoff: float = 0.015,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
     """Potential-based shaping: reward for REDUCING palm->target distance.
@@ -209,7 +273,7 @@ def reward_reach_progress(
 
     This is the single term that fixes "position is never learned".
     """
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
 
     if not hasattr(env, "_prev_palm_dist") or env._prev_palm_dist.shape != d.shape:
         env._prev_palm_dist = d.clone()
@@ -227,7 +291,7 @@ def penalty_reach_residual(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    offset_z: float = 0.08,
+    standoff: float = 0.015,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
     """Linear distance penalty. Use a NEGATIVE weight.
@@ -235,14 +299,14 @@ def penalty_reach_residual(
     Guarantees a non-zero pull even if progress shaping stalls, and makes
     "hover far away doing nothing" strictly worse than approaching.
     """
-    return _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+    return _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
 
 
 def reward_reach_gaussian(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    offset_z: float = 0.08,
+    standoff: float = 0.015,
     std: float = 0.05,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
@@ -253,50 +317,92 @@ def reward_reach_gaussian(
     is numerically zero beyond ~0.15 m -- exp(-18) = 1.5e-8 at d = 0.30 m --
     which is why the original palm_position term never trained anything.
     """
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
     return torch.exp(-(d ** 2) / (2.0 * std ** 2))
 
 
 # ═════════════════════════════════════════════════════════════════════════
-#  Orientation: palm normal -> world up, yaw UNCONSTRAINED
+#  Orientation: palm faces the apple, fingers point up
 # ═════════════════════════════════════════════════════════════════════════
 
-def reward_palm_normal_up(
+def _orientation_gate(env, robot_cfg, object_cfg, gate_dist, standoff, palm_local_offset):
+    """1 at the target, falling linearly to 0 at gate_dist. Without it an
+    orientation reward is collectable from ANYWHERE in the workspace and the
+    policy banks it instead of reaching."""
+    if gate_dist <= 0.0:
+        return 1.0
+    if object_cfg is None:
+        raise ValueError("gate_dist > 0 requires object_cfg")
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
+    return (1.0 - d / gate_dist).clamp(0.0, 1.0)
+
+
+def reward_palm_facing(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg | None = None,
-    palm_normal_axis: Sequence[float] = (0.0, 0.0, 1.0),
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
     std_rad: float = 0.5,
     gate_dist: float = 0.0,
-    offset_z: float = 0.08,
+    standoff: float = 0.015,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
-    """Reward the palm normal pointing at the sky. Fingers free to yaw.
-
-    This constrains ONE rotational DOF instead of three. The previous
-    full-quaternion target (roll 90 / pitch 0 / yaw 0) pinned the wrist yaw
-    too, removing redundancy the arm needs to satisfy the position target --
-    the two rewards were fighting each other.
+    """Reward the palm normal pointing along the approach direction (palm
+    facing the apple from the robot's side). Rotation about the normal is
+    left to reward_fingers_up, a separate, looser term.
 
     Args:
         palm_normal_axis: palm normal in the palm link's LOCAL frame.
-        std_rad: Gaussian width on the normal-vs-up angle. 0.5 rad ~ 29 deg.
+        std_rad: Gaussian width on the normal-vs-approach angle.
         gate_dist: if > 0, scale the reward linearly to 0 as the palm gets
-            further than gate_dist from the grasp point. Without this, the
-            orientation reward is collectable from ANYWHERE in the workspace
-            and the policy will bank it instead of reaching.
-        offset_z: only used when gating.
+            further than gate_dist from the grasp target.
     """
-    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
+    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
     r = torch.exp(-(theta ** 2) / (2.0 * std_rad ** 2))
+    return r * _orientation_gate(env, robot_cfg, object_cfg, gate_dist, standoff, palm_local_offset)
 
-    if gate_dist > 0.0:
-        if object_cfg is None:
-            raise ValueError("gate_dist > 0 requires object_cfg")
-        d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
-        r = r * (1.0 - d / gate_dist).clamp(0.0, 1.0)
 
-    return r
+def reward_fingers_up(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg | None = None,
+    finger_axis: Sequence[float] = PALM_FINGER_AXIS,
+    std_rad: float = 0.6,
+    gate_dist: float = 0.0,
+    standoff: float = 0.015,
+    palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+) -> torch.Tensor:
+    """Reward the fingers pointing at the sky (the palm's rotation about its
+    own normal). Same gating as reward_palm_facing."""
+    phi = _fingers_up_angle(env, robot_cfg, finger_axis)
+    r = torch.exp(-(phi ** 2) / (2.0 * std_rad ** 2))
+    return r * _orientation_gate(env, robot_cfg, object_cfg, gate_dist, standoff, palm_local_offset)
+
+
+def reach_neighbourhood(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    pos_tol: float,
+    ori_tol_rad: float,
+    standoff: float,
+    palm_normal_axis: Sequence[float],
+    palm_local_offset: Sequence[float],
+    fingers_tol_rad: float | None = None,
+) -> torch.Tensor:
+    """Palm at the grasp target (within pos_tol), facing the apple (within
+    ori_tol_rad) and, if fingers_tol_rad is given, fingers up within it.
+    Shared by reward_reach_hold, terminations_and_events.reach_success and
+    the grasp task's converged hand-off so they cannot disagree.
+
+    Returns: [num_envs] bool
+    """
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
+    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
+    inside = (d < pos_tol) & (theta < ori_tol_rad)
+    if fingers_tol_rad is not None:
+        inside = inside & (_fingers_up_angle(env, robot_cfg) < fingers_tol_rad)
+    return inside
 
 
 def reward_reach_hold(
@@ -305,9 +411,10 @@ def reward_reach_hold(
     object_cfg: SceneEntityCfg,
     pos_tol: float = 0.04,
     ori_tol_rad: float = 0.30,
-    offset_z: float = 0.08,
-    palm_normal_axis: Sequence[float] = (0.0, 0.0, 1.0),
+    standoff: float = 0.015,
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+    fingers_tol_rad: float | None = None,
     sensor_cfg: SceneEntityCfg | None = None,
     pressure_min: float = 0.5,
     pressure_max: float | None = 5.0,
@@ -329,9 +436,10 @@ def reward_reach_hold(
     to touch -- the same reward/gate mismatch that stalled the grasp
     phase's first training run, avoided here by construction.
     """
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
-    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
-    in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
+    in_neighbourhood = reach_neighbourhood(
+        env, robot_cfg, object_cfg, pos_tol, ori_tol_rad, standoff,
+        palm_normal_axis, palm_local_offset, fingers_tol_rad,
+    )
 
     if sensor_cfg is not None:
         from .observations import palm_contact_force
@@ -480,7 +588,7 @@ def penalty_premature_contact(
     gate_dist: float = 0.05,
     ramp: float = 0.03,
     cap: float = 5.0,
-    offset_z: float = 0.08,
+    standoff: float = 0.015,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
     link_names: Sequence[str] | None = None,
 ) -> torch.Tensor:
@@ -491,7 +599,7 @@ def penalty_premature_contact(
     This is the "collided on the way in" term. The observed failure is the
     BACK of the thumb clipping the apple during the approach: the hand
     arrives from a direction that sweeps a dorsal surface through the
-    apple's volume before the palm ever gets underneath it. Nothing else in
+    apple's volume before the palm ever gets in front of it. Nothing else in
     the reward set objects -- reward_gentle_touch only looks at whether the
     force is in band (and the dorsal links aren't even in its group),
     penalty_excess_palm_force only fires above 5 N, and
@@ -502,8 +610,8 @@ def penalty_premature_contact(
     Rather than trying to identify the dorsal surface geometrically (which
     would need a pad-normal axis per thumb link that nobody has measured for
     this USD), this uses the fact that makes the contact wrong in the first
-    place: WHEN it happens. In the intended trajectory the hand gets behind
-    and below the apple first and only then closes the last couple of
+    place: WHEN it happens. In the intended trajectory the hand lines up in
+    front of the apple first and only then closes the last couple of
     centimetres, so ANY apple contact while the palm reference point is
     still `gate_dist` away is premature by construction, whichever surface
     it lands on. Contact inside the neighbourhood -- the gentle touch this
@@ -525,7 +633,7 @@ def penalty_premature_contact(
     if link_names is None:
         link_names = RIGHT_HAND_CONTACT_LINKS
 
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
     gate = ((d - gate_dist) / max(ramp, 1e-6)).clamp(0.0, 1.0)      # [N]
 
     force = apple_force_per_link(env, sensor_cfg, link_names)        # [N, L]
@@ -542,7 +650,7 @@ def reward_reach_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
     env._reach_success, cached by reach_success. IsaacLab computes
     terminations before rewards each step (see ManagerBasedRLEnv.step), so
     that cache is always fresh here. Wire reach_success as a TerminationTermCfg
-    with the SAME pos_tol/ori_tol_rad/offset_z/palm_normal_axis/hold_time as
+    with the SAME pos_tol/ori_tol_rad/standoff/palm_normal_axis/hold_time as
     this reward's weight is meant to pay out on, or the two will disagree.
     """
     if not hasattr(env, "_reach_success"):
@@ -653,7 +761,7 @@ def penalty_near_goal_velocity(
     asset_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg,
     object_cfg: SceneEntityCfg,
-    offset_z: float = 0.08,
+    standoff: float = 0.015,
     brake_dist: float = 0.15,
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> torch.Tensor:
@@ -669,7 +777,7 @@ def penalty_near_goal_velocity(
     asset: Articulation = env.scene[asset_cfg.name]
     dq = asset.data.joint_vel[:, asset_cfg.joint_ids]
 
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
     frac = (1.0 - d / brake_dist).clamp(0.0, 1.0)
 
     return (dq ** 2).sum(dim=-1) * frac ** 2

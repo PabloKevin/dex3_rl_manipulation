@@ -21,7 +21,7 @@ import sys
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Render scene stills for the paper.")
-parser.add_argument("--task", type=str, default="AppleGrasp-v0")
+parser.add_argument("--task", type=str, default="AppleReach-v1")
 parser.add_argument("--num_envs", type=int, default=3)
 parser.add_argument("--settle_steps", type=int, default=12,
                     help="Sim steps before capture, so the arm settles into its initial pose.")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2025 - G1 Dex3 Apple Grasp Project
 """
-Phase 3 -- view the HARVEST task (AppleGraspHarvest-Play-v0), interactively.
+Phase 3 -- view the HARVEST task (AppleHarvest-Play-v1), interactively.
 
 Every episode starts from a ready grasp out of the start bank
 (scripts/collect_harvest_starts.py). Press 'r' + Enter to reset all envs
@@ -46,7 +46,7 @@ from envs.mdp import harvest as hv
 
 cfg = AppleGraspHarvestEnvCfg_PLAY()
 cfg.scene.num_envs = args.num_envs
-env = gym.make("AppleGraspHarvest-Play-v0", cfg=cfg).unwrapped
+env = gym.make("AppleHarvest-Play-v1", cfg=cfg).unwrapped
 dev = env.device
 
 if args.checkpoint:

@@ -57,7 +57,7 @@ class QuinticStopConfig:
 
     # DISTANCE METRIC: `dist` passed to update_state() is the palm REFERENCE
     # POINT (palm link origin + PALM_LOCAL_OFFSET, out at the finger pads) to
-    # the GRASP TARGET (GRASP_OFFSET_Z below the apple centre) -- exactly the
+    # the GRASP TARGET (GRASP_STANDOFF in front of the apple surface) -- exactly the
     # quantity reach_rewards._palm_target_dist computes, so stop_dist is
     # directly comparable to RewardsCfg's own pos_tol (0.04 m). It used to be
     # fed wrist-origin-to-apple-CENTRE, which reads ~0.10 m at the very pose

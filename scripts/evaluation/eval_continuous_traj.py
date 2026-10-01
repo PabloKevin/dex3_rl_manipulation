@@ -43,7 +43,7 @@ import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(
     description="Record full-length (non-terminating) policy trajectories for the fig_compare figure.")
-parser.add_argument("--task", type=str, default="AppleGrasp-v0", help="Task name (must be the TRAINING task).")
+parser.add_argument("--task", type=str, default="AppleReach-v1", help="Task name (must be the TRAINING task).")
 parser.add_argument("--num_envs", type=int, default=64, help="Parallel environments.")
 parser.add_argument("--n_steps", type=int, default=150, help="Control steps to record (150 = 3 s at 50 Hz).")
 parser.add_argument("--proximity_stop", type=str, default="on", choices=["on", "off"],
@@ -64,7 +64,7 @@ args_cli, hydra_args = parser.parse_known_args()
 if "-Play" in args_cli.task:
     raise SystemExit(
         f"[FATAL] --task {args_cli.task} is a Play variant: it sets episode_length_s=1e6 and "
-        "nulls the reset events. Use the training task (AppleGrasp-v0)."
+        "nulls the reset events. Use the training task (AppleReach-v1)."
     )
 
 sys.argv = [sys.argv[0]] + hydra_args
@@ -98,7 +98,7 @@ import envs  # noqa: E402,F401
 
 import eval_utils  # noqa: E402
 from envs.apple_grasp_env_cfg import (  # noqa: E402
-    GRASP_OFFSET_Z,
+    GRASP_STANDOFF,
     PALM_LOCAL_OFFSET,
     PALM_NORMAL_AXIS,
     RIGHT_ARM_JOINTS,
@@ -286,7 +286,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             tr_dq[:, t] = robot.data.joint_vel[:, arm_ids]
             tr_a[:, t] = term.raw_actions
             tr_u[:, t] = term.processed_actions
-            tr_d[:, t] = _palm_target_dist(u, robot_cfg, SceneEntityCfg("apple"), GRASP_OFFSET_Z, PALM_LOCAL_OFFSET)
+            tr_d[:, t] = _palm_target_dist(u, robot_cfg, SceneEntityCfg("apple"), GRASP_STANDOFF, PALM_LOCAL_OFFSET)
             tr_th[:, t] = _palm_normal_angle(u, robot_cfg, PALM_NORMAL_AXIS)
             if (t + 1) % 50 == 0:
                 print(f"  step {t + 1:4d}/{T}  ({(t + 1) * n / (time.time() - t0):.0f} env-steps/s)")
@@ -300,7 +300,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     delta = (apple_w - shoulder_w).cpu().numpy()
     r_xy = np.linalg.norm(delta[:, :2], axis=-1)
     az = np.degrees(np.arctan2(delta[:, 1], delta[:, 0]))
-    dz = delta[:, 2] - GRASP_OFFSET_Z
+    dz = delta[:, 2]   # side-on target: same height as the apple centre
     r3d = np.sqrt(r_xy ** 2 + dz ** 2)
 
     episodes = {
@@ -337,7 +337,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "pos_tol": np.float32(POS_TOL),
         "ori_tol_rad": np.float32(ORI_TOL_RAD),
         "hold_steps": np.int32(round(HOLD_TIME_S / u.step_dt)),
-        "offset_z": np.float32(GRASP_OFFSET_Z),
+        "standoff": np.float32(GRASP_STANDOFF),
         "joint_names": np.array(RIGHT_ARM_JOINTS, dtype="<U32"),
     }
     meta = {
@@ -360,7 +360,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "seed": agent_cfg.seed,
         "palm_normal_axis": list(PALM_NORMAL_AXIS),
         "palm_local_offset": list(PALM_LOCAL_OFFSET),
-        "grasp_offset_z": float(GRASP_OFFSET_Z),
+        "grasp_standoff": float(GRASP_STANDOFF),
         "reach_min": float(env_cfg.events.randomize_tree.params["reach_min"]),
         "reach_max": float(env_cfg.events.randomize_tree.params["reach_max"]),
         "azimuth_center_deg": float(env_cfg.events.randomize_tree.params["reach_azimuth_center_deg"]),

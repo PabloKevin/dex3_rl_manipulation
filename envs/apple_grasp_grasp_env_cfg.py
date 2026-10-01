@@ -87,12 +87,16 @@ from .apple_grasp_env_cfg import (
     RIGHT_ARM_JOINTS,
     PALM_NORMAL_AXIS,
     PALM_LOCAL_OFFSET,
-    GRASP_OFFSET_Z,
+    GRASP_STANDOFF,
+    FINGERS_UP_TOL_RAD,
     APPLE_RADIUS,
-    TREE_HEIGHT,
+    APPLE_INIT_POS,
+    TRUNK_HEIGHT_RANGE,
     BRANCH_LENGTH,
+    BRANCH_YAW_SPREAD_DEG,
+    STEM_LENGTH_RANGE,
+    REACH_TARGET_DZ_RANGE,
     BRANCH_RADIUS,
-    BRANCH_ROTATION,
     APPLE_STEM_BREAK_FORCE,
     APPLE_STEM_BREAK_TORQUE,
 )
@@ -119,14 +123,14 @@ RIGHT_HAND_JOINTS = [
 ]
 
 # Narrower than the reach task's own REACH_MIN/REACH_MAX/REACH_AZIMUTH_SPAN_DEG
-# (0.30-0.62 m, 65 deg) -- deliberately: this range only needs to be
-# comfortably WELL INSIDE the arm's measured hard kinematic ceiling (~0.42 m,
-# see apple_grasp_env_cfg.py's REACH_MAX comment for the probe_arm_reach.py
-# measurement and its own caveat that 0.62 already exceeds that ceiling), so
-# the frozen reach policy reliably converges during reach-autoplay instead of
-# this task's own placement randomization stress-testing reach robustness.
-GRASP_TRAIN_REACH_MIN = 0.30
-GRASP_TRAIN_REACH_MAX = 0.40
+# (0.20-0.36 m, 65 deg) -- deliberately: this range only needs to sit
+# comfortably INSIDE the side-on pose's reachable box (see
+# apple_grasp_env_cfg.py's REACH_MIN/REACH_MAX comment), so the frozen reach
+# policy reliably converges during reach-autoplay instead of this task's own
+# placement randomization stress-testing reach robustness. Revisit once the
+# side-on reach policy is trained and its success map is known.
+GRASP_TRAIN_REACH_MIN = 0.22
+GRASP_TRAIN_REACH_MAX = 0.34
 GRASP_TRAIN_REACH_AZIMUTH_CENTER_DEG = -45.0
 GRASP_TRAIN_REACH_AZIMUTH_SPAN_DEG = 40.0
 
@@ -228,7 +232,7 @@ class AppleGraspGraspSceneCfg(AppleGraspSceneCfg):
             ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.5, -0.3, TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS),
+            pos=APPLE_INIT_POS,
             rot=(1.0, 0.0, 0.0, 0.0),
         ),
     )
@@ -740,7 +744,11 @@ class EventsCfg:
     randomize_tree_geometry = EventTerm(
         func=dr.randomize_tree_geometry,
         mode="prestartup",
-        params={"tree_height_nominal": TREE_HEIGHT, "branch_length_nominal": BRANCH_LENGTH},
+        params={
+            "trunk_height_range": TRUNK_HEIGHT_RANGE,
+            "branch_length_nominal": BRANCH_LENGTH,
+            "stem_length_range": STEM_LENGTH_RANGE,
+        },
     )
     randomize_apple_scale = EventTerm(
         func=dr.randomize_apple_scale,
@@ -782,16 +790,14 @@ class EventsCfg:
         mode="reset",
         params={
             "object_cfg": SceneEntityCfg("apple"),
-            "branch_radius_nominal": BRANCH_RADIUS,
-            "branch_rotation_deg_nominal": BRANCH_ROTATION,
             "apple_radius_nominal": APPLE_RADIUS,
-            "tree_height_nominal": TREE_HEIGHT,
-            "branch_length_nominal": BRANCH_LENGTH,
             "reach_min": GRASP_TRAIN_REACH_MIN,
             "reach_max": GRASP_TRAIN_REACH_MAX,
             "reach_azimuth_center_deg": GRASP_TRAIN_REACH_AZIMUTH_CENTER_DEG,
             "reach_azimuth_span_deg": GRASP_TRAIN_REACH_AZIMUTH_SPAN_DEG,
-            "offset_z": GRASP_OFFSET_Z,
+            "target_dz_range": REACH_TARGET_DZ_RANGE,
+            "branch_yaw_spread_deg": BRANCH_YAW_SPREAD_DEG,
+            "standoff": GRASP_STANDOFF,
         },
     )
     randomize_stem_break = EventTerm(
@@ -893,12 +899,13 @@ class EventsCfg:
             "handoff_time_s": REACH_HANDOFF_TIME_S,
             # Only used in "converged" mode -- same neighbourhood as the
             # reach task's own reach_success termination.
-            "offset_z": GRASP_OFFSET_Z,
+            "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": REACH_HANDOFF_AIM_LOCAL,
             "pos_tol": 0.04,
             "ori_tol_rad": 0.30,
             "hold_time": 0.5,
+            "fingers_tol_rad": FINGERS_UP_TOL_RAD,
         },
     )
 

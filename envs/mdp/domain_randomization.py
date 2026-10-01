@@ -2,13 +2,13 @@
 """Domain randomization for the apple-grasp scene.
 
 Fixed once per env at "prestartup"/"startup" (before/just-after the GPU tensor
-views exist): apple scale, apple mass, trunk height, branch length — anything
+views exist): apple scale, apple mass, trunk height, branch/stem length — anything
 that requires a raw USD collider-geometry write, since that's illegal against
 a live PhysX GPU-direct-API tensor view.
 
-Re-sampled every episode at "reset": whole-tree (x, y) translation, branch
-yaw rotation, apple position (via the tensor API, tracking the branch tip),
-and stem break thresholds (plain Python values).
+Re-sampled every episode at "reset": apple position and height (via the
+tensor API), branch yaw, the tree translation that follows from both, and
+stem break thresholds (plain Python values).
 """
 from __future__ import annotations
 import random
@@ -280,17 +280,19 @@ def _get_cylinder_mesh(stage, base_path):
 def randomize_tree_geometry(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor | None,
-    tree_height_nominal: float,
+    trunk_height_range: tuple[float, float],
     branch_length_nominal: float,
+    stem_length_range: tuple[float, float],
 ) -> None:
-    """One-time (mode="prestartup") per-env trunk-height / branch-length pick.
+    """One-time (mode="prestartup") per-env trunk height / branch length /
+    stem length pick.
 
-    Resizing collider geometry is a raw USD write, same constraint as
+    Resizing cylinder geometry is a raw USD write, same constraint as
     randomize_apple_scale — must happen before sim.reset() creates the GPU
     tensor views, so it can only run once per env, not every episode. The
     sampled values are cached on `env` so randomize_tree_and_apple (mode=
-    "reset") can reuse them every episode without touching cylinder geometry
-    again — it only translates/rotates the (now-fixed-shape) trunk & branch.
+    "reset") can reuse them every episode; it only translates/rotates the
+    (now fixed-shape) trunk, branch and stem.
     """
     try:
         import omni.usd
@@ -302,85 +304,67 @@ def randomize_tree_geometry(
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device)
 
-    h_lo, h_hi = _range(tree_height_nominal)
     l_lo, l_hi = _range(branch_length_nominal)
 
-    env._tree_height = torch.full((env.num_envs,), tree_height_nominal, device=env.device)
+    env._trunk_height = torch.full((env.num_envs,), sum(trunk_height_range) / 2.0, device=env.device)
     env._branch_length = torch.full((env.num_envs,), branch_length_nominal, device=env.device)
+    env._stem_length = torch.full((env.num_envs,), sum(stem_length_range) / 2.0, device=env.device)
 
     for idx in env_ids.tolist():
-        tree_h = random.uniform(h_lo, h_hi)
+        trunk_h = random.uniform(*trunk_height_range)
         branch_len = random.uniform(l_lo, l_hi)
-        env._tree_height[idx] = tree_h
+        stem_len = random.uniform(*stem_length_range)
+        env._trunk_height[idx] = trunk_h
         env._branch_length[idx] = branch_len
+        env._stem_length[idx] = stem_len
 
         env_ns = f"/World/envs/env_{idx}"
-
-        _, trunk_cyl = _get_cylinder_mesh(stage, f"{env_ns}/TreeTrunk")
-        if trunk_cyl:
-            trunk_cyl.GetHeightAttr().Set(tree_h)
-
-        _, branch_cyl = _get_cylinder_mesh(stage, f"{env_ns}/TreeBranch")
-        if branch_cyl:
-            branch_cyl.GetHeightAttr().Set(branch_len)
+        for name, h in (("TreeTrunk", trunk_h), ("TreeBranch", branch_len), ("AppleStem", stem_len)):
+            _, cyl = _get_cylinder_mesh(stage, f"{env_ns}/{name}")
+            if cyl:
+                cyl.GetHeightAttr().Set(h)
 
 
 def randomize_tree_and_apple(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
     object_cfg: SceneEntityCfg,
-    branch_radius_nominal: float,
-    branch_rotation_deg_nominal: float,
     apple_radius_nominal: float,
-    tree_height_nominal: float,
-    branch_length_nominal: float,
-    reach_min: float = 0.25,
-    reach_max: float = 0.42,
-    reach_azimuth_center_deg: float = -45.0,
-    reach_azimuth_span_deg: float = 70.0,
-    offset_z: float = 0.08,
+    reach_min: float,
+    reach_max: float,
+    reach_azimuth_center_deg: float,
+    reach_azimuth_span_deg: float,
+    target_dz_range: tuple[float, float],
+    branch_yaw_spread_deg: float,
+    standoff: float,
     shoulder_body_name: str = "right_shoulder_pitch_link",
 ) -> None:
-    """Per-episode (mode="reset") apple placement, reachability-aware.
+    """Per-episode (mode="reset") apple placement, reachability-aware, on a
+    commercial fruiting-wall tree: a tall vertical trunk with a short,
+    horizontal branch whose tip holds the apple by a horizontal stem.
 
-    The apple's (x, y) is now sampled directly in the right shoulder's own
-    polar coordinates — radius in [reach_min, reach_max], azimuth in
-    [reach_azimuth_center_deg +- reach_azimuth_span_deg/2] — instead of being
-    an incidental byproduct of independently-jittered tree position + branch
-    rotation. The old scheme (TREE_POS +-15cm, BRANCH_ROTATION +-20%,
-    BRANCH_LENGTH +-20% ~ 0.4-0.6m) had no notion of the arm's actual
-    workspace, so it routinely spawned the apple out of reach (or even
-    behind the shoulder) — confirmed empirically via probe_arm_reach.py:
-    right_shoulder_pitch_link sits at env-local (0.0, -0.10, 1.085), and the
-    rigid chain shoulder->elbow->wrist->palm sums to only ~0.42 m, a hard
-    upper bound on how far the hand can possibly reach (before even
-    accounting for reach_rewards.PALM_LOCAL_OFFSET pushing the true grasp
-    reference point another ~0.14 m out). reach_max=0.45 below already
-    accounts for that; if you push PALM_LOCAL_OFFSET further out, tighten
-    reach_max to match, and re-run probe_arm_reach.py if you ever change the
-    USD/arm.
+    The GRASP TARGET (the point the palm's reference point is scored
+    against, reach_rewards._grasp_target_pos: `standoff` beyond the apple
+    surface, back toward the shoulder) is sampled in the right shoulder's
+    own spherical coordinates:
+      - height dz above the shoulder, uniform in target_dz_range;
+      - 3D distance in [reach_min, reach_max] (solved for the horizontal
+        radius given dz);
+      - azimuth in reach_azimuth_center_deg +- reach_azimuth_span_deg/2.
+    Measured at right_shoulder_pitch_link (env-local (0.0, -0.10, 1.085)).
 
-    dz (shoulder height vs. grasp-point height) comes from the already-fixed
-    per-env tree_height, so the azimuth/radius sampling below solves for the
-    horizontal radius that keeps the FULL 3D distance within
-    [reach_min, reach_max], not just the horizontal component.
+    The apple sits further out along the same azimuth, so shoulder, target
+    and apple are horizontally collinear and the approach direction is the
+    sampled azimuth. The branch points from the trunk back toward the robot,
+    yawed by up to +-branch_yaw_spread_deg (imperfect real trees), so the
+    trunk is BEHIND the apple: tree position is derived, not sampled.
 
-    branch_rotation_deg_nominal / its +-20% range is kept only for visual
-    branch yaw variety — the trunk (tree_x, tree_y) is now solved backward
-    from the chosen branch tip (= apple xy) and that sampled rotation, rather
-    than being sampled first.
+    Caches env._stem_anchor_pos (apple centre, for the lift reward /
+    tree_utils) and env._stem_dir (unit, apple -> branch tip).
 
-    Trunk height and branch length are fixed per env (set once by
-    randomize_tree_geometry at "prestartup") — the branch's world yaw is
-    still re-sampled every reset for visual variety; the resulting tree
-    translation is derived, not sampled. Trunk/branch are moved by
-    translating/rotating their root Xform prim (a cheap, legal USD write for
-    these *static* AssetBaseCfg colliders — unlike the Apple, they are not
-    dynamic RigidObjects tracked by the GPU tensor view, so this doesn't hit
-    the eENABLE_DIRECT_GPU_API restriction). The apple's pose is written
-    through the tensor API. The apple itself is kinematic (see
-    AppleGraspSceneCfg.apple for why), so this teleport is all that's needed
-    to hold it there for the whole episode — no joint required.
+    Trunk/branch/stem are visual-only AssetBaseCfg prims moved by USD
+    xform writes; the apple is kinematic in the reach task and moved
+    through the tensor API.
     """
     try:
         import omni.usd
@@ -391,14 +375,16 @@ def randomize_tree_and_apple(
     apple: RigidObject = env.scene[object_cfg.name]
     robot = env.scene["robot"]
 
+    n = env.num_envs
     if not hasattr(env, "_stem_anchor_pos"):
-        env._stem_anchor_pos = torch.zeros(env.num_envs, 3, device=env.device)
-    if not hasattr(env, "_tree_height"):
-        # randomize_tree_geometry (prestartup) should always run first; fall back
-        # to nominal only to avoid a hard crash if events are ever reordered.
-        env._tree_height = torch.full((env.num_envs,), tree_height_nominal, device=env.device)
-    if not hasattr(env, "_branch_length"):
-        env._branch_length = torch.full((env.num_envs,), branch_length_nominal, device=env.device)
+        env._stem_anchor_pos = torch.zeros(n, 3, device=env.device)
+    if not hasattr(env, "_stem_dir"):
+        env._stem_dir = torch.zeros(n, 3, device=env.device)
+    # randomize_tree_geometry (prestartup) should always run first; fall back
+    # to nominal only to avoid a hard crash if events are ever reordered.
+    for attr, val in (("_trunk_height", 2.25), ("_branch_length", 0.12), ("_stem_length", 0.03)):
+        if not hasattr(env, attr):
+            setattr(env, attr, torch.full((n,), val, device=env.device))
 
     if not hasattr(env, "_shoulder_local_xyz"):
         shoulder_id = robot.data.body_names.index(shoulder_body_name)
@@ -407,62 +393,58 @@ def randomize_tree_and_apple(
         env._shoulder_local_xyz = (shoulder_world - origin0).clone()
     shoulder_x, shoulder_y, shoulder_z = env._shoulder_local_xyz.tolist()
 
-    r_lo, r_hi = _range(branch_rotation_deg_nominal)
+    radius = getattr(env, "_apple_radius", None)
     az_lo = reach_azimuth_center_deg - reach_azimuth_span_deg / 2.0
     az_hi = reach_azimuth_center_deg + reach_azimuth_span_deg / 2.0
 
     apple_pos_local = torch.zeros(len(env_ids), 3, device=env.device)
+    stem_dir = torch.zeros(len(env_ids), 3, device=env.device)
 
     for k, idx in enumerate(env_ids.tolist()):
-        tree_h = env._tree_height[idx].item()
+        r_apple = float(radius[idx]) if isinstance(radius, torch.Tensor) else apple_radius_nominal
         branch_len = env._branch_length[idx].item()
-        apple_z = tree_h - branch_radius_nominal - apple_radius_nominal
-        dz = (apple_z - offset_z) - shoulder_z
+        stem_len = env._stem_length[idx].item()
+        trunk_h = env._trunk_height[idx].item()
 
+        dz = random.uniform(*target_dz_range)
         r_xy_max = math.sqrt(max(reach_max ** 2 - dz ** 2, 1e-4))
         r_xy_min = math.sqrt(max(reach_min ** 2 - dz ** 2, 0.0))
         if r_xy_min >= r_xy_max:
-            # dz alone already eats (close to) the whole reach budget — this
-            # env's randomized tree_height put the branch almost directly
-            # above/below the shoulder. Fall back to the smallest feasible
-            # horizontal radius rather than sampling an empty range.
+            # dz alone already eats (close to) the whole reach budget. Fall
+            # back to the smallest feasible horizontal radius rather than
+            # sampling an empty range.
             r_xy_min, r_xy_max = 0.0, max(r_xy_max, 0.02)
+        r_xy = random.uniform(r_xy_min, r_xy_max) + r_apple + standoff
+        az = math.radians(random.uniform(az_lo, az_hi))
 
-        r_xy = random.uniform(r_xy_min, r_xy_max)
-        az_deg = random.uniform(az_lo, az_hi)
-        az_rad = math.radians(az_deg)
+        apple_x = shoulder_x + r_xy * math.cos(az)
+        apple_y = shoulder_y + r_xy * math.sin(az)
+        apple_z = shoulder_z + dz
 
-        apple_x = shoulder_x + r_xy * math.cos(az_rad)
-        apple_y = shoulder_y + r_xy * math.sin(az_rad)
-
-        branch_rot_deg = random.uniform(r_lo, r_hi)
-        branch_rot_rad = math.radians(branch_rot_deg)
-
-        # Trunk position solved backward so the branch tip lands exactly at
-        # (apple_x, apple_y): branch_tip = tree_xy + branch_len * dir(rot).
-        tree_x = apple_x - branch_len * math.cos(branch_rot_rad)
-        tree_y = apple_y - branch_len * math.sin(branch_rot_rad)
-        branch_mid_x = tree_x + (branch_len / 2.0) * math.cos(branch_rot_rad)
-        branch_mid_y = tree_y + (branch_len / 2.0) * math.sin(branch_rot_rad)
+        # Branch direction (trunk -> tip): back toward the robot, yawed.
+        b = az + math.pi + math.radians(random.uniform(-branch_yaw_spread_deg, branch_yaw_spread_deg))
+        bx, by = math.cos(b), math.sin(b)
+        tip_x = apple_x - bx * (r_apple + stem_len)
+        tip_y = apple_y - by * (r_apple + stem_len)
+        stem_mid = r_apple + stem_len / 2.0
+        trunk_x, trunk_y = tip_x - bx * branch_len, tip_y - by * branch_len
 
         env_ns = f"/World/envs/env_{idx}"
-
-        base_prim = stage.GetPrimAtPath(f"{env_ns}/TreeBase")
-        if base_prim.IsValid():
-            _set_translate(base_prim, tree_x, tree_y, 0.03)
-
-        trunk_prim = stage.GetPrimAtPath(f"{env_ns}/TreeTrunk")
-        if trunk_prim.IsValid():
-            _set_translate(trunk_prim, tree_x, tree_y, tree_h / 2.0)
-
-        branch_prim = stage.GetPrimAtPath(f"{env_ns}/TreeBranch")
-        if branch_prim.IsValid():
-            _set_translate(branch_prim, branch_mid_x, branch_mid_y, tree_h)
-            _set_rotate_z(branch_prim, branch_rot_rad)
-
-        apple_pos_local[k] = torch.tensor(
-            [apple_x, apple_y, apple_z], device=env.device
+        placements = (
+            ("TreeBase", (trunk_x, trunk_y, 0.03), None),
+            ("TreeTrunk", (trunk_x, trunk_y, trunk_h / 2.0), None),
+            ("TreeBranch", (tip_x - bx * branch_len / 2.0, tip_y - by * branch_len / 2.0, apple_z), b),
+            ("AppleStem", (apple_x - bx * stem_mid, apple_y - by * stem_mid, apple_z), b),
         )
+        for name, pos, yaw in placements:
+            prim = stage.GetPrimAtPath(f"{env_ns}/{name}")
+            if prim.IsValid():
+                _set_translate(prim, *pos)
+                if yaw is not None:
+                    _set_rotate_z(prim, yaw)
+
+        apple_pos_local[k] = torch.tensor([apple_x, apple_y, apple_z], device=env.device)
+        stem_dir[k] = torch.tensor([-bx, -by, 0.0], device=env.device)
 
     env_origins = env.scene.env_origins[env_ids]
     root_state = apple.data.default_root_state[env_ids].clone()
@@ -471,6 +453,7 @@ def randomize_tree_and_apple(
     apple.write_root_state_to_sim(root_state, env_ids=env_ids)
 
     env._stem_anchor_pos[env_ids] = env_origins + apple_pos_local
+    env._stem_dir[env_ids] = stem_dir
 
 def randomize_closure_threshold(
     env: "ManagerBasedRLEnv",

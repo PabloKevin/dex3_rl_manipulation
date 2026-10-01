@@ -103,7 +103,7 @@ def main():
     cfg = AppleGraspEnvCfg_PLAY()
     speed = 0.5 if args_cli.slow else 1.0
 
-    env = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
+    env = gym.make("AppleReach-v1", cfg=cfg).unwrapped
     env.reset()
     stem = StemManager(env)  # ← Add this line
 

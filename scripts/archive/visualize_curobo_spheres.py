@@ -64,7 +64,7 @@ def build_sphere_to_link_map(config_file: dict):
 def main():
     # --- Build the env so we have the real robot to compare against ---
     cfg = AppleGraspEnvCfg_PLAY()
-    env = gym.make("AppleGrasp-Play-v0", cfg=cfg).unwrapped
+    env = gym.make("AppleReach-Play-v1", cfg=cfg).unwrapped
     obs, _ = env.reset()
     robot = env.scene["robot"]
     device = env.device

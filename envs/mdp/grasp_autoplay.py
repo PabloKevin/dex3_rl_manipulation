@@ -101,7 +101,7 @@ def _load_reach_policy(policy_path: str, device) -> torch.jit.ScriptModule:
         if not os.path.isfile(key):
             raise FileNotFoundError(
                 f"Reach hand-off policy not found at {key}. Export one with "
-                f"scripts/play.py --task AppleGrasp-Play-v0 and copy its "
+                f"scripts/play.py --task AppleReach-Play-v1 and copy its "
                 f"exported/policy.pt there (see grasp_autoplay.PINNED_REACH_POLICY)."
             )
         _reach_policy_cache[key] = torch.jit.load(key, map_location=device).eval()
@@ -345,12 +345,13 @@ def update_reach_grasp_phase(
     object_cfg: SceneEntityCfg,
     handoff_mode: str = "fixed",
     handoff_time_s: float = 2.5,
-    offset_z: float = 0.0,
+    standoff: float = 0.015,
     palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     pos_tol: float = 0.04,
     ori_tol_rad: float = 0.30,
     hold_time: float = 0.5,
+    fingers_tol_rad: float | None = None,
 ) -> None:
     """Every-step interval event: switch envs from the reach phase to the
     grasp phase.
@@ -380,11 +381,12 @@ def update_reach_grasp_phase(
     switch = reaching & (elapsed >= handoff_time_s - 1e-6)
 
     if handoff_mode == "converged":
-        from .reach_rewards import _palm_target_dist, _palm_normal_angle
+        from .reach_rewards import reach_neighbourhood
 
-        d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
-        theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
-        inside = (d < pos_tol) & (theta < ori_tol_rad)
+        inside = reach_neighbourhood(
+            env, robot_cfg, object_cfg, pos_tol, ori_tol_rad, standoff,
+            palm_normal_axis, palm_local_offset, fingers_tol_rad,
+        )
         env._reach_phase_hold_counter.copy_(torch.where(
             inside & reaching, env._reach_phase_hold_counter + 1, torch.zeros_like(env._reach_phase_hold_counter)
         ))

@@ -101,7 +101,7 @@ from isaaclab.utils.io import dump_yaml
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
-# register this repo's gym tasks (AppleGrasp-v0, AppleGrasp-Play-v0, ...) — must
+# register this repo's gym tasks (AppleReach-v1, AppleReach-Play-v1, ...) — must
 # happen before the @hydra_task_config decorator below resolves --task against the
 # gym registry. Mirrors the same sys.path pattern scripts/run_env.py already uses.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

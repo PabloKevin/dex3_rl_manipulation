@@ -1,5 +1,5 @@
 # Copyright 2025 - G1 Dex3 Apple Grasp Project
-"""MDP terms of the RL HARVEST task (AppleGraspHarvest-v0).
+"""MDP terms of the RL HARVEST task (AppleHarvest-v1).
 
 Episodes start from a READY GRASP taken from a start bank (recorded by
 scripts/collect_harvest_starts.py with a trained grasp policy), not by

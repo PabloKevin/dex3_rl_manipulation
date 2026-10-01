@@ -60,7 +60,7 @@ class EvalProbe(ManagerTermBase):
         p = cfg.params
         self.pos_tol = float(p.get("pos_tol", 0.04))
         self.ori_tol_rad = float(p.get("ori_tol_rad", 0.30))
-        self.offset_z = float(p.get("offset_z", 0.08))
+        self.standoff = float(p.get("standoff", 0.015))
         self.record_traces = bool(p.get("record_traces", True))
         self.n_joints = len(p["arm_cfg"].joint_names)
 
@@ -109,8 +109,8 @@ class EvalProbe(ManagerTermBase):
         action_term_name: str = "right_arm",
         pos_tol: float = 0.04,
         ori_tol_rad: float = 0.30,
-        offset_z: float = 0.08,
-        palm_normal_axis: Sequence[float] = (0.0, 0.0, 1.0),
+        standoff: float = 0.015,
+        palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
         palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
         success_term_name: str = "reach_success",
         record_traces: bool = True,
@@ -123,8 +123,8 @@ class EvalProbe(ManagerTermBase):
         if bool(fresh.any()):
             self._flush(torch.nonzero(fresh, as_tuple=False).squeeze(-1))
 
-        d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
-        theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
+        d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset)
+        theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
         t = (env.episode_length_buf - 1).clamp(min=0)
 
         in_tol = (d < pos_tol) & (theta < ori_tol_rad)
@@ -215,9 +215,13 @@ class EvalProbe(ManagerTermBase):
         )
 
         delta = self._apple_w[e] - self._shoulder_w[e]
-        r_xy = torch.norm(delta[:, :2], dim=-1)
+        # Grasp target = `standoff` beyond the apple surface, back toward the
+        # shoulder, horizontally (reach_rewards._grasp_target_pos).
+        radius = getattr(self._env, "_apple_radius", None)
+        radius = radius[e] if isinstance(radius, torch.Tensor) else 0.04
+        r_xy = torch.norm(delta[:, :2], dim=-1) - radius - self.standoff
         az = torch.rad2deg(torch.atan2(delta[:, 1], delta[:, 0]))
-        dz = delta[:, 2] - self.offset_z
+        dz = delta[:, 2]
         r3d = torch.sqrt(r_xy ** 2 + dz ** 2)
 
         cpu = lambda x: x.detach().cpu().numpy()
@@ -298,7 +302,7 @@ class EvalProbe(ManagerTermBase):
 
 
 def make_eval_probe_term(
-    offset_z: float,
+    standoff: float,
     palm_local_offset: Sequence[float],
     palm_normal_axis: Sequence[float],
     arm_joint_names: Sequence[str],
@@ -320,7 +324,7 @@ def make_eval_probe_term(
             "action_term_name": "right_arm",
             "pos_tol": pos_tol,
             "ori_tol_rad": ori_tol_rad,
-            "offset_z": offset_z,
+            "standoff": standoff,
             "palm_normal_axis": tuple(palm_normal_axis),
             "palm_local_offset": tuple(palm_local_offset),
             "success_term_name": "reach_success",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2025 - G1 Dex3 Apple Grasp Project
 """
-Record the START BANK for the harvest task (AppleGraspHarvest-v0): ready
+Record the START BANK for the harvest task (AppleHarvest-v1): ready
 grasps produced by a trained grasp policy, one per episode.
 
 Each env runs the normal reach -> grasp episode (grasp env, arm frozen, the
@@ -68,7 +68,7 @@ cfg.terminations.time_out = DoneTerm(func=mdp.time_out, time_out=True)
 cfg.terminations.collected = DoneTerm(func=_collected)
 cfg.events.reset_reach_grasp_phase.params.update(
     stem_release_schedule=None, stem_release_time_range=None, release_on_latch=False, shaping_grace_s=None)
-env = gym.make("AppleGraspGrasp-v0", cfg=cfg).unwrapped
+env = gym.make("AppleGrasp-v1", cfg=cfg).unwrapped
 N, dev = env.num_envs, env.device
 env._collect_flag = torch.zeros(N, dtype=torch.bool, device=dev)
 

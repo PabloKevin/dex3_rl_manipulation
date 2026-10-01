@@ -78,7 +78,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
-# register this repo's gym tasks (AppleGrasp-v0, AppleGrasp-Play-v0, ...) — must
+# register this repo's gym tasks (AppleReach-v1, AppleReach-Play-v1, ...) — must
 # happen before the @hydra_task_config decorator below resolves --task against the
 # gym registry. Mirrors the same sys.path pattern scripts/run_env.py already uses.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -205,7 +205,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     #  NOTE: AppleGraspEnvCfg_PLAY disables both reset event terms and sets
     #  episode_length_s = 1e6, so `dones` will essentially never fire here
     #  and (C) will not print. To exercise the reset path, run this script
-    #  against AppleGrasp-v0 (the non-Play task) instead, or temporarily
+    #  against AppleReach-v1 (the non-Play task) instead, or temporarily
     #  re-enable the reset events in AppleGraspEnvCfg_PLAY.__post_init__.
     # ─────────────────────────────────────────────────────────────────────
     from isaaclab.utils.math import matrix_from_quat as _mfq
@@ -242,10 +242,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("default arm q :", _fmt(_robot.data.default_joint_pos[0, _jids]))
     print("apple world   :", _fmt(_apple.data.root_pos_w[0]))
     print("palm  world   :", _fmt(_robot.data.body_pos_w[0, _palm_bid]))
-    print("SANITY: apple z should match TREE_HEIGHT - BRANCH_RADIUS - APPLE_RADIUS")
-    print("        from params/env.yaml of the run you are loading. If it does")
-    print("        NOT, train.py and this script rolled different scene")
-    print("        layouts (check SCENE_SEED is set the same for both).\n")
+    print("SANITY: apple z - 1.085 (shoulder) should lie in REACH_TARGET_DZ_RANGE")
+    print("        from params/env.yaml of the run you are loading.\n")
 
     _step_i = 0
 

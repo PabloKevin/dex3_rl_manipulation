@@ -11,7 +11,7 @@ Same scene, robot, sensors and physics settings as the grasp task
 (AppleGraspGraspEnvCfg); only actions, observations, rewards, terminations
 and the reset differ. The reach and grasp tasks are untouched.
 
-  train:  python scripts/train.py --task AppleGraspHarvest-v0 --num_envs 32 --headless
+  train:  python scripts/train.py --task AppleHarvest-v1 --num_envs 32 --headless
   view:   python scripts/run_harvest_env.py --checkpoint logs/rsl_rl/apple_grasp_harvest/<run>/model_XXX.pt
 """
 

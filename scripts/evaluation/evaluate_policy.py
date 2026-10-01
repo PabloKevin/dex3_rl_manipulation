@@ -43,7 +43,7 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 parser = argparse.ArgumentParser(description="Evaluate a trained reach policy over many episodes.")
-parser.add_argument("--task", type=str, default="AppleGrasp-v0", help="Task name (must be the TRAINING task).")
+parser.add_argument("--task", type=str, default="AppleReach-v1", help="Task name (must be the TRAINING task).")
 parser.add_argument("--num_envs", type=int, default=64, help="Parallel environments.")
 parser.add_argument("--n_episodes", type=int, default=512, help="Completed episodes to collect.")
 parser.add_argument("--max_steps", type=int, default=None, help="Safety cap on rollout steps.")
@@ -72,7 +72,7 @@ if "-Play" in args_cli.task:
     raise SystemExit(
         f"[FATAL] --task {args_cli.task} is a Play variant: it sets episode_length_s=1e6 and "
         "nulls the reset events, so it produces exactly ONE episode and no domain randomization. "
-        "Evaluate against the training task (AppleGrasp-v0)."
+        "Evaluate against the training task (AppleReach-v1)."
     )
 
 sys.argv = [sys.argv[0]] + hydra_args
@@ -105,7 +105,7 @@ import envs  # noqa: E402,F401
 
 import eval_utils  # noqa: E402
 from envs.apple_grasp_env_cfg import (  # noqa: E402
-    GRASP_OFFSET_Z,
+    GRASP_STANDOFF,
     PALM_LOCAL_OFFSET,
     PALM_NORMAL_AXIS,
     RIGHT_ARM_JOINTS,
@@ -170,7 +170,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     # decorator snapshots env_cfg.to_dict() from the gym registry, and a
     # ManagerTermBase subclass does not round-trip through OmegaConf.
     env_cfg.terminations.eval_probe = make_eval_probe_term(
-        offset_z=GRASP_OFFSET_Z,
+        standoff=GRASP_STANDOFF,
         palm_local_offset=PALM_LOCAL_OFFSET,
         palm_normal_axis=PALM_NORMAL_AXIS,
         arm_joint_names=RIGHT_ARM_JOINTS,
@@ -264,7 +264,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "pos_tol": np.float32(probe.pos_tol),
         "ori_tol_rad": np.float32(probe.ori_tol_rad),
         "hold_steps": np.int32(round(0.5 / env.unwrapped.step_dt)),
-        "offset_z": np.float32(GRASP_OFFSET_Z),
+        "standoff": np.float32(GRASP_STANDOFF),
         "joint_names": np.array(RIGHT_ARM_JOINTS, dtype="<U32"),
     }
     meta = {
@@ -287,7 +287,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         "scene_seed": os.environ.get("SCENE_SEED", "12345"),
         "palm_normal_axis": list(PALM_NORMAL_AXIS),
         "palm_local_offset": list(PALM_LOCAL_OFFSET),
-        "grasp_offset_z": float(GRASP_OFFSET_Z),
+        "grasp_standoff": float(GRASP_STANDOFF),
         "reach_min": float(env_cfg.events.randomize_tree.params["reach_min"]),
         "reach_max": float(env_cfg.events.randomize_tree.params["reach_max"]),
         "azimuth_center_deg": float(env_cfg.events.randomize_tree.params["reach_azimuth_center_deg"]),

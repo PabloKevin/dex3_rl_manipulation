@@ -1,6 +1,6 @@
 # Copyright 2025 - G1 Dex3 Apple Grasp Project
 """
-PPO (rsl_rl) runner config for AppleGrasp-v0 / AppleGrasp-Play-v0.
+PPO (rsl_rl) runner config for AppleReach-v1 / AppleReach-Play-v1.
 
 Save as:  envs/agents/rsl_rl_ppo_cfg.py   (complete replacement)
 
@@ -85,7 +85,7 @@ class AppleGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class AppleGraspGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """PPO runner config for AppleGraspGrasp-v0 / AppleGraspGrasp-Play-v0.
+    """PPO runner config for AppleGrasp-v1 / AppleGrasp-Play-v1.
 
     experiment_name MUST differ from "apple_grasp_reach" (it's
     "apple_grasp_grasp" here) — checkpoints for the two tasks must not land
@@ -151,7 +151,7 @@ class AppleGraspGraspPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class AppleGraspHarvestPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """PPO runner config for AppleGraspHarvest-v0 (own experiment folder,
+    """PPO runner config for AppleHarvest-v1 (own experiment folder,
     logs/rsl_rl/apple_grasp_harvest). 4 s episodes (200 steps), 7-dim delta
     arm actions. init_noise_std 0.5: with delta actions (0.025 rad/step per
     unit) the noise integrates into a slow random walk of the hand, which is

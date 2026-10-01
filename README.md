@@ -134,13 +134,13 @@ pip install rsl-rl-lib==3.0.1
 
 ```bash
 # Train (32 envs, ~6h on RTX 4060). Logs land in logs/rsl_rl/apple_grasp_reach/<timestamp>/:
-python scripts/train.py --task AppleGrasp-v0 --num_envs 32 --headless
+python scripts/train.py --task AppleReach-v1 --num_envs 32 --headless
 
 # Watch training progress:
 tensorboard --logdir logs/rsl_rl/apple_grasp_reach
 
 # Watch the trained policy (auto-picks the latest run/checkpoint, or pass --checkpoint <path>):
-python scripts/play.py --task AppleGrasp-Play-v0 --num_envs 1
+python scripts/play.py --task AppleReach-Play-v1 --num_envs 1
 ```
 
 PPO hyperparameters live in `envs/agents/rsl_rl_ppo_cfg.py`
@@ -258,13 +258,13 @@ position to the one that just ended.
 Switch to the camera env:
 
 ```bash
-python scripts/train.py --task AppleGrasp-Camera-v0 --num_envs 8
+python scripts/train.py --task AppleReach-Camera-v1 --num_envs 8
 ```
 
 The head camera (128×128 RGB+Depth) is already wired up in `AppleGraspCameraEnvCfg`.  
 You will need to add image encoding (CNN / ViT) to the policy network, and register
-a new agent config / `rsl_rl_cfg_entry_point` for `AppleGrasp-Camera-v0` — see
-`envs/agents/rsl_rl_ppo_cfg.py` for the pattern used by `AppleGrasp-v0`.
+a new agent config / `rsl_rl_cfg_entry_point` for `AppleReach-Camera-v1` — see
+`envs/agents/rsl_rl_ppo_cfg.py` for the pattern used by `AppleReach-v1`.
 
 ---
 

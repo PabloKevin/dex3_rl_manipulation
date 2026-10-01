@@ -64,10 +64,11 @@ def reach_success(
     object_cfg: SceneEntityCfg,
     pos_tol: float = 0.04,
     ori_tol_rad: float = 0.30,
-    offset_z: float = 0.08,
-    palm_normal_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    standoff: float = 0.015,
+    palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
     hold_time: float = 0.5,
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    fingers_tol_rad: float | None = None,
     sensor_cfg: SceneEntityCfg | None = None,
     pressure_min: float = 0.5,
     pressure_max: float | None = 5.0,
@@ -97,11 +98,12 @@ def reach_success(
 
     Shape: [num_envs]  bool
     """
-    from .reach_rewards import _palm_target_dist, _palm_normal_angle
+    from .reach_rewards import reach_neighbourhood
 
-    d = _palm_target_dist(env, robot_cfg, object_cfg, offset_z, palm_local_offset)
-    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis)
-    in_neighbourhood = (d < pos_tol) & (theta < ori_tol_rad)
+    in_neighbourhood = reach_neighbourhood(
+        env, robot_cfg, object_cfg, pos_tol, ori_tol_rad, standoff,
+        palm_normal_axis, palm_local_offset, fingers_tol_rad,
+    )
 
     if sensor_cfg is not None:
         from .observations import palm_contact_force
@@ -111,8 +113,8 @@ def reach_success(
             touching = touching & (force <= pressure_max)
         in_neighbourhood = in_neighbourhood & touching
 
-    if not hasattr(env, "_reach_hold_counter") or env._reach_hold_counter.shape != d.shape:
-        env._reach_hold_counter = torch.zeros_like(d)
+    if not hasattr(env, "_reach_hold_counter") or env._reach_hold_counter.shape != in_neighbourhood.shape:
+        env._reach_hold_counter = torch.zeros(in_neighbourhood.shape, device=env.device)
 
     # Episode boundary: don't carry a stale count into a fresh episode.
     env._reach_hold_counter = torch.where(

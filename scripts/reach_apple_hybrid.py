@@ -367,7 +367,7 @@ def _find_last_policy() -> str:
         raise FileNotFoundError(
             f"No exported policy at {exported_path}. Run play.py against this "
             f"checkpoint first (it exports policy.pt as a side effect), e.g.:\n"
-            f"  python scripts/play.py --task AppleGrasp-Play-v0 --num_envs 1"
+            f"  python scripts/play.py --task AppleReach-Play-v1 --num_envs 1"
         )
     return exported_path
 

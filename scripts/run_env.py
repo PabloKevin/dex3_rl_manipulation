@@ -112,9 +112,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import envs  # registers gym tasks
 
 from isaaclab.assets import Articulation, RigidObject
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from envs.apple_grasp_env_cfg import (
-    AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY, GRASP_OFFSET_Z, PALM_LOCAL_OFFSET,
+    AppleGraspEnvCfg, AppleGraspEnvCfg_PLAY, GRASP_STANDOFF, PALM_LOCAL_OFFSET,
 )
 from proximity_stop import QuinticStopController, QuinticStopConfig
 import scripts.tactile_layout as tactile_layout
@@ -419,7 +420,7 @@ def _find_last_policy():
         raise FileNotFoundError(
             f"No exported policy at {exported_path}. Run play.py against this "
             f"checkpoint first (it exports policy.pt as a side effect), e.g.:\n"
-            f"  python scripts/play.py --task AppleGrasp-Play-v0 --num_envs 1"
+            f"  python scripts/play.py --task AppleReach-Play-v1 --num_envs 1"
         )
     return exported_path
 
@@ -437,7 +438,7 @@ def main():
         cfg = AppleGraspEnvCfg()
         cfg.scene.num_envs = args_cli.num_envs
 
-    env      = gym.make("AppleGrasp-v0", cfg=cfg).unwrapped
+    env      = gym.make("AppleReach-v1", cfg=cfg).unwrapped
     # This script owns reset timing itself (manual 'r', or --auto_reset_on_success
     # below) instead of letting ManagerBasedRLEnv.step() instantly auto-reset the
     # moment reach_success fires — see terminations_and_events.reach_success.
@@ -529,10 +530,10 @@ def main():
         quantity reach_rewards._palm_target_dist computes (and therefore the
         same one pos_tol/hold/reach_success are all expressed in)."""
         from isaaclab.utils.math import matrix_from_quat
+        from envs.mdp.reach_rewards import _grasp_target_pos
         R = matrix_from_quat(robot.data.body_quat_w[0:1, palm_bid, :])[0]
         ref = robot.data.body_pos_w[0, palm_bid] + R @ _palm_local_offset_t
-        target = apple.data.root_pos_w[0].clone()
-        target[2] -= GRASP_OFFSET_Z
+        target = _grasp_target_pos(env, SceneEntityCfg("apple"), GRASP_STANDOFF)[0]
         return torch.norm(target - ref)
 
     def _palm_force_env0(env) -> float | None:
@@ -691,12 +692,11 @@ def main():
                     # Distance measured EXACTLY as the reward stack measures
                     # it: palm reference point (palm link origin offset by
                     # PALM_LOCAL_OFFSET, i.e. out at the finger pads, not the
-                    # wrist) to the grasp target (GRASP_OFFSET_Z below the
-                    # apple centre). This used to be wrist-origin-to-apple-
-                    # CENTRE, a completely different quantity: at the pose
-                    # the policy is trained to reach, that metric reads
-                    # ~sqrt(0.08^2 + GRASP_OFFSET_Z^2) ~ 0.10 m while this
-                    # one reads ~0. A stop_dist tuned against one metric
+                    # wrist) to the grasp target (GRASP_STANDOFF in front of
+                    # the apple surface). This used to be wrist-origin-to-
+                    # apple-CENTRE, a completely different quantity: at the
+                    # pose the policy is trained to reach, that metric reads
+                    # ~0.10 m while this one reads ~0. A stop_dist tuned against one metric
                     # means nothing in the other, so the trigger distance was
                     # effectively arbitrary relative to the task.
                     _dist_now = float(_palm_target_dist_env0(robot, apple, palm_bid))
@@ -780,8 +780,8 @@ def main():
                     _q  = robot.data.joint_pos[0, arm_joint_idx]
                     _dq = robot.data.joint_vel[0, arm_joint_idx]
                     _palm = robot.data.body_pos_w[0, palm_bid]
-                    _tgt  = apple.data.root_pos_w[0].clone()
-                    _tgt[2] -= 0.08   # matches reach_rewards.py's offset_z
+                    from envs.mdp.reach_rewards import _grasp_target_pos
+                    _tgt  = _grasp_target_pos(env, SceneEntityCfg("apple"), GRASP_STANDOFF)[0]
                     _d = float(torch.norm(_tgt - _palm))
 
                     from isaaclab.utils.math import matrix_from_quat
