@@ -12,7 +12,10 @@ kept only when:
   - the palm reference point is in front of the robot: forward of the
     shoulder by >= --min_forward, within --max_reach of it, and between
     --z_lo and --z_hi above/below it;
-  - right_shoulder_roll stays inside the posture box (< 0.35 rad).
+  - right_shoulder_roll stays inside the posture box (< 0.35 rad);
+  - arm, hand and held apple clear the harvest basket (envs/mdp/basket.py);
+  - the arm really is at the sampled pose after the checking step (the
+    task apple is parked far away so nothing can shove it).
 Palm orientation is left free on purpose: the bench should turn the fruit
 every which way.
 
@@ -55,6 +58,7 @@ import envs  # noqa: E402,F401
 from envs.apple_grasp_env_cfg import AppleGraspEnvCfg, PALM_LOCAL_OFFSET, RIGHT_ARM_JOINTS  # noqa: E402
 from envs.apple_grasp_grasp_env_cfg import GRASP_CENTER_LOCAL  # noqa: E402
 from envs.mdp import self_collision as scm  # noqa: E402
+from envs.mdp import basket as bk  # noqa: E402
 from envs.mdp import reach_rewards as rr  # noqa: E402
 
 
@@ -66,6 +70,14 @@ def main():
     cfg.events.reset_arm_jitter = None
     env = ManagerBasedRLEnv(cfg)
     env.reset()
+    # Park the task's (kinematic) apple far away: random arm configurations
+    # that pass through it get shoved out by PhysX within the one checking
+    # step, and the check would then score a different pose than sampled.
+    apple_obj = env.scene["apple"]
+    far = apple_obj.data.default_root_state.clone()
+    far[:, :3] = env.scene.env_origins + torch.tensor([50.0, 0.0, 1.0], device=env.device)
+    far[:, 7:] = 0.0
+    apple_obj.write_root_state_to_sim(far)
     robot = env.scene["robot"]
     arm_ids = [robot.joint_names.index(n) for n in RIGHT_ARM_JOINTS]
     palm_cfg = SceneEntityCfg("robot", body_names=["right_hand_palm_link"]); palm_cfg.resolve(env.scene)
@@ -85,6 +97,7 @@ def main():
         robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
         tgt = robot.data.joint_pos_target.clone(); tgt[:, arm_ids] = q
         robot.set_joint_position_target(tgt)
+        env.scene.write_data_to_sim()          # else PhysX keeps the old PD targets and pulls the arm away
         env.sim.step(render=False); env.scene.update(env.physics_dt)
 
         arm_ok = scm.self_collision_depth(env, margin).amax(-1) <= 0.0
@@ -100,7 +113,13 @@ def main():
         rel = ref - sh
         reach_ok = (rel[:, 0] >= args_cli.min_forward) & (rel.norm(dim=-1) <= args_cli.max_reach) \
             & (rel[:, 2] >= args_cli.z_lo) & (rel[:, 2] <= args_cli.z_hi)
-        ok = arm_ok & apple_ok & reach_ok & (q[:, roll_i] < 0.35)
+        settled = (robot.data.joint_pos[:, arm_ids] - q).abs().amax(-1) < 0.01   # pose really is q
+        # stay clear of the harvest basket too (envs/mdp/basket.py)
+        arm_c = scm._world_spheres(env, sets["arm"]) - env.scene.env_origins.unsqueeze(1)
+        basket_ok = (bk.basket_intrusion(arm_c, sets["arm"]["r"], margin).amax(-1) <= 0.0) & \
+            (bk.basket_intrusion((apple_c - env.scene.env_origins).unsqueeze(1),
+                                 torch.tensor([args_cli.apple_radius], device=env.device), margin)[:, 0] <= 0.0)
+        ok = arm_ok & apple_ok & reach_ok & basket_ok & settled & (q[:, roll_i] < 0.35)
         keep_q.append(q[ok].cpu()); keep_p.append((ref - env.scene.env_origins)[ok].cpu())
         keep_n.append(rr._palm_normal_world(env, palm_cfg, (0.0, 1.0, 0.0))[ok].cpu())
         print(f"batch {b + 1}/{args_cli.batches}: kept {int(ok.sum())}/{env.num_envs} "
