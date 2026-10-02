@@ -49,12 +49,23 @@ going home.
 Rounds: when every env is done the table is printed and all envs reset;
 'r' + Enter ends the round early. --rounds 0 runs until the window closes.
 
+--orchard: the same bench in the NOVA commercial orchard (envs/
+apple_grasp_orchard_env_cfg.py: 15 tall-spindle trees, trellis, terrain)
+instead of the procedural tree -- ONE env; every round picks one of its
+hanging apples (or --apples) and moves the orchard around the robot. Wood is
+visual-only like the training tree (intrusion reported); --solid_wood makes
+it collide and picks only apples reachable without touching it. The stem is
+the real pedicel (vertical), so the twist about the palm normal bends it
+rather than twists it.
+
 Usage:
   python scripts/harvest_test_bench.py --num_envs 4                       (viewer)
   python scripts/harvest_test_bench.py --headless --num_envs 4 --rounds 1 --video logs/videos/harvest.mp4
                                           (real-speed video, no screen capture needed; --cam_eye/--cam_lookat to re-aim)
   python scripts/harvest_test_bench.py --headless --num_envs 32 --rounds 2
   python scripts/harvest_test_bench.py --headless --policy <run>/exported/policy.pt
+  python scripts/harvest_test_bench.py --orchard                          (viewer, 1 env in the orchard)
+  python scripts/harvest_test_bench.py --orchard --headless --rounds 3 --video logs/videos/harvest_orchard.mp4
 """
 import argparse
 import glob
@@ -69,7 +80,7 @@ p = argparse.ArgumentParser(description="Harvest test bench for the grasp policy
                             formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("--policy", type=str, default="last",
                help="JIT-exported grasp policy.pt, or 'last' for the newest logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")
-p.add_argument("--num_envs", type=int, default=8)
+p.add_argument("--num_envs", type=int, default=None, help="default 8 (1 with --orchard, its only option)")
 p.add_argument("--rounds", type=int, default=0, help="rounds before exiting (0 = until the window is closed)")
 p.add_argument("--grasp_timeout", type=float, default=5.0,
                help="seconds after the hand-off; a grasp not READY by then is harvested anyway, labelled 'timeout-ready'")
@@ -99,8 +110,20 @@ p.add_argument("--video_res", type=int, nargs=2, default=[1280, 720])
 p.add_argument("--cam_eye", type=float, nargs=3, default=None,
                help="video camera position, relative to the centre of the env grid (1 env: env 0's origin)")
 p.add_argument("--cam_lookat", type=float, nargs=3, default=None, help="video camera target, same frame as --cam_eye")
+p.add_argument("--orchard", action="store_true",
+               help="run in the NOVA commercial orchard (envs/EnvCommercialAppleTrees) instead of the procedural tree")
+p.add_argument("--solid_wood", action="store_true",
+               help="(--orchard) wood collides with the robot and fruit, and only apples the robot can stand at and "
+                    "reach without touching wood are picked (default: visual-only wood, like the training tree; "
+                    "any apple in the reach envelope, wood intrusion reported)")
+p.add_argument("--apples", type=str, nargs="+", default=None,
+               help="(--orchard) only these apples, e.g. granny_smith_r2_t1_05 (default: any reachable one)")
 AppLauncher.add_app_launcher_args(p)
 args = p.parse_args()
+if args.num_envs is None:
+    args.num_envs = 1 if args.orchard else 8
+if args.orchard and args.num_envs != 1:
+    p.error("--orchard runs exactly one env")
 if args.video:
     args.enable_cameras = True          # needed for any render product
 app = AppLauncher(args).app
@@ -122,7 +145,15 @@ from envs.mdp.grasp_rewards import _max_link_apple_force
 from envs.mdp.self_collision import self_collision_depth, tree_contact_depth
 
 # ── env: the grasp task with the stem never released and nothing ending episodes ──
-cfg = AppleGraspGraspEnvCfg()
+if args.orchard:
+    from envs.apple_grasp_orchard_env_cfg import AppleGraspOrchardEnvCfg
+    cfg = AppleGraspOrchardEnvCfg()
+    if args.apples:
+        cfg.events.randomize_tree.params["apples"] = args.apples
+    cfg.scene.orchard.spawn.collision_props.collision_enabled = args.solid_wood
+    cfg.events.randomize_tree.params["screen_robot"] = args.solid_wood
+else:
+    cfg = AppleGraspGraspEnvCfg()
 cfg.scene.num_envs = args.num_envs
 if not args.no_basket:
     from envs.mdp import basket as bk
@@ -144,7 +175,11 @@ if args.video:
     # front the trunks (in front of each robot) block the view. Framed on the
     # centre of the env grid; pulled back further for more envs.
     centre = env.scene.env_origins.mean(0).cpu().numpy()
-    if N == 1:
+    if args.orchard:
+        # behind the robot's right shoulder, in the alley: from the side the
+        # neighbouring trees' canopies block the view
+        eye, look = (-0.85, -1.05, 1.6), (0.3, -0.2, 1.05)
+    elif N == 1:
         eye, look = (0.35, -1.7, 1.55), (0.3, -0.2, 1.05)
     else:
         spread = float(env.scene.env_origins[:, 1].max() - env.scene.env_origins[:, 1].min())
@@ -266,6 +301,7 @@ def new_round():
         max_self={k: torch.zeros(N, device=dev) for k in ("twist", "home", "moves", "basket")},
         chain=[None] * N, seg=[0] * N, in_basket=[None] * N, max_basket=torch.zeros(N, device=dev),
         min_apple_gap=torch.full((N,), float("inf"), device=dev), max_tree=torch.zeros(N, device=dev),
+        max_tree_grasp=torch.zeros(N, device=dev),
         max_ik=torch.zeros(N, device=dev),
         outcome=["" for _ in range(N)], not_ready=["" for _ in range(N)],
     )
@@ -346,6 +382,14 @@ def report(rnd, early=False):
               + f"        {fmt(S['min_apple_gap'][i].item() * 100, '{:+.1f}cm'):>7s}  {S['max_tree'][i] * 1000:3.0f}      "
               + f"{'-' if S['in_basket'][i] is None else ('yes' if S['in_basket'][i] else 'NO'):>3s} {S['max_basket'][i] * 1000:4.0f}"
               + f"          -> {S['outcome'][i]}")
+    for i, info in enumerate(getattr(env, "_orchard_info", []) or []):
+        if info:
+            print(f" env {i} orchard apple {info['apple']} ({info['cultivar']}, {info['orchard_radius'] * 1000:.0f} mm in the "
+                  f"orchard, {env._apple_radius[i] * 1000:.0f} mm simulated), {info['height']:.2f} m high, robot facing "
+                  f"{info['facing']}, {info['dist']:.2f} m / {info['azimuth_deg']:.0f} deg from the shoulder, "
+                  f"{info['neighbours_10cm']} other apple(s) within 10 cm, {info['wood_capsules']} wood capsules in reach; "
+                  f"arm/hand into the wood during reach+grasp {S['max_tree_grasp'][i] * 1000:.0f} mm "
+                  f"({'solid' if args.solid_wood else 'visual-only'} wood)")
     c = Counter(S["outcome"])
     print(f"\nsummary: {dict(c)}")
     for label, grp in (("detector-READY", [i for i in range(N) if not S["not_ready"][i] and not S["outcome"][i].startswith("NOT READY")]),
@@ -499,7 +543,9 @@ while app.is_running():
                      ("basket", (st == BASKET) | (st == RELEASE))):
             S["max_self"][k] = torch.where(m, torch.maximum(S["max_self"][k], sc_d), S["max_self"][k])
         S["min_apple_gap"] = torch.where(live, torch.minimum(S["min_apple_gap"], apple_body_clearance()), S["min_apple_gap"])
-        S["max_tree"] = torch.where(after_home, torch.maximum(S["max_tree"], tree_contact_depth(env, 0.0).amax(-1)), S["max_tree"])
+        tree_d = tree_contact_depth(env, 0.0).amax(-1)
+        S["max_tree"] = torch.where(after_home, torch.maximum(S["max_tree"], tree_d), S["max_tree"])
+        S["max_tree_grasp"] = torch.where(st == GRASP, torch.maximum(S["max_tree_grasp"], tree_d), S["max_tree_grasp"])
         newly = stem.broken & torch.isnan(S["twist_at_break"]) & h
         S["twist_at_break"] = torch.where(newly, stem.twist_deg.abs(), S["twist_at_break"])
         for i in (live & (d_hand > args.leave_margin)).nonzero(as_tuple=True)[0].tolist():
