@@ -387,6 +387,19 @@ BREAK_CAUSES = {0: "-", 1: "pull", 2: "bend", 3: "twist"}
 #  Joint-path re-timing
 # ─────────────────────────────────────────────
 
+def smooth_joint_path(path: torch.Tensor, window: int = 5) -> torch.Tensor:
+    """Centred moving average over `window` samples along a recorded joint
+    path [L, n], endpoints kept exactly: removes the step-to-step jitter of
+    a recorded policy trajectory before it is replayed."""
+    if path.shape[0] <= 2 or window <= 1:
+        return path.clone()
+    k = window // 2
+    padded = torch.cat([path[:1].expand(k, -1), path, path[-1:].expand(k, -1)])
+    out = padded.unfold(0, 2 * k + 1, 1).mean(-1)
+    out[0], out[-1] = path[0], path[-1]
+    return out
+
+
 def retime_joint_path(path: torch.Tensor, dt: float, peak_speed: float = 1.0,
                       min_duration: float = 0.5) -> torch.Tensor:
     """Re-sample a recorded joint path [L, n] so it is traversed at a set

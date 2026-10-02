@@ -107,17 +107,20 @@ def _drive_targets(env, targets: torch.Tensor, n_control_steps: int) -> None:
         env.sim.render()
 
 
-def _retrace_home(env, arm_traj: list, arm_ids: list) -> None:
+def _retrace_home(env, arm_traj: list, arm_ids: list, handoff_idx: int | None = None) -> None:
     """Play the episode's recorded arm trajectory backwards (hand keeps its
     current targets, so a held apple comes along), re-timed to a constant
     joint speed (harvest.retime_joint_path: the reach's slow final approach
     would otherwise make the start of the way home crawl), then open the
     hand."""
-    from envs.mdp.harvest import retime_joint_path
+    from envs.mdp.harvest import retime_joint_path, smooth_joint_path
     robot = env.scene["robot"]
     targets = robot.data.joint_pos_target.clone()
     if arm_traj:
-        path = torch.stack(arm_traj).flip(0)
+        # The REACH part only (grasp-phase wrist oscillations are not worth
+        # retracing), backwards and smoothed, starting from where the arm is.
+        reach = arm_traj[:handoff_idx] if handoff_idx else arm_traj
+        path = smooth_joint_path(torch.stack(reach).flip(0))
         path = torch.cat([robot.data.joint_pos[0, arm_ids].unsqueeze(0), path])
         for q in retime_joint_path(path, env.step_dt, RETRACE_SPEED):
             targets[0, arm_ids] = q
@@ -212,15 +215,16 @@ def main():
     robot = env.scene["robot"]
     arm_ids = [robot.joint_names.index(n) for n in RIGHT_ARM_JOINTS]
     arm_traj = []   # arm joint positions since the last reset, for the retrace
+    handoff_idx = None
 
     while simulation_app.is_running():
         with torch.inference_mode(), _reset_lock:
             if _reset_requested:
                 _reset_requested = False
                 print("\n>>> MANUAL RESET: retracing the arm home, then resetting <<<")
-                _retrace_home(env, arm_traj, arm_ids)
+                _retrace_home(env, arm_traj, arm_ids, handoff_idx)
                 obs, _ = env.reset()
-                arm_traj = []
+                arm_traj = []; handoff_idx = None
                 step = 0
                 print(">>> reset done (reach hand-off re-runs from the home pose) <<<\n")
 
@@ -234,6 +238,8 @@ def main():
             obs, reward, terminated, truncated, info = env.step(actions)
             step += 1
             arm_traj.append(robot.data.joint_pos[0, arm_ids].clone())
+            if handoff_idx is None and bool(env._grasp_phase_active[0]):
+                handoff_idx = len(arm_traj)
 
             if terminated.any() or truncated.any():
                 term_log = {k.replace("Episode_Termination/", ""): v
@@ -241,7 +247,7 @@ def main():
                 fired = [k for k, v in term_log.items() if v]
                 print(f"\n>>> EPISODE ENDED at step {step} — {fired or 'unknown'} — auto-reset <<<\n")
                 step = 0
-                arm_traj = []   # env.step already reset the robot to the home pose
+                arm_traj = []; handoff_idx = None   # env.step already reset the robot to the home pose
 
             if step % 25 == 0 or step == 1:
                 _diag_line()

@@ -268,7 +268,14 @@ class ActionsCfg:
         use_default_offset=True,
         clip={".*": (-3.0, 3.0)},
         max_velocity=2.0,
-        max_acceleration=15.0,
+        # 15 -> 8 rad/s^2: the reach policy always asks for targets further
+        # than one step can reach, so the limiter runs bang-bang at this cap
+        # (measured: commanded |acc| pinned at the cap the whole reach, 3-7
+        # direction reversals per joint per second) -- visibly jerky far
+        # from the apple. 8 keeps the frozen v1 reach as accurate (75% vs
+        # 69% within 2 cm at hand-off, ~0.15 s slower) with half the jerk;
+        # 5 broke it (31%). Keep the reach and grasp tasks identical.
+        max_acceleration=8.0,
         drive_with_reach_policy=True,
         anchor_to_handoff=True,
         reach_scale=0.5,

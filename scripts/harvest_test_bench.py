@@ -13,14 +13,16 @@ Nothing is trained here. Per env, a state machine:
            PD keeps squeezing), and a breakable stem (envs.mdp.harvest.
            BreakableStem) replaces the grasp phase's soft pin, along the real
            stem direction (env._stem_dir)
-  TWIST    the hand + fruit rotate about the stem axis through the stem
-           pivot (IK-tracked, null-space pull to the grasp-time arm pose),
-           up to --twist_deg, stopping as soon as the stem breaks: torsion
-           breaks it with far less force than a straight pull (~0.1 N*m vs
-           15-25 N)
-  HOME     the recorded path played backwards, re-timed to --home_speed rad/s
-           (harvest.retime_joint_path), with the twist undone gradually along
-           the way: back to the start pose without sweeping through the tree
+  TWIST    the hand + fruit rotate about the PALM NORMAL through the grasp
+           pocket -- what the robot knows from its own kinematics; the
+           approach makes it roughly the stem axis -- (IK-tracked, null-space
+           pull to the grasp-time arm pose), up to --twist_deg, stopping as
+           soon as the stem breaks. The simulated stem keeps its TRUE axis,
+           so this tests whether the imperfect twist still breaks it; torsion
+           needs far less force than a straight pull (~0.1 N*m vs 15-25 N)
+  HOME     the recorded REACH path (not the grasp phase) played backwards,
+           smoothed, re-timed to --home_speed rad/s (harvest.retime_joint_path),
+           with the twist undone gradually along the way
   MOVES    --moves random arm poses from the safe-pose library
            (scripts/build_harvest_pose_library.py: arm, hand AND held apple
            clear of the body, palm in front, any palm orientation), palm kept
@@ -41,6 +43,8 @@ Rounds: when every env is done the table is printed and all envs reset;
 
 Usage:
   python scripts/harvest_test_bench.py --num_envs 4                       (viewer)
+  python scripts/harvest_test_bench.py --headless --num_envs 4 --rounds 1 --video logs/videos/harvest.mp4
+                                          (real-speed video of env 0, no screen capture needed)
   python scripts/harvest_test_bench.py --headless --num_envs 32 --rounds 2
   python scripts/harvest_test_bench.py --headless --policy <run>/exported/policy.pt
 """
@@ -75,8 +79,15 @@ p.add_argument("--library", type=str, default=None, help="pose library (default 
 p.add_argument("--tree_clearance", type=float, default=0.15, help="waypoints at least this far from trunk/branch (m)")
 p.add_argument("--hold_after", type=float, default=0.5)
 p.add_argument("--leave_margin", type=float, default=0.06, help="fruit this far from the grasp pocket = dropped")
+p.add_argument("--video", type=str, default=None,
+               help="write an mp4 here, timed in SIMULATED time (plays at true speed however slow the sim runs); "
+                    "camera follows env 0. Works headless.")
+p.add_argument("--video_fps", type=int, default=25)
+p.add_argument("--video_res", type=int, nargs=2, default=[1280, 720])
 AppLauncher.add_app_launcher_args(p)
 args = p.parse_args()
+if args.video:
+    args.enable_cameras = True          # needed for any render product
 app = AppLauncher(args).app
 
 import numpy as np
@@ -104,8 +115,20 @@ for name in list(vars(cfg.terminations)):
         setattr(cfg.terminations, name, None)
 cfg.events.reset_reach_grasp_phase.params.update(
     stem_release_schedule=None, stem_release_time_range=None, release_on_latch=False, shaping_grace_s=None)
-env = gym.make("AppleGrasp-v1", cfg=cfg).unwrapped
+if args.video:
+    cfg.viewer.origin_type = "env"
+    cfg.viewer.env_index = 0
+    cfg.viewer.eye = (0.35, -1.7, 1.55)
+    cfg.viewer.lookat = (0.3, -0.2, 1.05)
+    cfg.viewer.resolution = tuple(args.video_res)
+env = gym.make("AppleGrasp-v1", cfg=cfg, render_mode="rgb_array" if args.video else None).unwrapped
 N, dev, dt = env.num_envs, env.device, env.step_dt
+video = None
+if args.video:
+    import imageio
+    os.makedirs(os.path.dirname(os.path.abspath(args.video)), exist_ok=True)
+    video = imageio.get_writer(args.video, fps=args.video_fps, codec="libx264", quality=8, macro_block_size=8)
+    video_every = max(1, round(1.0 / (args.video_fps * dt)))      # control steps per frame
 
 if args.policy == "last":
     cands = sorted(glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")), key=os.path.getmtime)
@@ -195,7 +218,8 @@ def new_round():
     global S
     S = dict(
         state=torch.full((N,), GRASP, dtype=torch.long, device=dev), t=torch.zeros(N, device=dev),
-        path=[[] for _ in range(N)], home=[None] * N, home_k=[0] * N, twist_dq=[None] * N, q_ready=[None] * N,
+        path=[[] for _ in range(N)], handoff_idx=[None] * N, home=[None] * N, home_k=[0] * N, twist_dq=[None] * N,
+        q_ready=[None] * N, tw_axis=torch.zeros(N, 3, device=dev), tw_pivot=torch.zeros(N, 3, device=dev),
         hand_hold=torch.zeros(N, hand.action_dim, device=dev),
         palm0_p=torch.zeros(N, 3, device=dev), palm0_q=torch.zeros(N, 4, device=dev),
         q_from=torch.zeros(N, len(arm_ids), device=dev), q_to=torch.zeros(N, len(arm_ids), device=dev),
@@ -299,6 +323,8 @@ print(f"[bench] twist {args.twist_deg} deg / {args.twist_s} s, home at {args.hom
       f"(wrist {args.wrist_amp} rad, arm {args.arm_amp} rad)", flush=True)
 rnd, step = 1, 0
 twist_rad = math.radians(args.twist_deg)
+import time
+_wall0, _step0 = time.time(), 0
 while app.is_running():
     with torch.inference_mode():
         a = policy().clone()
@@ -309,6 +335,8 @@ while app.is_running():
         q_now = robot.data.joint_pos[:, arm_ids]
         for i in (st == GRASP).nonzero(as_tuple=True)[0].tolist():
             S["path"][i].append(q_now[i].clone())
+            if S["handoff_idx"][i] is None and bool(env._grasp_phase_active[i]):
+                S["handoff_idx"][i] = len(S["path"][i])          # reach part ends here
 
         ready = ready_det.update() & (st == GRASP)
         timeout = (st == GRASP) & env._grasp_phase_active & (since_handoff > args.grasp_timeout) & ~ready
@@ -326,6 +354,13 @@ while app.is_running():
             S["palm0_q"][i] = robot.data.body_quat_w[i, palm_id]
             S["q_ready"][i] = arm._processed_actions[i].clone()
             S["fruit0"][i] = fruit_in_palm()[i]
+            # Twist axis/pivot the ROBOT knows: its palm normal, through the
+            # grasp pocket (forward kinematics only). The simulated stem keeps
+            # its true axis, so this also tests whether that imperfect twist
+            # still breaks it.
+            pq_i = robot.data.body_quat_w[i:i + 1, palm_id]
+            S["tw_axis"][i] = quat_apply(pq_i, torch.tensor([[0.0, 1.0, 0.0]], device=dev))[0]
+            S["tw_pivot"][i] = robot.data.body_pos_w[i, palm_id] + quat_apply(pq_i, c_local[:1])[0]
             env._stem_released[i] = True                      # soft grasp pin off, arm unlocked
             st[i] = TWIST; S["t"][i] = 0.0
         if bool(ready.any()):
@@ -338,7 +373,7 @@ while app.is_running():
         if bool(tw.any()):
             frac = hv.smoothstep(S["t"] / args.twist_s)
             zero = torch.zeros(N, device=dev)
-            pose_p, pose_q = hv.harvest_palm_pose(S["palm0_p"], S["palm0_q"], stem.pivot, stem.axis,
+            pose_p, pose_q = hv.harvest_palm_pose(S["palm0_p"], S["palm0_q"], S["tw_pivot"], S["tw_axis"],
                                                   torch.tensor([[1.0, 0.0, 0.0]], device=dev).expand(N, 3), zero, twist_rad * frac)
         mv, ci = st == MOVE, st == CIRCLE
         if bool(mv.any()):
@@ -372,6 +407,10 @@ while app.is_running():
 
         env.step(a)
         step += 1
+        if video is not None and step % video_every == 0:
+            frame = env.render()
+            if frame is not None:
+                video.append_data(frame)
 
         # bookkeeping
         S["t"] = S["t"] + dt * h.float()
@@ -396,8 +435,13 @@ while app.is_running():
         for i in (h & (st != DONE)).nonzero(as_tuple=True)[0].tolist():
             s_i, t_i = int(st[i]), float(S["t"][i])
             if s_i == TWIST and (t_i >= args.twist_s or (bool(stem.broken[i]) and t_i >= 0.1)):
-                path = torch.stack(S["path"][i]).flip(0) if S["path"][i] else S["q_ready"][i].unsqueeze(0)
-                path = torch.cat([S["q_ready"][i].unsqueeze(0), path[1:]])          # start exactly where we are
+                # Home = the REACH part only, backwards (the grasp phase's small
+                # wrist/finger oscillations would otherwise be retraced too),
+                # lightly smoothed, starting exactly at the READY pose.
+                k_ho = S["handoff_idx"][i] or len(S["path"][i])
+                reach = torch.stack(S["path"][i][:k_ho]) if k_ho > 0 else S["q_ready"][i].unsqueeze(0)
+                reach = hv.smooth_joint_path(reach.flip(0))
+                path = torch.cat([S["q_ready"][i].unsqueeze(0), reach])
                 S["home"][i] = hv.retime_joint_path(path, dt, args.home_speed)
                 S["twist_dq"][i] = arm._processed_actions[i] - S["q_ready"][i]
                 S["home_k"][i] = 0
@@ -419,7 +463,10 @@ while app.is_running():
 
         if step % 100 == 0:
             cnt = Counter(PHASE[int(x)] for x in st)
-            print(f"  t={step * dt:5.1f}s  {dict(cnt)}  stems broken {int(stem.broken.sum())}  "
+            now = time.time()
+            rtf = (step - _step0) * dt / max(now - _wall0, 1e-6)
+            _wall0, _step0 = now, step
+            print(f"  t={step * dt:5.1f}s  real-time factor {rtf:4.2f}x  {dict(cnt)}  stems broken {int(stem.broken.sum())}  "
                   f"dropped {sum(1 for d in S['drop_phase'] if d)}", flush=True)
         with _reset_lock:
             manual, _reset_requested = _reset_requested, False
@@ -431,7 +478,11 @@ while app.is_running():
             env.reset()
             new_round()
             step = 0
+            _wall0, _step0 = time.time(), 0
             print(f"\n>>> ROUND {rnd} <<<\n", flush=True)
 
+if video is not None:
+    video.close()
+    print(f"[bench] video written: {args.video} ({args.video_fps} fps, simulated time)", flush=True)
 sys.stdout.flush()
 os._exit(0)
