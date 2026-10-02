@@ -96,9 +96,9 @@ APPLE_MASS      = _jitter(0.15)
 # model (long branch at the trunk top, apple hanging BELOW it), which is not
 # how commercial apple trees present fruit.
 #
-# The branch points from the trunk back toward the robot, yawed by up to
-# +-BRANCH_YAW_SPREAD_DEG to emulate real-tree imperfections, so the trunk is
-# BEHIND the apple. Tree, trunk and stem are visual-only. Placement is
+# The branch points from the trunk (in the wall) back toward the robot, yawed
+# by up to +-BRANCH_YAW_SPREAD_DEG to emulate real-tree imperfections, so the
+# trunk is BEHIND the apple. Tree, trunk and stem are visual-only. Placement is
 # apple-first (domain_randomization.randomize_tree_and_apple): the trunk
 # position is derived from the sampled apple position, so it moves around
 # much more than with the old long branch.
@@ -106,7 +106,14 @@ TRUNK_HEIGHT_RANGE    = (2.0, 2.5)     # m, per env (prestartup)
 TRUNK_RADIUS          = 0.06
 BRANCH_LENGTH         = 0.12           # m, +-20% per env (prestartup)
 BRANCH_RADIUS         = 0.015
-BRANCH_YAW_SPREAD_DEG = 30.0           # branch yaw vs. pointing at the shoulder
+# Fruiting wall in front of the robot: fruit sticks out of the wall toward
+# it, so the stem (apple -> branch tip) points INTO the wall, along +x, give
+# or take BRANCH_YAW_SPREAD_DEG. (An earlier version pointed every branch at
+# the shoulder, so stems ran forward-RIGHT for the usual front-right apples;
+# the palm-toward-stem reward then asked for an awkward outward-twisted
+# right hand, which the policy refused.)
+STEM_HEADING_DEG      = 0.0
+BRANCH_YAW_SPREAD_DEG = 30.0           # branch/stem yaw spread around STEM_HEADING_DEG
 STEM_LENGTH_RANGE     = (0.02, 0.04)   # m, apple surface -> branch tip (matches harvest.StemParams.length)
 STEM_RADIUS           = 0.003
  
@@ -215,6 +222,12 @@ TOUCH_FORCE_MAX = 6.0
 # side of the apple is free). Hold and success require it; reward_palm_lateral
 # shapes it.
 PALM_TILT_TOL_RAD = math.radians(20.0)
+# ...and roughly opposite the stem (palm normal toward the stem direction),
+# so the hand stays off the stem/branch and out of neighbouring fruit. The
+# stem is not observed and the branch yaw varies +-BRANCH_YAW_SPREAD_DEG, so
+# this has to be wide: "similar", not equal. Hold and success require it;
+# reward_palm_toward_stem shapes it.
+PALM_STEM_TOL_RAD = math.radians(45.0)
 
 # Compliant contact of the reach-phase (kinematic) apple: a real apple on its
 # stem yields when pushed. Without it a position-controlled arm touching an
@@ -231,7 +244,7 @@ _az0 = math.radians(REACH_AZIMUTH_CENTER_DEG)
 _r0 = 0.5 * (REACH_MIN + REACH_MAX) + APPLE_RADIUS + GRASP_STANDOFF
 _stem0 = 0.5 * sum(STEM_LENGTH_RANGE)
 APPLE_INIT_POS = (_SHOULDER_LOCAL[0] + _r0 * math.cos(_az0), _SHOULDER_LOCAL[1] + _r0 * math.sin(_az0), _SHOULDER_LOCAL[2])
-_branch_yaw0 = _az0 + math.pi
+_branch_yaw0 = math.radians(STEM_HEADING_DEG) + math.pi
 _bx0, _by0 = math.cos(_branch_yaw0), math.sin(_branch_yaw0)
 _tip0 = (APPLE_INIT_POS[0] - _bx0 * (APPLE_RADIUS + _stem0), APPLE_INIT_POS[1] - _by0 * (APPLE_RADIUS + _stem0))
 TREE_POS = (_tip0[0] - _bx0 * BRANCH_LENGTH, _tip0[1] - _by0 * BRANCH_LENGTH, 0.0)
@@ -819,12 +832,12 @@ class RewardsCfg:
         },
     )
 
-    # ── Orientation: palm facing SIDEWAYS (normal horizontal, any heading)
-    #    so the apple is touched from a lateral and the harvest motion can be
-    #    horizontal; never from above or below. Which side of the apple, and
-    #    where the fingers point, are free. The position terms already put
-    #    the apple centred ON the palm face (reach_rewards._palm_target_dist),
-    #    so the normal points at the apple. Gated to zero beyond gate_dist.
+    # ── Orientation: palm facing SIDEWAYS (normal horizontal) so the apple
+    #    is touched from a lateral and the harvest motion can be horizontal;
+    #    never from above or below. Where the fingers point is free. The
+    #    position terms already put the apple centred ON the palm face
+    #    (reach_rewards._palm_target_dist), so the normal points at the
+    #    apple. Gated to zero beyond gate_dist.
     palm_lateral = RewTerm(
         func=rr.reward_palm_lateral,
         weight=6.0,
@@ -833,6 +846,26 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "std_rad": 0.3,      # ~17 deg
+            "gate_dist": 0.55,
+            "standoff": GRASP_STANDOFF,
+            "palm_local_offset": PALM_LOCAL_OFFSET,
+        },
+    )
+
+    # ...and coming from roughly opposite the stem (soft: std ~34 deg; the
+    #    stem is not observed, so only the typical direction -- forward, into
+    #    the wall, STEM_HEADING_DEG -- is learnable).
+    #    Without it the policy touched the apple from the side/trunk side
+    #    (palm 120 deg off the stem direction, median) and swept the hand into
+    #    the stem/branch in 84% of episodes.
+    palm_toward_stem = RewTerm(
+        func=rr.reward_palm_toward_stem,
+        weight=10.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names=["right_hand_palm_link"]),
+            "object_cfg": SceneEntityCfg("apple"),
+            "palm_normal_axis": PALM_NORMAL_AXIS,
+            "std_rad": 0.6,
             "gate_dist": 0.55,
             "standoff": GRASP_STANDOFF,
             "palm_local_offset": PALM_LOCAL_OFFSET,
@@ -859,6 +892,8 @@ class RewardsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
             "tilt_tol_rad": PALM_TILT_TOL_RAD,
+            # No stem gate here (success has it): hold keeps rewarding a
+            # good touch while the heading is still being learned.
             "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "palm_local_offset": PALM_LOCAL_OFFSET,
@@ -992,6 +1027,17 @@ class RewardsCfg:
             "margin": 0.015,  # metres of clearance on top of both radii (= probe)
             "ref": 0.05,      # metres of intrusion that costs 1.0
         },
+    )
+
+    # The tree has no colliders (visual prims), so nothing stops the hand
+    # passing through the stem/branch/trunk -- one episode ended with the
+    # hand between the apple and the trunk. Arm + hand spheres vs. the
+    # per-episode stem, branch and trunk capsules (self_collision.py),
+    # 1 cm clearance; 2 cm inside costs 1.0 before the weight.
+    tree_contact = RewTerm(
+        func=task_mdp.penalty_tree_contact,
+        weight=-6.0,
+        params={"margin": 0.01, "ref": 0.02},
     )
 
     joint_limits = RewTerm(
@@ -1222,6 +1268,7 @@ class TerminationsCfg:
             "object_cfg": SceneEntityCfg("apple"),
             "pos_tol": 0.04,
             "tilt_tol_rad": PALM_TILT_TOL_RAD,
+            "stem_tol_rad": PALM_STEM_TOL_RAD,
             "standoff": GRASP_STANDOFF,
             "palm_normal_axis": PALM_NORMAL_AXIS,
             "hold_time": 0.5,
@@ -1347,7 +1394,11 @@ class EventsCfg:
             "reach_min_horizontal": REACH_MIN_HORIZONTAL,
             "workspace_map": REACH_WORKSPACE_MAP,
             "branch_yaw_spread_deg": BRANCH_YAW_SPREAD_DEG,
+            "stem_heading_deg": STEM_HEADING_DEG,
             "standoff": GRASP_STANDOFF,
+            "stem_radius": STEM_RADIUS,
+            "branch_radius": BRANCH_RADIUS,
+            "trunk_radius": TRUNK_RADIUS,
         },
     )
 

@@ -64,6 +64,7 @@ def reach_success(
     object_cfg: SceneEntityCfg,
     pos_tol: float = 0.04,
     tilt_tol_rad: float | None = None,
+    stem_tol_rad: float | None = None,
     standoff: float = 0.015,
     palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
     hold_time: float = 0.5,
@@ -101,7 +102,7 @@ def reach_success(
 
     in_neighbourhood = reach_neighbourhood(
         env, robot_cfg, object_cfg, pos_tol, tilt_tol_rad, standoff,
-        palm_normal_axis, palm_local_offset,
+        palm_normal_axis, palm_local_offset, stem_tol_rad,
     )
 
     if sensor_cfg is not None:

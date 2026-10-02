@@ -63,7 +63,7 @@ from .terminations_and_events import (
     hold_default_joint_targets,
 )
 
-from .self_collision import penalty_self_collision, self_collision_depth
+from .self_collision import penalty_self_collision, penalty_tree_contact, self_collision_depth, tree_contact_depth
 
 from .domain_randomization import (
     randomize_apple_scale,

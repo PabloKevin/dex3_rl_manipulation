@@ -383,6 +383,29 @@ def reward_palm_lateral(
     return r * (1.0 - d / gate_dist).clamp(0.0, 1.0)
 
 
+def reward_palm_toward_stem(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
+    std_rad: float = 0.5,
+    gate_dist: float = 0.55,
+    standoff: float = 0.015,
+    palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+) -> torch.Tensor:
+    """Soft pull of the palm normal toward the stem direction (apple ->
+    branch tip, env._stem_dir), i.e. touching the apple from the side
+    opposite the stem: keeps the hand off the stem/branch and out of
+    neighbouring fruit. The stem is NOT observed, so the policy can only aim
+    at the typical stem direction for an apple at that position; a wide
+    std_rad makes "similar" good enough. Gated to 0 beyond gate_dist.
+    """
+    theta = _palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
+    r = torch.exp(-(theta ** 2) / (2.0 * std_rad ** 2))
+    d = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis)
+    return r * (1.0 - d / gate_dist).clamp(0.0, 1.0)
+
+
 def reach_neighbourhood(
     env: "ManagerBasedRLEnv",
     robot_cfg: SceneEntityCfg,
@@ -392,10 +415,12 @@ def reach_neighbourhood(
     standoff: float,
     palm_normal_axis: Sequence[float],
     palm_local_offset: Sequence[float],
+    stem_tol_rad: float | None = None,
 ) -> torch.Tensor:
-    """Apple centred on the palm (_palm_target_dist within pos_tol) and, if
-    tilt_tol_rad is given, the palm normal within it of horizontal (lateral
-    approach, any heading; _palm_tilt). Shared by reward_reach_hold,
+    """Apple centred on the palm (_palm_target_dist within pos_tol); if
+    tilt_tol_rad is given, the palm normal within it of horizontal
+    (_palm_tilt); if stem_tol_rad is given, within it of the stem direction
+    (_palm_normal_angle). Shared by reward_reach_hold,
     terminations_and_events.reach_success and the grasp task's converged
     hand-off so they cannot disagree.
 
@@ -404,6 +429,8 @@ def reach_neighbourhood(
     inside = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis) < pos_tol
     if tilt_tol_rad is not None:
         inside = inside & (_palm_tilt(env, robot_cfg, palm_normal_axis) < tilt_tol_rad)
+    if stem_tol_rad is not None:
+        inside = inside & (_palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg) < stem_tol_rad)
     return inside
 
 
@@ -416,6 +443,7 @@ def reward_reach_hold(
     standoff: float = 0.015,
     palm_normal_axis: Sequence[float] = (0.0, 1.0, 0.0),
     palm_local_offset: Sequence[float] = (0.0, 0.0, 0.0),
+    stem_tol_rad: float | None = None,
     sensor_cfg: SceneEntityCfg | None = None,
     pressure_min: float = 0.5,
     pressure_max: float | None = 5.0,
@@ -439,7 +467,7 @@ def reward_reach_hold(
     """
     in_neighbourhood = reach_neighbourhood(
         env, robot_cfg, object_cfg, pos_tol, tilt_tol_rad, standoff,
-        palm_normal_axis, palm_local_offset,
+        palm_normal_axis, palm_local_offset, stem_tol_rad,
     )
 
     if sensor_cfg is not None:

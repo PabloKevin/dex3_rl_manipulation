@@ -350,6 +350,7 @@ def update_reach_grasp_phase(
     palm_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
     pos_tol: float = 0.04,
     tilt_tol_rad: float | None = None,
+    stem_tol_rad: float | None = None,
     hold_time: float = 0.5,
 ) -> None:
     """Every-step interval event: switch envs from the reach phase to the
@@ -384,7 +385,7 @@ def update_reach_grasp_phase(
 
         inside = reach_neighbourhood(
             env, robot_cfg, object_cfg, pos_tol, tilt_tol_rad, standoff,
-            palm_normal_axis, palm_local_offset,
+            palm_normal_axis, palm_local_offset, stem_tol_rad,
         )
         env._reach_phase_hold_counter.copy_(torch.where(
             inside & reaching, env._reach_phase_hold_counter + 1, torch.zeros_like(env._reach_phase_hold_counter)

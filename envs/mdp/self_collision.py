@@ -158,3 +158,44 @@ def penalty_self_collision(
     Returns: [num_envs]
     """
     return ((self_collision_depth(env, margin) / ref) ** 2).sum(dim=-1)
+
+
+def tree_contact_depth(env: "ManagerBasedRLEnv", margin: float = 0.01) -> torch.Tensor:
+    """Per right-arm/hand sphere: deepest intrusion (m, >= 0) into the stem,
+    branch or trunk, modelled as capsules (env._tree_segments / _tree_radii,
+    set every reset by domain_randomization.randomize_tree_and_apple).
+
+    The tree prims are visual only (no colliders), so without this the hand
+    can pass straight through the stem or sit between the apple and the
+    trunk. Privileged geometry, used in the reward only.
+
+    Returns: [num_envs, num_arm_spheres] (zeros if the tree is not set up)
+    """
+    if not hasattr(env, "_self_collision_spheres"):
+        env._self_collision_spheres = _build(env)
+    arm = env._self_collision_spheres["arm"]
+    if not hasattr(env, "_tree_segments"):
+        return torch.zeros(env.num_envs, len(arm["r"]), device=env.device)
+    p = _world_spheres(env, arm)                                   # [N, A, 3]
+    a = env._tree_segments[:, :, 0].unsqueeze(1)                   # [N, 1, T, 3]
+    b = env._tree_segments[:, :, 1].unsqueeze(1)
+    ab = b - a
+    ap = p.unsqueeze(2) - a                                        # [N, A, T, 3]
+    t = ((ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-9)).clamp(0.0, 1.0)
+    dist = (ap - t.unsqueeze(-1) * ab).norm(dim=-1)                # [N, A, T]
+    need = arm["r"].view(1, -1, 1) + env._tree_radii.view(1, 1, -1) + margin
+    return (need - dist).clamp(min=0.0).amax(dim=-1)
+
+
+def penalty_tree_contact(
+    env: "ManagerBasedRLEnv",
+    margin: float = 0.01,
+    ref: float = 0.02,
+) -> torch.Tensor:
+    """Quadratic penalty on the arm/hand entering the stem, branch or trunk
+    (tree_contact_depth). Use a NEGATIVE weight. `ref` small because the
+    stem is thin: 2 cm into it already costs 1.0.
+
+    Returns: [num_envs]
+    """
+    return ((tree_contact_depth(env, margin) / ref) ** 2).sum(dim=-1)

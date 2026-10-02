@@ -337,9 +337,13 @@ def randomize_tree_and_apple(
     target_dz_range: tuple[float, float],
     branch_yaw_spread_deg: float,
     standoff: float,
+    stem_heading_deg: float | None = None,
     reach_min_forward: float = 0.0,
     reach_min_horizontal: float = 0.0,
     workspace_map: str | None = None,
+    stem_radius: float = 0.003,
+    branch_radius: float = 0.015,
+    trunk_radius: float = 0.06,
     shoulder_body_name: str = "right_shoulder_pitch_link",
 ) -> None:
     """Per-episode (mode="reset") apple placement, reachability-aware, on a
@@ -363,13 +367,17 @@ def randomize_tree_and_apple(
         and no self-collision).
     Measured at right_shoulder_pitch_link (env-local (0.0, -0.10, 1.085)).
 
-    The branch points from the trunk back toward the robot (toward the
-    shoulder), yawed by up to +-branch_yaw_spread_deg (imperfect real
-    trees). The apple then sits beyond the target along the stem, so the
-    trunk is BEHIND the apple: tree position is derived, not sampled.
+    The stem (apple -> branch tip) points at world heading stem_heading_deg
+    (0 = +x: into the fruiting wall the robot faces, so fruit sticks out of
+    the wall toward the robot), or, if None, straight away from the
+    shoulder; either way yawed by up to +-branch_yaw_spread_deg (imperfect
+    real trees). The branch continues it, so the trunk is BEHIND the apple:
+    tree position is derived, not sampled.
 
     Caches env._stem_anchor_pos (apple centre, for the lift reward /
-    tree_utils) and env._stem_dir (unit, apple -> branch tip).
+    tree_utils), env._stem_dir (unit, apple -> branch tip) and
+    env._tree_segments / env._tree_radii (world-frame stem, branch and trunk
+    capsules, for self_collision.penalty_tree_contact).
 
     Trunk/branch/stem are visual-only AssetBaseCfg prims moved by USD
     xform writes; the apple is kinematic in the reach task and moved
@@ -424,6 +432,7 @@ def randomize_tree_and_apple(
 
     apple_pos_local = torch.zeros(len(env_ids), 3, device=env.device)
     stem_dir = torch.zeros(len(env_ids), 3, device=env.device)
+    segments = torch.zeros(len(env_ids), 3, 2, 3, device=env.device)   # stem, branch, trunk (local)
 
     for k, idx in enumerate(env_ids.tolist()):
         r_apple = float(radius[idx]) if isinstance(radius, torch.Tensor) else apple_radius_nominal
@@ -451,7 +460,8 @@ def randomize_tree_and_apple(
 
         # Branch direction (trunk -> tip): back toward the robot, yawed. The
         # stem continues it, so the apple sits beyond the target along -b.
-        b = az + math.pi + math.radians(random.uniform(-branch_yaw_spread_deg, branch_yaw_spread_deg))
+        stem_heading = az if stem_heading_deg is None else math.radians(stem_heading_deg)
+        b = stem_heading + math.pi + math.radians(random.uniform(-branch_yaw_spread_deg, branch_yaw_spread_deg))
         bx, by = math.cos(b), math.sin(b)
         apple_x = target_x - bx * (r_apple + standoff)
         apple_y = target_y - by * (r_apple + standoff)
@@ -477,6 +487,11 @@ def randomize_tree_and_apple(
 
         apple_pos_local[k] = torch.tensor([apple_x, apple_y, apple_z], device=env.device)
         stem_dir[k] = torch.tensor([-bx, -by, 0.0], device=env.device)
+        segments[k] = torch.tensor([
+            [[apple_x - bx * r_apple, apple_y - by * r_apple, apple_z], [tip_x, tip_y, apple_z]],
+            [[tip_x, tip_y, apple_z], [trunk_x, trunk_y, apple_z]],
+            [[trunk_x, trunk_y, 0.0], [trunk_x, trunk_y, trunk_h]],
+        ], device=env.device)
 
     env_origins = env.scene.env_origins[env_ids]
     root_state = apple.data.default_root_state[env_ids].clone()
@@ -486,6 +501,10 @@ def randomize_tree_and_apple(
 
     env._stem_anchor_pos[env_ids] = env_origins + apple_pos_local
     env._stem_dir[env_ids] = stem_dir
+    if not hasattr(env, "_tree_segments"):
+        env._tree_segments = torch.full((n, 3, 2, 3), 1.0e3, device=env.device)
+        env._tree_radii = torch.tensor([stem_radius, branch_radius, trunk_radius], device=env.device)
+    env._tree_segments[env_ids] = segments + env_origins.view(-1, 1, 1, 3)
 
 def randomize_closure_threshold(
     env: "ManagerBasedRLEnv",
