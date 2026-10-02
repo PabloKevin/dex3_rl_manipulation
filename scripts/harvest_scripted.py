@@ -6,8 +6,7 @@ Phase 3 (first approach) -- SCRIPTED harvest on top of the trained grasp.
 Per env, a small state machine:
   REACH   frozen reach policy (inside the env, unchanged)
   GRASP   the trained grasp policy drives wrist + fingers; the arm stays
-          frozen and the simulated stem never lets go, so the policy's
-          grip_established observation stays 0 -- exactly as in the
+          frozen and the simulated stem never lets go -- as in the
           training episodes it knows (no retraining needed)
   READY   envs.mdp.harvest.GraspReadyDetector: closure + thumb pad
           pressure + settled fingers, held 0.5 s

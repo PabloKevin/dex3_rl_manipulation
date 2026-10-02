@@ -241,19 +241,6 @@ def grip_established(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return env._grasp_ever_closed
 
 
-def grip_established_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """Policy observation: 1.0 once the stem has let go of the apple (so the
-    hand alone holds it and the arm is unlocked), 0.0 before. That is the
-    grip latching OR the per-episode release deadline, whichever came
-    first (stem_released) -- both change what the policy's actions do, so
-    it has to see it. Name kept for the observation layout; before the
-    timed release existed the two were the same thing.
-
-    Shape: [num_envs, 1]
-    """
-    return stem_released(env).float().unsqueeze(-1)
-
-
 def grasp_phase_obs(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """Policy observation: 1.0 in the grasp phase, 0.0 in the reach phase.
     Lets the critic tell the (action-independent) reach-phase steps apart.

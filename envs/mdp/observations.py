@@ -251,9 +251,8 @@ def palm_contact_force(
 #  _per_finger_group_force), since privileged, uncalibrated info is fine for
 #  a training-only reward signal but would defeat the point if fed to the
 #  policy as an observation. The one sanctioned exception is the grip
-#  DETECTOR (grasp_rewards._pad_state): it gates the arm and is observed as
-#  grip_established, so it has to be exactly what the real hand could
-#  compute, i.e. these sensed values.
+#  DETECTOR (grasp_rewards._pad_state): it gates the arm, so it has to be
+#  exactly what the real hand could compute, i.e. these sensed values.
 #
 #  Sensed also means PAD-ONLY: _sensed_tactile_forces models where on the
 #  link a real taxel can feel (see contact_geometry), whereas the rewards'

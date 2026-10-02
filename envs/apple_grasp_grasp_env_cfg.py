@@ -130,15 +130,14 @@ RIGHT_HAND_JOINTS = [
 ]
 
 # Narrower than the reach task's own REACH_MIN/REACH_MAX/REACH_AZIMUTH_SPAN_DEG
-# (0.20-0.36 m, 65 deg) -- deliberately: this range only needs to sit
-# comfortably INSIDE the side-on pose's reachable box (see
-# apple_grasp_env_cfg.py's REACH_MIN/REACH_MAX comment), so the frozen reach
-# policy reliably converges during reach-autoplay instead of this task's own
-# placement randomization stress-testing reach robustness. Revisit once the
-# side-on reach policy is trained and its success map is known.
-GRASP_TRAIN_REACH_MIN = 0.22
-GRASP_TRAIN_REACH_MAX = 0.34
-GRASP_TRAIN_REACH_AZIMUTH_CENTER_DEG = -45.0
+# (0.24-0.34 m, effectively -65..-12 deg with REACH_MIN_FORWARD) --
+# deliberately: comfortably INSIDE the box the frozen reach policy was
+# trained on, so it reliably converges during reach-autoplay instead of this
+# task's placement stress-testing reach robustness. Height range, minimum
+# distances and the safe-workspace map are shared with the reach task.
+GRASP_TRAIN_REACH_MIN = 0.25
+GRASP_TRAIN_REACH_MAX = 0.33
+GRASP_TRAIN_REACH_AZIMUTH_CENTER_DEG = -38.0
 GRASP_TRAIN_REACH_AZIMUTH_SPAN_DEG = 40.0
 
 # Reach -> grasp hand-off (see grasp_autoplay.update_reach_grasp_phase).
@@ -170,26 +169,14 @@ FRUIT_DAMAGE_APPLE_WEIGHT_PCT = 0.6
 APPLE_MASS_NOMINAL = 0.15   # matches apple_grasp_env_cfg.py's _jitter(0.15) nominal
 GRIP_FRICTION_MU = 0.5      # assumed -- no PhysX material explicitly configured on the apple
 
-# Where the frozen reach policy is told the palm is, for the hand-off: the
-# point it drives under the apple (it observes apple - (palm + R*aim)).
-# PALM_LOCAL_OFFSET shifted -27 mm along the palm's lateral axis (local z,
-# the index/middle flexion axis).
-#
-# Why: with the reach task's own offset the hand-off leaves the apple at
-# palm-local z = +27 mm (measured, 16 envs) -- right on the INDEX finger's
-# flexion plane (z = +28.5 mm; middle is at -28.5 mm). From there no finger
-# curl can reach the middle finger to the apple at all (0 middle contacts
-# in 16 scripted closures), and the only grips that latch are thumb-index
-# pinches: the grasp this task kept converging to. With the shifted aim
-# the apple arrives at z = +2 mm, between the two fingers, in the thumb's
-# own flexion plane (thumb_0 = 0) -- and 8/16 scripted closures latch and
-# hold the apple 1 s after the stem releases, most as thumb + index +
-# middle tripods, vs 2/16 pinches before.
-#
-# For the reach policy this is just the apple appearing 2.7 cm to one
-# side, well inside its training distribution; the reach task itself is
-# untouched. A real-robot hand-off must use the same aim point.
-REACH_HANDOFF_AIM_LOCAL = (PALM_LOCAL_OFFSET[0], PALM_LOCAL_OFFSET[1], PALM_LOCAL_OFFSET[2] - 0.027)
+# Where the frozen reach policy is told the palm is, for the hand-off (it
+# observes apple - (palm + R*aim)). The side-on reach policy (v1) is trained
+# to centre the apple on the palm at exactly PALM_LOCAL_OFFSET -- laterally
+# between index and middle, in the thumb's own flexion plane, which is the
+# tripod's starting point -- so no correction. (The palm-up policy needed a
+# -27 mm lateral shift here: it left the apple on the index finger's plane.)
+# A real-robot hand-off must use the same aim point.
+REACH_HANDOFF_AIM_LOCAL = PALM_LOCAL_OFFSET
 
 # The hand's GRASP POCKET: where the fruit centre sits, in right_hand_palm_
 # link's own frame, when the hand is holding it in a TRIPOD -- laterally
@@ -385,10 +372,10 @@ class ObservationsCfg:
         # critic can't tell the two apart from the rest of the state.
         grasp_phase = ObsTerm(func=ga.grasp_phase_obs)
 
-        # 1.0 once the fingers have a grip: the apple is off the stem and
-        # the arm is unlocked. Both of those change what the policy's own
-        # actions do, so it has to be observable.
-        grip_established = ObsTerm(func=ga.grip_established_obs)
+        # (No grip_established flag: it was a simulator-internal latch -- the
+        # apple off the stem, the arm unlocked -- with no real-robot sensor
+        # behind it. The policy has to infer grip state from tactile and
+        # joint observations, as it would on hardware.)
 
         # Fruit position in the PALM's own rotating frame, relative to the
         # grasp pocket -- exactly what RewardsCfg.apple_centered scores, so

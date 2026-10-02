@@ -428,8 +428,8 @@ def _closure_state(
     Everything here is real-robot computable (see _pad_state): sensed taxel
     pressure, joint encoders, and a perceived fruit centre. That matters
     because this drives env._grasp_ever_closed, which is not only a reward
-    input but an OBSERVATION (grip_established) and an interlock on the arm
-    -- both of which deployment has to reproduce from real signals. The
+    input but an interlock on the arm -- which deployment has to reproduce
+    from real signals. The
     SAFETY terms deliberately do not go through here: fruit_damaged and
     penalty_excess_hand_force keep reading true, apple-filtered force on
     every face of every link (_max_link_apple_force), because "am I
