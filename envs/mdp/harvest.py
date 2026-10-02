@@ -349,24 +349,69 @@ class DifferentialIK:
         return pos_des - pos, axis_angle_from_quat(dq)
 
     def step(self, pos_des: torch.Tensor, quat_des: torch.Tensor, max_dq: float = 0.2,
-             base: torch.Tensor | None = None) -> torch.Tensor:
+             base: torch.Tensor | None = None, null_target: torch.Tensor | None = None,
+             null_gain: float = 0.0) -> torch.Tensor:
         """Joint position targets (for self.joint_ids) one DLS step toward
         the desired pose, added to `base` -- pass the CURRENTLY COMMANDED
         targets, not the measured angles: under gravity the joint PD sits a
         few centi-radians below its target, and re-commanding the measured
         angles drops the arm by that much again (measured: a ~2 cm drop
         that broke the stem by pulling before the motion began).
-        Integrating on the targets acts as the missing integral term."""
+        Integrating on the targets acts as the missing integral term.
+
+        null_target / null_gain: secondary task in the Jacobian's null space,
+        pulling the joints toward null_target without disturbing the pose
+        (keeps the elbow/shoulder from drifting into the body while the
+        hand only has to turn)."""
         J = self.robot.root_physx_view.get_jacobians()[:, self.jac_body][:, :, self.jac_cols]   # [N, 6, n]
         e_pos, e_rot = self.pose_error(pos_des, quat_des)
         e = torch.cat([e_pos, e_rot], dim=-1).unsqueeze(-1)                                 # [N, 6, 1]
         JT = J.transpose(1, 2)
         lam = (self.damping ** 2) * torch.eye(6, device=J.device).unsqueeze(0)
-        dq = (JT @ torch.linalg.solve(J @ JT + lam, e)).squeeze(-1)
-        dq = dq.clamp(-max_dq, max_dq)
+        J_pinv = JT @ torch.linalg.solve(J @ JT + lam, torch.eye(6, device=J.device).expand(J.shape[0], 6, 6))
+        dq = (J_pinv @ e).squeeze(-1)
         if base is None:
             base = self.robot.data.joint_pos[:, self.joint_ids]
+        if null_target is not None and null_gain > 0.0:
+            n = J.shape[-1]
+            P = torch.eye(n, device=J.device).unsqueeze(0) - J_pinv @ J
+            dq = dq + (P @ (null_gain * (null_target - base)).unsqueeze(-1)).squeeze(-1)
+        dq = dq.clamp(-max_dq, max_dq)
         return base + dq
 
 
 BREAK_CAUSES = {0: "-", 1: "pull", 2: "bend", 3: "twist"}
+
+
+# ─────────────────────────────────────────────
+#  Joint-path re-timing
+# ─────────────────────────────────────────────
+
+def retime_joint_path(path: torch.Tensor, dt: float, peak_speed: float = 1.0,
+                      min_duration: float = 0.5) -> torch.Tensor:
+    """Re-sample a recorded joint path [L, n] so it is traversed at a set
+    joint-space speed instead of its recorded timing: same geometric path,
+    duration from its length (Euclidean, rad), quintic smoothstep timing
+    (zero velocity/acceleration at both ends, peak = peak_speed rad/s).
+
+    Played backwards as recorded, a reach is slow at the end -- its last
+    centimetres creep toward the apple, which is right for touching but
+    wastes seconds on the way home. Re-timing drops that dwell.
+
+    Returns: [M, n], one row per control step of length dt.
+    """
+    if path.shape[0] < 2:
+        return path.clone()
+    seg = (path[1:] - path[:-1]).norm(dim=-1)
+    s = torch.cat([torch.zeros(1, device=path.device), seg.cumsum(0)])
+    total = float(s[-1])
+    if total < 1e-6:
+        return path[-1:].clone()
+    duration = max(min_duration, 1.875 * total / peak_speed)    # smoothstep peak slope = 1.875
+    m = max(2, int(round(duration / dt)) + 1)
+    u = torch.linspace(0.0, 1.0, m, device=path.device)
+    s_q = total * smoothstep(u)
+    idx = torch.searchsorted(s, s_q.clamp(max=total - 1e-9), right=True).clamp(1, len(s) - 1)
+    s0, s1 = s[idx - 1], s[idx]
+    w = ((s_q - s0) / (s1 - s0).clamp(min=1e-12)).unsqueeze(-1)
+    return path[idx - 1] * (1 - w) + path[idx] * w

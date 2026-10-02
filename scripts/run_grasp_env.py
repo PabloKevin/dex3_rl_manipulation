@@ -23,7 +23,8 @@ Usage:
 Press 'r' + Enter in this terminal at any time to reset WITHOUT relaunching
 Isaac Sim -- this is the "don't reload isaaclab every trial" part. A manual
 reset first RETRACES the arm: the episode's recorded arm trajectory is
-played back in reverse (the hand keeps its grip), the hand opens, and only
+played back in reverse at a constant joint speed (the hand keeps its grip),
+the hand opens, and only
 then do the apple and tree move -- so the arm goes home the way it came,
 without sweeping through the tree. The reset itself then puts every joint
 exactly at the home pose the reach policy was trained from (also on the
@@ -89,7 +90,7 @@ def _listen_terminal_reset():
             break
 
 
-RETRACE_MAX_S = 3.0      # retrace takes at most this long (replay sped up to fit)
+RETRACE_SPEED = 1.2      # peak joint-space speed (rad/s) on the way home
 OPEN_HAND_S = 0.5        # then open the hand for this long before resetting
 
 
@@ -108,12 +109,17 @@ def _drive_targets(env, targets: torch.Tensor, n_control_steps: int) -> None:
 
 def _retrace_home(env, arm_traj: list, arm_ids: list) -> None:
     """Play the episode's recorded arm trajectory backwards (hand keeps its
-    current targets, so a held apple comes along), then open the hand."""
+    current targets, so a held apple comes along), re-timed to a constant
+    joint speed (harvest.retime_joint_path: the reach's slow final approach
+    would otherwise make the start of the way home crawl), then open the
+    hand."""
+    from envs.mdp.harvest import retime_joint_path
     robot = env.scene["robot"]
     targets = robot.data.joint_pos_target.clone()
     if arm_traj:
-        stride = max(1, -(-len(arm_traj) // int(RETRACE_MAX_S / env.step_dt)))
-        for q in reversed(arm_traj[::stride]):
+        path = torch.stack(arm_traj).flip(0)
+        path = torch.cat([robot.data.joint_pos[0, arm_ids].unsqueeze(0), path])
+        for q in retime_joint_path(path, env.step_dt, RETRACE_SPEED):
             targets[0, arm_ids] = q
             _drive_targets(env, targets, 1)
         targets[0, arm_ids] = robot.data.default_joint_pos[0, arm_ids]
