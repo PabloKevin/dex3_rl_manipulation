@@ -970,6 +970,10 @@ class AppleGraspGraspEnvCfg_PLAY(AppleGraspGraspEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 1
         self.scene.env_spacing = 2.5
-        self.events.reset_all_exact = None
+        # reset_all_exact stays ON: every episode must start the frozen reach
+        # policy from the home pose it was trained from. (Disabling it, as
+        # the reach task's interactive PLAY config does for external
+        # controllers, left the arm wherever the last episode ended, and the
+        # reach often failed from there.) Only the start-pose jitter is off.
         self.events.reset_arm_jitter = None
         self.episode_length_s = 1.0e6

@@ -21,7 +21,13 @@ Usage:
   ~/IsaacLab/isaaclab.sh -p scripts/run_grasp_env.py --random_actions   (no policy, sanity-check the env itself)
 
 Press 'r' + Enter in this terminal at any time to reset WITHOUT relaunching
-Isaac Sim -- this is the "don't reload isaaclab every trial" part.
+Isaac Sim -- this is the "don't reload isaaclab every trial" part. A manual
+reset first RETRACES the arm: the episode's recorded arm trajectory is
+played back in reverse (the hand keeps its grip), the hand opens, and only
+then do the apple and tree move -- so the arm goes home the way it came,
+without sweeping through the tree. The reset itself then puts every joint
+exactly at the home pose the reach policy was trained from (also on the
+automatic resets after a termination, which do not retrace).
 
 Every reset prints which termination fired last episode (grasp_success /
 fruit_damaged / apple_fell_from_grip / apple_dropped / time_out) and a
@@ -60,7 +66,7 @@ from isaaclab.managers import SceneEntityCfg
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import envs  # noqa: registers gym tasks
 
-from envs.apple_grasp_grasp_env_cfg import AppleGraspGraspEnvCfg_PLAY, GRASP_CENTER_LOCAL
+from envs.apple_grasp_grasp_env_cfg import AppleGraspGraspEnvCfg_PLAY, GRASP_CENTER_LOCAL, RIGHT_ARM_JOINTS
 from isaaclab.utils.math import quat_apply
 from envs.mdp.grasp_rewards import _per_finger_group_force
 
@@ -81,6 +87,40 @@ def _listen_terminal_reset():
                     _reset_requested = True
         except Exception:
             break
+
+
+RETRACE_MAX_S = 3.0      # retrace takes at most this long (replay sped up to fit)
+OPEN_HAND_S = 0.5        # then open the hand for this long before resetting
+
+
+def _drive_targets(env, targets: torch.Tensor, n_control_steps: int) -> None:
+    """Hold the robot's joint position targets for n control steps, outside
+    env.step (no policy, no action manager), rendering as it goes."""
+    robot = env.scene["robot"]
+    for _ in range(n_control_steps):
+        robot.set_joint_position_target(targets)
+        for _ in range(env.cfg.decimation):
+            env.scene.write_data_to_sim()
+            env.sim.step(render=False)
+            env.scene.update(env.physics_dt)
+        env.sim.render()
+
+
+def _retrace_home(env, arm_traj: list, arm_ids: list) -> None:
+    """Play the episode's recorded arm trajectory backwards (hand keeps its
+    current targets, so a held apple comes along), then open the hand."""
+    robot = env.scene["robot"]
+    targets = robot.data.joint_pos_target.clone()
+    if arm_traj:
+        stride = max(1, -(-len(arm_traj) // int(RETRACE_MAX_S / env.step_dt)))
+        for q in reversed(arm_traj[::stride]):
+            targets[0, arm_ids] = q
+            _drive_targets(env, targets, 1)
+        targets[0, arm_ids] = robot.data.default_joint_pos[0, arm_ids]
+        _drive_targets(env, targets, 5)
+    hand_ids = [i for i, n in enumerate(robot.joint_names) if n.startswith("right_hand_")]
+    targets[0, hand_ids] = robot.data.default_joint_pos[0, hand_ids]
+    _drive_targets(env, targets, int(OPEN_HAND_S / env.step_dt))
 
 
 def _find_last_exported_grasp_policy() -> str:
@@ -163,14 +203,20 @@ def main():
     global _reset_requested
     step = 0
     obs, _ = env.reset()
+    robot = env.scene["robot"]
+    arm_ids = [robot.joint_names.index(n) for n in RIGHT_ARM_JOINTS]
+    arm_traj = []   # arm joint positions since the last reset, for the retrace
 
     while simulation_app.is_running():
         with torch.inference_mode(), _reset_lock:
             if _reset_requested:
                 _reset_requested = False
+                print("\n>>> MANUAL RESET: retracing the arm home, then resetting <<<")
+                _retrace_home(env, arm_traj, arm_ids)
                 obs, _ = env.reset()
+                arm_traj = []
                 step = 0
-                print("\n>>> MANUAL RESET (reach hand-off re-ran) <<<\n")
+                print(">>> reset done (reach hand-off re-runs from the home pose) <<<\n")
 
         with torch.inference_mode():
             if args_cli.random_actions:
@@ -181,6 +227,7 @@ def main():
 
             obs, reward, terminated, truncated, info = env.step(actions)
             step += 1
+            arm_traj.append(robot.data.joint_pos[0, arm_ids].clone())
 
             if terminated.any() or truncated.any():
                 term_log = {k.replace("Episode_Termination/", ""): v
@@ -188,6 +235,7 @@ def main():
                 fired = [k for k, v in term_log.items() if v]
                 print(f"\n>>> EPISODE ENDED at step {step} — {fired or 'unknown'} — auto-reset <<<\n")
                 step = 0
+                arm_traj = []   # env.step already reset the robot to the home pose
 
             if step % 25 == 0 or step == 1:
                 _diag_line()
