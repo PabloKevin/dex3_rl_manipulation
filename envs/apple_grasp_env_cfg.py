@@ -366,16 +366,27 @@ G1_DEX3_CFG = ArticulationCfg(
             stiffness=1.0,
             damping=0.05,
         ),
-        # ── Legs + waist (position-held, not trained) ─────────────────
+        # ── Legs + waist yaw (position-held, not trained) ─────────────
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[
                 ".*hip.*", ".*knee.*", ".*ankle.*",
-                "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+                "waist_yaw_joint",
             ],
             effort_limit=200.0,
             velocity_limit=10.0,
             stiffness=100.0,
             damping=5.0,
+        ),
+        # ── Waist roll + pitch: LOCKED, as on the real robot (more
+        #    stable). At kp 100 they rocked with every arm swing; this
+        #    holds them within ~2 mrad of the default pose under the arm's
+        #    reaction torques (implicit PD, so stable at any gain). ──
+        "waist_locked": ImplicitActuatorCfg(
+            joint_names_expr=["waist_roll_joint", "waist_pitch_joint"],
+            effort_limit=10000.0,
+            velocity_limit=10.0,
+            stiffness=10000.0,
+            damping=500.0,
         ),
     },
 )

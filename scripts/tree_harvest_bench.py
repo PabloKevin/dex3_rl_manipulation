@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+# Copyright 2025 - G1 Dex3 Apple Grasp Project
+"""
+Tree harvest bench: harvest EVERY apple of a multi-apple tree, one at a
+time, with the frozen reach and grasp policies -- the neighbours of each
+apple are real (dynamic, on breakable stems), so the hand and fingers can
+push them, and knock them off (envs/apple_grasp_tree_env_cfg.py,
+envs/mdp/apple_tree.py: APPLES_PER_TREE apples in clusters of 1-4).
+
+Nothing is trained here. Per apple, per env:
+  GRASP    frozen reach policy, then the frozen grasp policy; the arm's
+           joint path is recorded
+  (READY)  envs.mdp.harvest.GraspReadyDetector, or --grasp_timeout s after
+           the hand-off ("timeout-ready"); finger targets freeze, the stem
+           (a BreakableStem along the apple's real stem) replaces the pin
+  TWIST    hand + fruit rotate about the palm normal through the grasp
+           pocket (IK), up to --twist_deg, until the stem breaks -- in the
+           direction that keeps the hand and wrist clear of the neighbours:
+           both sweeps are checked with the self-collision hand/wrist
+           spheres against the fruit still hanging (a neighbour on one side
+           -> twist the other way, whatever the hand's orientation)
+  HOME     the recorded REACH path played backwards, smoothed, re-timed to
+           --home_speed rad/s, the twist undone along the way
+  BASKET   the planned path from home over the basket (scripts/
+           plan_basket_drop.py), down to the palm-down drop pose
+  RELEASE  open the hand, wait --release_s, check the fruit is in the basket
+  RETURN   the same path back home
+  -> the next apple of the tree (an env reset that keeps the tree: the
+     robot is at home, where every reach starts)
+Every fruit, the target included, hangs on its breakable stem from the
+start (no pin): a reach or grasp can knock the target off, which also sends
+the arm home. A dropped apple sends the arm home at once (the rest of the reach path, or
+the basket path back) and on to the next apple. When a tree is done its
+table is printed; when every env's tree is done, a new round (new trees).
+
+Per apple: grasp-ready time, stem (cause, twist angle at break), kept in
+hand / phase it fell in, max slip in the palm, peak contact force on the
+CARRIED fruit (twist / home / basket) vs. that apple's bruising threshold,
+the peak during reach + grasp (on the pinned fruit), in the basket, worst self-collision overlap,
+how far the hand pushed the neighbours still on the tree, and how many it
+knocked off. FINISHED = held through everything and in the basket.
+
+Usage:
+  python scripts/tree_harvest_bench.py --num_envs 2                       (viewer)
+  python scripts/tree_harvest_bench.py --headless --num_envs 1 --video logs/videos/tree_harvest.mp4
+  python scripts/tree_harvest_bench.py --headless --num_envs 8 --rounds 2
+"""
+import argparse
+import glob
+import math
+import os
+import sys
+import time
+
+from isaaclab.app import AppLauncher
+
+p = argparse.ArgumentParser(description="Harvest every apple of a tree, one at a time",
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("--policy", type=str, default="last",
+               help="JIT-exported grasp policy.pt, or 'last' for the newest logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")
+p.add_argument("--num_envs", type=int, default=4)
+p.add_argument("--rounds", type=int, default=1, help="trees per env before exiting (0 = until the window is closed)")
+p.add_argument("--apples", type=int, default=None, help="apples per tree (default APPLES_PER_TREE of the env cfg)")
+p.add_argument("--order", type=str, default=None, choices=["top_down", "bottom_up", "random", "clearance"],
+               help="harvest order (default HARVEST_ORDER of the env cfg)")
+p.add_argument("--grasp_timeout", type=float, default=5.0,
+               help="seconds after the hand-off; a grasp not READY by then is harvested anyway ('timeout-ready')")
+p.add_argument("--twist_deg", type=float, default=90.0)
+p.add_argument("--twist_s", type=float, default=1.5)
+p.add_argument("--home_speed", type=float, default=1.2, help="peak joint-space speed (rad/s) going home")
+p.add_argument("--move_speed", type=float, default=1.0, help="peak joint speed (rad/s) on the basket path")
+p.add_argument("--drop_speed", type=float, default=0.4, help="peak joint speed (rad/s) for the last descent to the drop pose")
+p.add_argument("--release_s", type=float, default=1.5)
+p.add_argument("--leave_margin", type=float, default=0.06, help="fruit this far from the grasp pocket = dropped")
+p.add_argument("--video", type=str, default=None, help="mp4 in SIMULATED time (works headless)")
+p.add_argument("--video_fps", type=int, default=25)
+p.add_argument("--video_res", type=int, nargs=2, default=[1280, 720])
+p.add_argument("--cam_eye", type=float, nargs=3, default=None, help="relative to the centre of the env grid")
+p.add_argument("--cam_lookat", type=float, nargs=3, default=None)
+AppLauncher.add_app_launcher_args(p)
+args = p.parse_args()
+if args.video:
+    args.enable_cameras = True
+app = AppLauncher(args).app
+
+import numpy as np
+import torch
+import gymnasium as gym
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+os.chdir(REPO)
+import envs  # noqa: F401
+from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
+from envs import apple_grasp_tree_env_cfg as tree_cfg_mod
+from envs.apple_grasp_grasp_env_cfg import GRASP_CENTER_LOCAL, RIGHT_ARM_JOINTS
+from envs.mdp import apple_tree as at
+from envs.mdp import basket as bk
+from envs.mdp import harvest as hv
+from envs.mdp import self_collision as scm
+from envs.mdp.grasp_rewards import _max_link_apple_force
+from envs.mdp.self_collision import self_collision_depth
+
+if args.apples is not None:
+    tree_cfg_mod.APPLES_PER_TREE = args.apples           # read by the scene / event cfgs below
+cfg = tree_cfg_mod.AppleGraspTreeEnvCfg()
+cfg.scene.num_envs = args.num_envs
+bk.add_to_scene(cfg.scene)
+cfg.episode_length_s = 1.0e5
+for name in list(vars(cfg.terminations)):
+    if not name.startswith("_"):
+        setattr(cfg.terminations, name, None)
+cfg.terminations.next_apple = TerminationTermCfg(func=at.next_apple_requested)
+cfg.events.reset_reach_grasp_phase.params.update(
+    stem_release_schedule=None, stem_release_time_range=None, release_on_latch=False, shaping_grace_s=None)
+if args.order:
+    cfg.events.randomize_tree.params["order"] = args.order
+if args.video:
+    cfg.viewer.resolution = tuple(args.video_res)
+env = gym.make("AppleGrasp-v1", cfg=cfg, render_mode="rgb_array" if args.video else None).unwrapped
+N, dev, dt = env.num_envs, env.device, env.step_dt
+M = tree_cfg_mod.APPLES_PER_TREE
+
+video = None
+if args.video:
+    centre = env.scene.env_origins.mean(0).cpu().numpy()
+    # Behind the robot's right shoulder: from straight to the side the fruit
+    # line up and their spacing along the wall is lost; far enough back to
+    # keep the basket and its stand in frame, left of the trunk.
+    if N == 1:
+        eye, look = (-1.05, -1.85, 1.9), (0.15, -0.3, 0.85)
+    else:
+        spread = float(env.scene.env_origins[:, 1].max() - env.scene.env_origins[:, 1].min())
+        eye, look = (-1.3, -3.1 - 0.9 * spread, 2.1), (0.2, 0.0, 0.9)
+    eye, look = args.cam_eye or eye, args.cam_lookat or look
+    env.viewport_camera_controller.update_view_location(
+        eye=tuple(float(c + e) for c, e in zip(centre, eye)), lookat=tuple(float(c + l) for c, l in zip(centre, look)))
+    import imageio
+    os.makedirs(os.path.dirname(os.path.abspath(args.video)), exist_ok=True)
+    video = imageio.get_writer(args.video, fps=args.video_fps, codec="libx264", quality=8, macro_block_size=8)
+    video_every = max(1, round(1.0 / (args.video_fps * dt)))
+
+if args.policy == "last":
+    cands = sorted(glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")), key=os.path.getmtime)
+    if not cands:
+        sys.exit("no exported grasp policy found -- pass --policy")
+    args.policy = cands[-1]
+_jit = torch.jit.load(args.policy, map_location=dev).eval()
+policy = lambda: _jit(env.observation_manager.compute()["policy"])
+
+robot = env.scene["robot"]
+apple = env.scene["apple"]
+arm = env.action_manager.get_term("right_arm")
+hand = env.action_manager.get_term("right_hand")
+arm_dim = arm.action_dim
+palm_id = robot.data.body_names.index("right_hand_palm_link")
+arm_ids = list(arm._joint_ids)
+sc = SceneEntityCfg("contact_forces"); sc.resolve(env.scene)
+ready_det = hv.GraspReadyDetector(env, sc, hand._joint_ids)
+ik = hv.DifferentialIK(robot, "right_hand_palm_link", arm_ids)
+c_local = torch.tensor(GRASP_CENTER_LOCAL, device=dev).expand(N, 3)
+_bp = np.load(os.path.join(REPO, "envs", "assets", "basket_drop_path.npz"))
+_order = [RIGHT_ARM_JOINTS.index(robot.joint_names[j]) for j in arm_ids]
+basket_wps = torch.tensor(_bp["waypoints"], device=dev, dtype=torch.float32)[:, _order]   # home, ..., drop
+hand_open = robot.data.default_joint_pos[:, hand._joint_ids]
+
+GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE = range(8)
+PHASE = {GRASP: "grasp", TWIST: "twist", HOME: "home", BASKET: "basket", RELEASE: "release",
+         RETURN: "return", NEXT: "next", TREE_DONE: "done"}
+fmt = lambda x, s="{:.2f}": "-" if x != x else s.format(x)
+_cm = lambda x: " -  " if x != x else ("free" if x == float("inf") else f"{x * 100:+4.1f}")
+
+
+def T():
+    return env._tree
+
+
+def fruit_to_hand():
+    gp = robot.data.body_pos_w[:, palm_id] + quat_apply(robot.data.body_quat_w[:, palm_id], c_local)
+    return torch.norm(apple.data.root_pos_w - gp, dim=-1)
+
+
+def fruit_in_palm():
+    return quat_apply_inverse(robot.data.body_quat_w[:, palm_id], apple.data.root_pos_w - robot.data.body_pos_w[:, palm_id])
+
+
+def neighbours_on_tree():
+    """[N, M] bool spots whose fruit is still hanging (not the target), and
+    [N, M] its displacement from where it grew (m)."""
+    tr = T()
+    pos = torch.stack([o.data.root_pos_w for o in tr.objs], dim=1) - env.scene.env_origins.unsqueeze(1)   # by entity
+    occ = tr.occupant
+    p_spot = torch.gather(pos, 1, occ.unsqueeze(-1).expand(-1, -1, 3))
+    broken = torch.stack([torch.zeros(N, dtype=torch.bool, device=dev)] + [s.broken for s in tr.stems[1:]], dim=1)
+    hanging = (tr.status == at.WAITING) & (occ > 0) & ~torch.gather(broken, 1, occ)
+    return hanging, (p_spot - tr.spot_pos).norm(dim=-1)
+
+
+_sph = scm._build(env)["arm"]
+_sph_keep = torch.tensor([robot.data.body_names[int(b)] not in ("right_shoulder_yaw_link", "right_elbow_link")
+                          for b in _sph["ids"]], device=dev)     # hand + wrist: what the twist swings round
+
+
+def twist_sign(i, n_samples=10):
+    """+1 or -1: the twist direction whose sweep keeps the hand and wrist
+    spheres furthest from the fruit still hanging, and the two clearances (m)."""
+    c = scm._world_spheres(env, _sph)[i][_sph_keep]                  # [S, 3]
+    rad = _sph["r"][_sph_keep]
+    hanging, _ = neighbours_on_tree()
+    tr = T()
+    ent = tr.occupant[i][hanging[i]]
+    if len(ent) == 0:
+        return 1.0, float("inf"), float("inf")
+    q = torch.stack([tr.objs[int(e)].data.root_pos_w[i] for e in ent])       # [K, 3]
+    r_a = float(env._apple_radius[i])
+    k, piv = S["tw_axis"][i], S["tw_pivot"][i]
+    v = c - piv
+    out = {}
+    for sgn in (1.0, -1.0):
+        best = float("inf")
+        for th in torch.linspace(0.0, twist_rad, n_samples, device=dev)[1:]:
+            a = sgn * th
+            vr = v * torch.cos(a) + torch.cross(k.expand_as(v), v, dim=-1) * torch.sin(a) \
+                + k * (v @ k).unsqueeze(-1) * (1 - torch.cos(a))
+            p = piv + vr
+            d = (p.unsqueeze(1) - q.unsqueeze(0)).norm(dim=-1) - rad.unsqueeze(1) - r_a
+            best = min(best, float(d.min()))
+        out[sgn] = best
+    sign = 1.0 if out[1.0] >= out[-1.0] - 1e-3 else -1.0
+    return sign, out[1.0], out[-1.0]
+
+
+def new_apple(ids):
+    """Per-apple state for the envs in ids (their reset has just happened)."""
+    for i in ids:
+        S["state"][i] = GRASP
+        S["t"][i] = 0.0
+        S["path"][i], S["handoff_idx"][i] = [], None
+        S["home"][i], S["home_k"][i], S["twist_dq"][i], S["q_ready"][i] = None, 0, None, None
+        S["chain"][i], S["seg"][i] = None, 0
+        S["drop_phase"][i], S["not_ready"][i], S["in_basket"][i] = "", "", None
+        S["tw_sign"][i], S["tw_clear"][i] = 1.0, (float("nan"), float("nan"))
+        S["pending_home"][i] = False
+        S["row_done"][i] = False
+        S["home_tries"][i] = 0
+        for k in ("t_ready", "twist_at_break"):
+            S[k][i] = float("nan")
+        for k in ("max_slip", "max_f", "max_f_reach", "max_self", "max_push"):
+            S[k][i] = 0.0
+        hanging, _ = neighbours_on_tree()
+        S["hanging0"][i] = hanging[i].clone()
+        S["spot"][i] = T().current_spot(i)
+    ready_det.reset(torch.tensor(ids, device=dev))
+
+
+def new_trees():
+    global S
+    S = dict(
+        state=torch.full((N,), GRASP, dtype=torch.long, device=dev), t=torch.zeros(N, device=dev),
+        path=[[] for _ in range(N)], handoff_idx=[None] * N, home=[None] * N, home_k=[0] * N, twist_dq=[None] * N,
+        q_ready=[None] * N, tw_axis=torch.zeros(N, 3, device=dev), tw_pivot=torch.zeros(N, 3, device=dev),
+        hand_hold=torch.zeros(N, hand.action_dim, device=dev),
+        palm0_p=torch.zeros(N, 3, device=dev), palm0_q=torch.zeros(N, 4, device=dev),
+        q_from=torch.zeros(N, len(arm_ids), device=dev), q_to=torch.zeros(N, len(arm_ids), device=dev),
+        seg_T=torch.ones(N, device=dev), chain=[None] * N, seg=[0] * N,
+        t_ready=torch.full((N,), float("nan"), device=dev), twist_at_break=torch.full((N,), float("nan"), device=dev),
+        fruit0=torch.zeros(N, 3, device=dev), max_slip=torch.zeros(N, device=dev), max_f=torch.zeros(N, device=dev),
+        max_f_reach=torch.zeros(N, device=dev),
+        max_self=torch.zeros(N, device=dev), max_push=torch.zeros(N, device=dev),
+        drop_phase=[""] * N, not_ready=[""] * N, in_basket=[None] * N, hanging0=[None] * N, spot=[0] * N,
+        tw_sign=torch.ones(N, device=dev), tw_clear=[(float("nan"), float("nan"))] * N, pending_home=[False] * N, row_done=[False] * N, home_tries=[0] * N,
+        rows=[[] for _ in range(N)], knocked={i: {} for i in range(N)}, reported=[False] * N,
+    )
+    if hasattr(env, "_tree"):                      # (created by the first reset, which grows new trees anyway)
+        T().new_tree[:] = True
+    env.reset()
+    new_apple(list(range(N)))
+
+
+def start_chain(i, points):
+    S["chain"][i], S["seg"][i] = points, 0
+    next_segment(i)
+
+
+def next_segment(i):
+    k = S["seg"][i]
+    q0, q1 = S["chain"][i][k], S["chain"][i][k + 1]
+    slow = S["state"][i] == BASKET and k + 1 == len(S["chain"][i]) - 1
+    speed = args.drop_speed if slow else args.move_speed
+    S["q_from"][i], S["q_to"][i] = q0, q1
+    S["seg_T"][i] = max(0.8, 1.875 * float((q1 - q0).norm()) / speed)
+    S["t"][i] = 0.0
+
+
+def go_basket(i):
+    S["state"][i] = BASKET
+    start_chain(i, [arm._processed_actions[i].clone()] + list(basket_wps))
+
+
+def go_back_from_basket(i):
+    """Home along the basket path, from wherever on it the arm is."""
+    k = S["seg"][i]
+    pts = [arm._processed_actions[i].clone()] + [S["chain"][i][j] for j in range(k, 0, -1)]
+    if len(pts) < 2 or (pts[-1] - basket_wps[0]).norm() > 1e-4:
+        pts.append(basket_wps[0])
+    S["state"][i] = RETURN
+    start_chain(i, pts)
+
+
+def start_home(i):
+    k_ho = S["handoff_idx"][i] or len(S["path"][i])
+    reach = torch.stack(S["path"][i][:k_ho]) if k_ho > 0 else S["q_ready"][i].unsqueeze(0)
+    reach = hv.smooth_joint_path(reach.flip(0))
+    start = arm._processed_actions[i].clone()
+    q_ref = S["q_ready"][i] if S["q_ready"][i] is not None else start
+    S["home"][i] = hv.retime_joint_path(torch.cat([q_ref.unsqueeze(0), reach]), dt, args.home_speed)
+    S["twist_dq"][i] = start - q_ref
+    S["home_k"][i] = 0
+    S["state"][i] = HOME
+    S["t"][i] = 0.0
+
+
+def finish_apple(i):
+    """Record this apple's row (once), make sure the arm is home -- every
+    reach must start there -- then ask for the next apple."""
+    if not S["row_done"][i]:
+        record_row(i)
+        S["row_done"][i] = True
+    q = arm._processed_actions[i]
+    S["home_tries"][i] += 1
+    if float((q - basket_wps[0]).norm()) > 0.05 and S["home_tries"][i] <= 2:
+        S["state"][i] = RETURN
+        start_chain(i, [q.clone(), basket_wps[0]])
+        return
+    if T().remaining(i) > 0:
+        T().next_request[i] = True
+        S["state"][i] = NEXT
+    else:
+        S["state"][i] = TREE_DONE
+        report_tree(i)
+
+
+def record_row(i):
+    tr = T()
+    dmg = env._fruit_damage_force[i] if hasattr(env, "_fruit_damage_force") else float("nan")
+    stem = tr.target_stem
+    if S["drop_phase"][i] == "reach/grasp":
+        out = "KNOCKED OFF in reach/grasp"
+    elif not bool(stem.broken[i]):
+        out = "LEFT ON TREE" + (f" (slipped out in {S['drop_phase'][i]})" if S["drop_phase"][i] else "")
+    elif S["drop_phase"][i]:
+        out = f"DROPPED in {S['drop_phase'][i]}"
+    elif S["in_basket"][i]:
+        out = "FINISHED"
+    else:
+        out = "MISSED BASKET"
+    if out == "FINISHED" and float(S["max_f"][i]) > float(dmg):
+        out += " but BRUISED"
+    if S["not_ready"][i]:
+        out += " (timeout-ready)"
+    hanging, _ = neighbours_on_tree()
+    knocked = (S["hanging0"][i] & ~hanging[i] & (tr.status[i] == at.WAITING)).nonzero(as_tuple=True)[0].tolist()
+    n_pick = len(S["rows"][i]) + 1
+    for s in knocked:
+        S["knocked"][i][s] = n_pick
+    s = S["spot"][i]
+    a = tr.spot_pos[i]
+    gaps = (a - a[s]).norm(dim=-1) - 2 * float(env._apple_radius[i])
+    gaps[s] = float("inf")
+    S["rows"][i].append(dict(
+        n=n_pick, spot=s, cluster=int((tr.cluster[i] == tr.cluster[i, s]).sum()), z=float(a[s, 2]),
+        gap=float(gaps.min()), ready=float(S["t_ready"][i]), broke=bool(stem.broken[i]),
+        cause=hv.BREAK_CAUSES[int(stem.break_cause[i])], twist=float(S["twist_at_break"][i]),
+        slip=float(S["max_slip"][i]), f=float(S["max_f"][i]), f_reach=float(S["max_f_reach"][i]), thr=float(dmg), self=float(S["max_self"][i]),
+        push=float(S["max_push"][i]), knocked=len(knocked), out=out, not_ready=S["not_ready"][i],
+        tw=("+" if S["tw_sign"][i] > 0 else "-") if not math.isnan(S["tw_clear"][i][0]) else " ",
+        tw_clear=S["tw_clear"][i]))
+
+
+def report_tree(i):
+    if S["reported"][i]:
+        return
+    S["reported"][i] = True
+    tr = T()
+    r = float(env._apple_radius[i])
+    print(f"\n===== TREE env {i}  ({M} apples, radius {r * 1000:.0f} mm, clusters "
+          f"{sorted(torch.bincount(tr.cluster[i]).tolist(), reverse=True)})   policy: {args.policy}")
+    print("  #  spot clu  z(m) gap mm ready_s stem   cause twist@brk dir (clear +/- cm)  slip   peak_F (thr)  reach+grasp_F  "
+          "self mm  push cm knocked -> outcome")
+    for row in S["rows"][i]:
+        print(f" {row['n']:2d}   {row['spot']:2d}   {row['cluster']}  {row['z']:.2f}  {row['gap'] * 1000:+5.0f}  "
+              f"{fmt(row['ready']):>6s}  {'broke' if row['broke'] else 'intact':6s} {row['cause']:5s} "
+              f"{fmt(row['twist'], '{:.0f}deg'):>7s}  {row['tw']}  ({_cm(row['tw_clear'][0])}/{_cm(row['tw_clear'][1])})  {row['slip'] * 100:4.1f}cm {row['f']:5.1f} N ({row['thr']:4.1f})  {row['f_reach']:6.1f} N    "
+              f"  {row['self'] * 1000:5.0f}   {row['push'] * 100:5.1f}   {row['knocked']:3d}     -> {row['out']}")
+    for s, by in sorted(S["knocked"][i].items()):
+        print(f"      spot {s:2d}: KNOCKED OFF while picking #{by}")
+    rows = S["rows"][i]
+    fin = sum(r_["out"].startswith("FINISHED") for r_ in rows)
+    print(f"  tree env {i}: {fin}/{M} in the basket, {sum(r_['out'].startswith('DROPPED') for r_ in rows)} dropped, "
+          f"{sum(r_['out'].startswith('LEFT') for r_ in rows)} left on the tree, {len(S['knocked'][i])} knocked off by the hand, "
+          f"{sum('BRUISED' in r_['out'] for r_ in rows)} bruised, {sum(bool(r_['not_ready']) for r_ in rows)} timeout-ready")
+    sys.stdout.flush()
+
+
+print(f"[tree bench] {N} envs x {M} apples, policy {args.policy}", flush=True)
+new_trees()
+rnd, step = 1, 0
+twist_rad = math.radians(args.twist_deg)
+tot = {"apples": 0, "finished": 0, "dropped": 0, "knocked": 0, "left": 0}
+_wall0, _step0 = time.time(), 0
+while app.is_running():
+    with torch.inference_mode():
+        a = policy().clone()
+        st = S["state"]
+        since_handoff = (env.episode_length_buf - env._grasp_handoff_step).float() * dt
+
+        q_now = robot.data.joint_pos[:, arm_ids]
+        for i in (st == GRASP).nonzero(as_tuple=True)[0].tolist():
+            S["path"][i].append(q_now[i].clone())
+            if S["handoff_idx"][i] is None and bool(env._grasp_phase_active[i]):
+                S["handoff_idx"][i] = len(S["path"][i])
+
+        ready = ready_det.update() & (st == GRASP)
+        timeout = (st == GRASP) & env._grasp_phase_active & (since_handoff > args.grasp_timeout) & ~ready
+        if bool(timeout.any()):
+            L = ready_det.last
+            for i in timeout.nonzero(as_tuple=True)[0].tolist():
+                S["not_ready"][i] = (f"closure {int(L['closure'][i])}, thumb {float(L['thumb_N'][i]):.1f} N, "
+                                     f"finger span {float(L['max_dq'][i]):.2f} rad")
+            ready = ready | timeout
+        for i in ready.nonzero(as_tuple=True)[0].tolist():
+            S["t_ready"][i] = since_handoff[i]
+            S["hand_hold"][i] = hand._processed_actions[i]
+            S["palm0_p"][i] = robot.data.body_pos_w[i, palm_id]
+            S["palm0_q"][i] = robot.data.body_quat_w[i, palm_id]
+            S["q_ready"][i] = arm._processed_actions[i].clone()
+            S["fruit0"][i] = fruit_in_palm()[i]
+            pq_i = robot.data.body_quat_w[i:i + 1, palm_id]
+            S["tw_axis"][i] = quat_apply(pq_i, torch.tensor([[0.0, 1.0, 0.0]], device=dev))[0]
+            S["tw_pivot"][i] = robot.data.body_pos_w[i, palm_id] + quat_apply(pq_i, c_local[:1])[0]
+            sgn, c_pos, c_neg = twist_sign(i)
+            S["tw_sign"][i], S["tw_clear"][i] = sgn, (c_pos, c_neg)
+            env._stem_released[i] = True                  # arm unlock (the fruit is on its stem all along)
+            st[i] = TWIST; S["t"][i] = 0.0
+
+        # The reach or the grasp knocked the target off its stem. While the
+        # reach phase lasts, the arm term follows the frozen reach policy and
+        # ignores these commands -- it chased the falling fruit into the body
+        # -- so end the reach phase now (the hand-off), and go home on the
+        # next step, once the arm term has anchored to it.
+        for i in [i for i in range(N) if S["pending_home"][i]]:
+            S["pending_home"][i] = False
+            S["q_ready"][i] = arm._processed_actions[i].clone()
+            S["hand_hold"][i] = hand._processed_actions[i]
+            start_home(i)
+        tgt_off = (st == GRASP) & T().target_stem.broken & (fruit_to_hand() > args.leave_margin) \
+            & ((apple.data.root_pos_w - env._stem_anchor_pos).norm(dim=-1) > 0.08) \
+            & torch.tensor([not p_ for p_ in S["pending_home"]], device=dev)
+        for i in tgt_off.nonzero(as_tuple=True)[0].tolist():
+            S["drop_phase"][i] = "reach/grasp"
+            if not bool(env._grasp_phase_active[i]):
+                env._grasp_handoff_joint_pos[i] = robot.data.joint_pos[i].clone()
+                env._grasp_handoff_step[i] = env.episode_length_buf[i]
+                env._grasp_phase_active[i] = True
+            env._stem_released[i] = True              # unlocks the proximal arm (locked until a grip otherwise)
+            S["pending_home"][i] = True
+
+        # ── arm targets ──
+        q_cmd = arm._processed_actions.clone()
+        tw = st == TWIST
+        if bool(tw.any()):
+            frac = hv.smoothstep(S["t"] / args.twist_s)
+            zero = torch.zeros(N, device=dev)
+            pose_p, pose_q = hv.harvest_palm_pose(S["palm0_p"], S["palm0_q"], S["tw_pivot"], S["tw_axis"],
+                                                  torch.tensor([[1.0, 0.0, 0.0]], device=dev).expand(N, 3), zero,
+                                                  twist_rad * frac * S["tw_sign"])
+            q_ready = torch.stack([S["q_ready"][i] if S["q_ready"][i] is not None else arm._processed_actions[i]
+                                   for i in range(N)])
+            q_ik = ik.step(pose_p, pose_q, base=arm._processed_actions, max_dq=0.05, null_target=q_ready, null_gain=0.2)
+            q_cmd = torch.where(tw.unsqueeze(-1), q_ik, q_cmd)
+        mv = (st == BASKET) | (st == RETURN)
+        if bool(mv.any()):
+            f = hv.smoothstep(S["t"] / S["seg_T"]).unsqueeze(-1)
+            q_cmd = torch.where(mv.unsqueeze(-1), S["q_from"] + (S["q_to"] - S["q_from"]) * f, q_cmd)
+        for i in (st == HOME).nonzero(as_tuple=True)[0].tolist():
+            k = S["home_k"][i]
+            fade = 1.0 - float(hv.smoothstep(torch.tensor(k / max(len(S["home"][i]) - 1, 1))))
+            q_cmd[i] = S["home"][i][min(k, len(S["home"][i]) - 1)] + fade * S["twist_dq"][i]
+            S["home_k"][i] = k + 1
+        rl = st == RELEASE
+        q_cmd = torch.where(rl.unsqueeze(-1), S["q_to"], q_cmd)
+        h = st != GRASP
+        a[h, :arm_dim] = ((q_cmd - arm._anchor) / arm._scale)[h]
+        a[h, arm_dim:] = ((S["hand_hold"] - hand._grasp_offset) / hand._scale)[h]
+
+        pending = T().next_request.clone()
+        env.step(a)
+        step += 1
+        if video is not None and step % video_every == 0:
+            frame = env.render()
+            if frame is not None:
+                video.append_data(frame)
+        reset_ids = pending.nonzero(as_tuple=True)[0].tolist()
+        if reset_ids:
+            new_apple(reset_ids)
+            st = S["state"]
+
+        # ── bookkeeping ──
+        S["t"] = S["t"] + dt * (st != GRASP).float()
+        carrying = (st == TWIST) | (st == HOME) | (st == BASKET)
+        live = carrying & torch.tensor([not d for d in S["drop_phase"]], device=dev)
+        slip = (fruit_in_palm() - S["fruit0"]).norm(dim=-1)
+        S["max_slip"] = torch.where(live, torch.maximum(S["max_slip"], slip), S["max_slip"])
+        busy = (st != NEXT) & (st != TREE_DONE)
+        # carried fruit only, like harvest_test_bench (the reach can hit the pinned
+        # target, and the open hand can hit fruit lying in the basket)
+        f_now = _max_link_apple_force(env, sc)
+        S["max_f"] = torch.where(live, torch.maximum(S["max_f"], f_now), S["max_f"])
+        S["max_f_reach"] = torch.where(st == GRASP, torch.maximum(S["max_f_reach"], f_now), S["max_f_reach"])
+        S["max_self"] = torch.where(busy, torch.maximum(S["max_self"], self_collision_depth(env, margin=0.0).amax(-1)),
+                                    S["max_self"])
+        hanging, disp = neighbours_on_tree()
+        push = torch.where(hanging, disp, torch.zeros_like(disp)).amax(-1)
+        S["max_push"] = torch.where(busy, torch.maximum(S["max_push"], push), S["max_push"])
+        stem = T().target_stem
+        newly = stem.broken & torch.isnan(S["twist_at_break"]) & (st != GRASP)
+        S["twist_at_break"] = torch.where(newly, stem.twist_deg.abs(), S["twist_at_break"])
+        for i in (live & (fruit_to_hand() > args.leave_margin)).nonzero(as_tuple=True)[0].tolist():
+            S["drop_phase"][i] = PHASE[int(st[i])]
+            if st[i] == TWIST:
+                start_home(i)                     # straight home from wherever the twist got to
+            elif st[i] == BASKET:
+                go_back_from_basket(i)
+
+        # ── transitions ──
+        for i in ((st != GRASP) & busy).nonzero(as_tuple=True)[0].tolist():
+            s_i, t_i = int(st[i]), float(S["t"][i])
+            if s_i == TWIST and (t_i >= args.twist_s or (bool(stem.broken[i]) and t_i >= 0.1)):
+                start_home(i)
+            elif s_i == HOME and S["home_k"][i] >= len(S["home"][i]) + int(0.3 / dt):
+                if S["drop_phase"][i] or not bool(stem.broken[i]):
+                    finish_apple(i)
+                else:
+                    go_basket(i)
+            elif s_i in (BASKET, RETURN) and t_i >= float(S["seg_T"][i]) + 0.15:
+                S["seg"][i] += 1
+                if S["seg"][i] < len(S["chain"][i]) - 1:
+                    next_segment(i)
+                elif s_i == BASKET:
+                    S["hand_hold"][i] = hand_open[i]
+                    st[i] = RELEASE; S["t"][i] = 0.0
+                else:
+                    finish_apple(i)
+            elif s_i == RELEASE and t_i >= args.release_s:
+                rad = env._apple_radius[i:i + 1]
+                S["in_basket"][i] = bool(bk.apple_in_basket(
+                    apple.data.root_pos_w[i:i + 1] - env.scene.env_origins[i:i + 1], rad)[0])
+                S["state"][i] = RETURN
+                start_chain(i, [S["q_to"][i].clone()] + list(basket_wps.flip(0)[1:]))
+
+        if step % 250 == 0:
+            from collections import Counter
+            cnt = Counter(PHASE[int(x)] for x in st)
+            now = time.time()
+            rtf = (step - _step0) * dt / max(now - _wall0, 1e-6)
+            _wall0, _step0 = now, step
+            done = sum(len(r_) for r_ in S["rows"])
+            print(f"  t={step * dt:6.1f}s  real-time factor {rtf:4.2f}x  {dict(cnt)}  apples handled {done}/{N * M}", flush=True)
+
+        if bool((S["state"] == TREE_DONE).all()):
+            for i in range(N):
+                rows = S["rows"][i]
+                tot["apples"] += M
+                tot["finished"] += sum(r_["out"].startswith("FINISHED") for r_ in rows)
+                tot["dropped"] += sum(r_["out"].startswith("DROPPED") for r_ in rows)
+                tot["left"] += sum(r_["out"].startswith("LEFT") for r_ in rows)
+                tot["knocked"] += len(S["knocked"][i])
+            print(f"\n===== ROUND {rnd} done: {N} trees.  Running totals over {tot['apples']} apples: "
+                  f"{tot['finished']} in the basket, {tot['dropped']} dropped, {tot['left']} left on the tree, "
+                  f"{tot['knocked']} knocked off by the hand", flush=True)
+            if args.rounds and rnd >= args.rounds:
+                break
+            rnd += 1
+            new_trees()
+            step = 0
+            _wall0, _step0 = time.time(), 0
+            print(f"\n>>> ROUND {rnd} <<<\n", flush=True)
+
+if video is not None:
+    video.close()
+    print(f"[tree bench] video written: {args.video} ({args.video_fps} fps, simulated time)", flush=True)
+sys.stdout.flush()
+os._exit(0)
