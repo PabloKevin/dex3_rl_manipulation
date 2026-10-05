@@ -262,6 +262,7 @@ def palm_contact_force(
 def _sensed_tactile_forces(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
+    all_apples: bool = False,
 ) -> torch.Tensor:
     """What each real taxel would read: apple-filtered force magnitude on its
     link, times how much of that contact lands on the PAD, times the
@@ -285,6 +286,13 @@ def _sensed_tactile_forces(
     right_hand_palm_link), so those columns are identical up to gain and
     footprint — flagged on the monitor plot too (scripts/tactile_monitor.py).
 
+    all_apples: on the multi-apple tree (apple_grasp_tree_env_cfg), the
+    per-link sensors are filtered against EVERY apple, and a real pad reads
+    any fruit pressing on it -- so sum over them, each contact weighted by
+    its own pad factor (a neighbour against the BACK of a finger still
+    reads nothing). Default: the target only. Rewards and the grip latch
+    (grasp_rewards._pad_state) keep the default.
+
     Shape: [num_envs, 9] (tactile_layout.TAXELS order).
     """
     import scripts.tactile_layout as tactile_layout
@@ -292,12 +300,18 @@ def _sensed_tactile_forces(
         apple_contact_faces, pad_face_weight, TACTILE_FULL_DEG_DEFAULT, TACTILE_CUT_DEG_DEFAULT,
     )
 
-    force, cos_pad = apple_contact_faces(
-        env, sensor_cfg, [t.link_name for t in tactile_layout.TAXELS]
-    )  # [N, 9, 3], [N, 9]
+    links = [t.link_name for t in tactile_layout.TAXELS]
     full = getattr(env, "_tactile_full_deg", TACTILE_FULL_DEG_DEFAULT)
     cut = getattr(env, "_tactile_cut_deg", TACTILE_CUT_DEG_DEFAULT)
-    sensed = torch.norm(force, dim=-1) * pad_face_weight(cos_pad, full, cut)
+    n_filters = 1
+    if all_apples:
+        n_filters = _apple_contact_sensors(env, sensor_cfg.name)[links[0]].data.force_matrix_w.shape[2]
+    sensed = 0.0
+    for m in range(n_filters):
+        force, cos_pad = apple_contact_faces(
+            env, sensor_cfg, links, object_name="apple" if m == 0 else f"apple_{m}", filter_index=m,
+        )  # [N, 9, 3], [N, 9]
+        sensed = sensed + torch.norm(force, dim=-1) * pad_face_weight(cos_pad, full, cut)
 
     if not hasattr(env, "_tactile_gain"):
         env._tactile_gain = torch.ones(env.num_envs, sensed.shape[-1], device=env.device)
@@ -323,6 +337,7 @@ def _taxel_finger_groups(env: ManagerBasedRLEnv) -> dict[str, list[int]]:
 def tactile_slip(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
+    all_apples: bool = False,
 ) -> torch.Tensor:
     """Per-taxel temporal slip signal: (force_now - force_prev) / step_dt,
     calibration-gained. The real physical signature of slip (a sudden force
@@ -332,7 +347,7 @@ def tactile_slip(
 
     Shape: [num_envs, 9]
     """
-    sensed = _sensed_tactile_forces(env, sensor_cfg)
+    sensed = _sensed_tactile_forces(env, sensor_cfg, all_apples)
 
     if not hasattr(env, "_prev_tactile_force") or env._prev_tactile_force.shape != sensed.shape:
         env._prev_tactile_force = sensed.clone()
@@ -352,6 +367,7 @@ def tactile_slip(
 def tactile_finger_balance(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
+    all_apples: bool = False,
 ) -> torch.Tensor:
     """Per-finger-group (thumb/index/middle) mean force, normalized by
     deviation from the cross-finger mean — deliberately NOT absolute
@@ -360,7 +376,7 @@ def tactile_finger_balance(
 
     Shape: [num_envs, 3]
     """
-    sensed = _sensed_tactile_forces(env, sensor_cfg)
+    sensed = _sensed_tactile_forces(env, sensor_cfg, all_apples)
     idx = _taxel_finger_groups(env)
     per_finger = torch.stack(
         [sensed[:, idx[f]].mean(dim=-1) for f in ("thumb", "index", "middle")], dim=-1
@@ -372,6 +388,7 @@ def tactile_finger_balance(
 def tactile_force_level(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
+    all_apples: bool = False,
 ) -> torch.Tensor:
     """Per-finger-group mean of the calibration-gained absolute force level.
 
@@ -384,7 +401,7 @@ def tactile_force_level(
 
     Shape: [num_envs, 3]
     """
-    sensed = _sensed_tactile_forces(env, sensor_cfg)
+    sensed = _sensed_tactile_forces(env, sensor_cfg, all_apples)
     idx = _taxel_finger_groups(env)
     return torch.stack(
         [sensed[:, idx[f]].mean(dim=-1) for f in ("thumb", "index", "middle")], dim=-1

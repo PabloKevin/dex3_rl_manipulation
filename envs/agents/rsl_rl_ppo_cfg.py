@@ -192,3 +192,10 @@ class AppleReachTreePPORunnerCfg(AppleGraspPPORunnerCfg):
     """AppleReachTree-v1: the v1 reach recipe, on the multi-apple tree. Own
     log folder (logs/rsl_rl/apple_reach_tree)."""
     experiment_name = "apple_reach_tree"
+
+
+@configclass
+class AppleGraspTreePPORunnerCfg(AppleGraspGraspPPORunnerCfg):
+    """AppleGraspTree-v1: the grasp recipe on the multi-apple tree with the
+    hold-under-load stage. Own log folder (logs/rsl_rl/apple_grasp_tree)."""
+    experiment_name = "apple_grasp_tree"

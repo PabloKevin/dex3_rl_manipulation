@@ -335,6 +335,7 @@ class _TreeState:
         self.knocked_by = torch.full((N, n), -1, dtype=torch.long, device=dev)
         self.new_tree = torch.ones(N, dtype=torch.bool, device=dev)
         self.next_request = torch.zeros(N, dtype=torch.bool, device=dev)
+        self.retry_request = torch.zeros(N, dtype=torch.bool, device=dev)   # same target again
         self.target_stem = BreakableStem(env, "apple", params=p)
         self.stems = [None] + [BreakableStem(env, apple_entity(k), params=p) for k in range(1, n)]
         self.objs = [env.scene[apple_entity(k)] for k in range(n)]
@@ -466,7 +467,11 @@ def place_apple_tree(
         origin = env.scene.env_origins[i]
         idt = torch.tensor([i], device=dev)
         r = float(env._apple_radius[i])
-        if new_tree_each_reset or bool(T.new_tree[i]) or T.trees[i] is None:
+        if bool(T.retry_request[i]) and not new_tree_each_reset and T.trees[i] is not None:
+            # another attempt at the same apple (it is still on its stem):
+            # nothing moves, the bookkeeping below is refreshed
+            T.retry_request[i] = False
+        elif new_tree_each_reset or bool(T.new_tree[i]) or T.trees[i] is None:
             tree = sample_tree(rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter,
                                stem_heading_max_deg, stem_length_range, cluster_sizes, cluster_weights,
                                cluster_gap, sep_min)

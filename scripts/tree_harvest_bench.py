@@ -63,7 +63,12 @@ from isaaclab.app import AppLauncher
 p = argparse.ArgumentParser(description="Harvest every apple of a tree, one at a time",
                             formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("--policy", type=str, default="last",
-               help="JIT-exported grasp policy.pt, or 'last' for the newest logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")
+               help="grasp policy: 'last' = newest AppleGraspTree-v1 checkpoint (exported on the fly), else the newest "
+                    "logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt; or a model_*.pt / exported .pt")
+p.add_argument("--fingers", type=str, default="auto", choices=["auto", "policy", "freeze"],
+               help="after READY: 'policy' = the grasp policy keeps driving the fingers through twist, home and "
+                    "basket; 'freeze' = hold its last finger targets (the old bench); 'auto' = policy for a hand-only "
+                    "(41-input) policy, freeze otherwise (its arm inputs would be out of distribution)")
 p.add_argument("--reach_policy", type=str, default="last",
                help="'last' = newest AppleReachTree-v1 checkpoint (exported on the fly), 'v1' = the pinned "
                     "single-apple reach the grasp task was trained with, or a model_*.pt / exported policy .pt")
@@ -86,8 +91,11 @@ p.add_argument("--grasp_timeout", type=float, default=5.0,
 p.add_argument("--twist_deg", type=float, default=90.0)
 p.add_argument("--twist_s", type=float, default=1.5)
 p.add_argument("--home_speed", type=float, default=1.2, help="peak joint-space speed (rad/s) going home")
-p.add_argument("--move_speed", type=float, default=1.5, help="peak joint speed (rad/s) on the basket path")
-p.add_argument("--drop_speed", type=float, default=0.8, help="peak joint speed (rad/s) for the last descent to the drop pose")
+p.add_argument("--move_speed", type=float, default=1.9,
+               help="peak joint speed (rad/s) on the basket path (the arm's rate limiter caps at 2.0)")
+p.add_argument("--drop_speed", type=float, default=1.0, help="peak joint speed (rad/s) for the last descent to the drop pose")
+p.add_argument("--max_attempts", type=int, default=3,
+               help="attempts per apple: a grasp that fails with the fruit still on its stem is retried")
 p.add_argument("--release_s", type=float, default=1.5)
 p.add_argument("--leave_margin", type=float, default=0.06, help="fruit this far from the grasp pocket = dropped")
 p.add_argument("--video", type=str, default=None, help="mp4 in SIMULATED time (works headless)")
@@ -145,6 +153,36 @@ def _resolve_reach_policy(spec):
 
 
 reach_path, reach_layout = _resolve_reach_policy(args.reach_policy)
+
+
+def _resolve_grasp_policy(spec):
+    """Path of an exported grasp policy for --policy, and its input size."""
+    import importlib.util
+    _sp = importlib.util.spec_from_file_location("export_policy_jit", os.path.join(REPO, "scripts", "export_policy_jit.py"))
+    ex = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(ex)
+    if spec == "last":
+        runs = [d for d in glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_grasp_tree/20*/"))
+                if not any(w in d for w in ("validate", "smoke"))]
+        ckpts = [c for d in runs for c in glob.glob(os.path.join(d, "model_*.pt"))]
+        if ckpts:
+            spec = max(ckpts, key=lambda c: (os.path.getmtime(os.path.dirname(c)), int(c.rsplit("_", 1)[1][:-3])))
+        else:
+            cands = sorted(glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")),
+                           key=os.path.getmtime)
+            if not cands:
+                sys.exit("no grasp policy found -- pass --policy")
+            spec = cands[-1]
+    path = ex.export(spec) if os.path.basename(spec).startswith("model_") else spec
+    return path, ex.input_dim(path)
+
+
+args.policy, grasp_dim = _resolve_grasp_policy(args.policy)
+HAND_ONLY = grasp_dim in (41, 44)                   # hand-only grasp (44: + gravity in the palm frame)
+if HAND_ONLY:
+    cfg.observations = tree_cfg_mod.HandOnlyObservationsCfg()
+    if grasp_dim == 41:
+        cfg.observations.policy.gravity_palm = None
+FINGERS_POLICY = args.grasp == "policy" and (args.fingers == "policy" or (args.fingers == "auto" and HAND_ONLY))
 cfg.actions.right_arm.reach_policy_path = reach_path
 cfg.actions.right_arm.reach_obs_layout = reach_layout
 cfg.scene.num_envs = args.num_envs
@@ -183,11 +221,6 @@ if args.video:
     video = imageio.get_writer(args.video, fps=args.video_fps, codec="libx264", quality=8, macro_block_size=8)
     video_every = max(1, round(1.0 / (args.video_fps * dt)))
 
-if args.policy == "last":
-    cands = sorted(glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")), key=os.path.getmtime)
-    if not cands:
-        sys.exit("no exported grasp policy found -- pass --policy")
-    args.policy = cands[-1]
 _jit = torch.jit.load(args.policy, map_location=dev).eval()
 policy = lambda: _jit(env.observation_manager.compute()["policy"])
 
@@ -276,7 +309,7 @@ GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE = range(8)
 PHASE = {GRASP: "grasp", TWIST: "twist", HOME: "home", BASKET: "basket", RELEASE: "release",
          RETURN: "return", NEXT: "next", TREE_DONE: "done"}
 fmt = lambda x, s="{:.2f}": "-" if x != x else s.format(x)
-_cm = lambda x: " -  " if x != x else ("free" if x == float("inf") else f"{x * 100:+4.1f}")
+_cm = lambda x: "free" if x != x else f"{x * 100:4.1f}"
 
 
 def T():
@@ -309,32 +342,40 @@ _sph_keep = torch.tensor([robot.data.body_names[int(b)] not in ("right_shoulder_
                           for b in _sph["ids"]], device=dev)     # hand + wrist: what the twist swings round
 
 
-def twist_sign(i, n_samples=10):
-    """+1 or -1: the twist direction whose sweep keeps the hand and wrist
-    spheres furthest from the fruit still hanging, and the two clearances (m)."""
+def twist_sign(i, n_samples=10, margin=0.03):
+    """+1 or -1: the twist direction that swings the hand and wrist the LEAST
+    into the fruit still hanging, and the two costs (m).
+
+    The hand/wrist spheres are rotated rigidly about the twist axis (palm
+    normal, through the grasp pocket) over the whole sweep, each way; the
+    cost is the mean, over the sweep, of the summed intrusion of every
+    sphere into a `margin` around every neighbour. Scoring the CLOSEST
+    approach instead (first version) made both directions tie whenever a
+    sphere already touched a neighbour at the start -- usual in a cluster,
+    the spheres are a little inflated -- and the tie went to the default
+    direction, often the one that swung the fingers into the neighbour."""
     c = scm._world_spheres(env, _sph)[i][_sph_keep]                  # [S, 3]
     rad = _sph["r"][_sph_keep]
     hanging, _ = neighbours_on_tree()
     tr = T()
     ent = tr.occupant[i][hanging[i]]
     if len(ent) == 0:
-        return 1.0, float("inf"), float("inf")
+        return 1.0, float("nan"), float("nan")
     q = torch.stack([tr.objs[int(e)].data.root_pos_w[i] for e in ent])       # [K, 3]
     r_a = float(env._apple_radius[i])
     k, piv = S["tw_axis"][i], S["tw_pivot"][i]
     v = c - piv
     out = {}
     for sgn in (1.0, -1.0):
-        best = float("inf")
+        cost = 0.0
         for th in torch.linspace(0.0, twist_rad, n_samples, device=dev)[1:]:
             a = sgn * th
             vr = v * torch.cos(a) + torch.cross(k.expand_as(v), v, dim=-1) * torch.sin(a) \
                 + k * (v @ k).unsqueeze(-1) * (1 - torch.cos(a))
-            p = piv + vr
-            d = (p.unsqueeze(1) - q.unsqueeze(0)).norm(dim=-1) - rad.unsqueeze(1) - r_a
-            best = min(best, float(d.min()))
-        out[sgn] = best
-    sign = 1.0 if out[1.0] >= out[-1.0] - 1e-3 else -1.0
+            d = ((piv + vr).unsqueeze(1) - q.unsqueeze(0)).norm(dim=-1) - rad.unsqueeze(1) - r_a
+            cost += float((margin - d).clamp(min=0.0).sum())
+        out[sgn] = cost / (n_samples - 1)
+    sign = 1.0 if out[1.0] <= out[-1.0] + 1e-4 else -1.0
     return sign, out[1.0], out[-1.0]
 
 
@@ -355,9 +396,14 @@ def new_apple(ids):
             S[k][i] = float("nan")
         for k in ("max_slip", "max_f", "max_f_reach", "max_self", "max_push"):
             S[k][i] = 0.0
-        hanging, _ = neighbours_on_tree()
-        S["hanging0"][i] = hanging[i].clone()
-        S["spot"][i] = T().current_spot(i)
+        if S["retry"][i]:                          # another attempt at the same apple
+            S["retry"][i] = False
+            S["attempt"][i] += 1
+        else:
+            S["attempt"][i] = 1
+            hanging, _ = neighbours_on_tree()
+            S["hanging0"][i] = hanging[i].clone()   # knock-offs count over every attempt
+            S["spot"][i] = T().current_spot(i)
     ready_det.reset(torch.tensor(ids, device=dev))
     sc_state["started"][ids] = False
 
@@ -377,7 +423,7 @@ def new_trees():
         max_f_reach=torch.zeros(N, device=dev),
         max_self=torch.zeros(N, device=dev), max_push=torch.zeros(N, device=dev),
         drop_phase=[""] * N, not_ready=[""] * N, in_basket=[None] * N, hanging0=[None] * N, spot=[0] * N,
-        tw_sign=torch.ones(N, device=dev), tw_clear=[(float("nan"), float("nan"))] * N, pending_home=[False] * N, row_done=[False] * N, home_tries=[0] * N,
+        tw_sign=torch.ones(N, device=dev), tw_clear=[(float("nan"), float("nan"))] * N, pending_home=[False] * N, row_done=[False] * N, home_tries=[0] * N, retry=[False] * N, attempt=[1] * N,
         rows=[[] for _ in range(N)], knocked={i: {} for i in range(N)}, reported=[False] * N,
     )
     if hasattr(env, "_tree"):                      # (created by the first reset, which grows new trees anyway)
@@ -444,7 +490,12 @@ def finish_apple(i):
     """Record this apple's row (once), make sure the arm is home -- every
     reach must start there -- then ask for the next apple."""
     if not S["row_done"][i]:
-        record_row(i)
+        stem = T().target_stem
+        on_tree = bool(stem.active[i]) and not bool(stem.broken[i])
+        if on_tree and S["attempt"][i] < args.max_attempts:
+            S["retry"][i] = True                       # still hanging: reach + grasp + harvest it again
+        else:
+            record_row(i)
         S["row_done"][i] = True
     q = arm._processed_actions[i]
     S["home_tries"][i] += 1
@@ -452,7 +503,11 @@ def finish_apple(i):
         S["state"][i] = RETURN
         start_chain(i, [q.clone(), basket_wps[0]])
         return
-    if T().remaining(i) > 0:
+    if S["retry"][i]:
+        T().retry_request[i] = True
+        T().next_request[i] = True
+        S["state"][i] = NEXT
+    elif T().remaining(i) > 0:
         T().next_request[i] = True
         S["state"][i] = NEXT
     else:
@@ -494,7 +549,7 @@ def record_row(i):
         slip=float(S["max_slip"][i]), f=float(S["max_f"][i]), f_reach=float(S["max_f_reach"][i]), thr=float(dmg), self=float(S["max_self"][i]),
         push=float(S["max_push"][i]), knocked=len(knocked), out=out, not_ready=S["not_ready"][i],
         tw=("+" if S["tw_sign"][i] > 0 else "-") if not math.isnan(S["tw_clear"][i][0]) else " ",
-        tw_clear=S["tw_clear"][i]))
+        tw_clear=S["tw_clear"][i], attempts=S["attempt"][i]))
 
 
 def report_tree(i):
@@ -505,13 +560,14 @@ def report_tree(i):
     r = float(env._apple_radius[i])
     print(f"\n===== TREE env {i}  ({M} apples, radius {r * 1000:.0f} mm, clusters "
           f"{sorted(torch.bincount(tr.cluster[i]).tolist(), reverse=True)})   reach {os.path.basename(reach_path)}, grasp {'scripted' if args.grasp == 'scripted' else os.path.basename(os.path.dirname(os.path.dirname(args.policy)))}")
-    print("  #  spot clu  z(m) gap mm ready_s stem   cause twist@brk dir (clear +/- cm)  slip   peak_F (thr)  reach+grasp_F  "
+    print("  #  spot clu  z(m) gap mm ready_s stem   cause twist@brk dir (cost +/- cm)  slip   peak_F (thr)  reach+grasp_F  "
           "self mm  push cm knocked -> outcome")
     for row in S["rows"][i]:
         print(f" {row['n']:2d}   {row['spot']:2d}   {row['cluster']}  {row['z']:.2f}  {row['gap'] * 1000:+5.0f}  "
               f"{fmt(row['ready']):>6s}  {'broke' if row['broke'] else 'intact':6s} {row['cause']:5s} "
               f"{fmt(row['twist'], '{:.0f}deg'):>7s}  {row['tw']}  ({_cm(row['tw_clear'][0])}/{_cm(row['tw_clear'][1])})  {row['slip'] * 100:4.1f}cm {row['f']:5.1f} N ({row['thr']:4.1f})  {row['f_reach']:6.1f} N    "
-              f"  {row['self'] * 1000:5.0f}   {row['push'] * 100:5.1f}   {row['knocked']:3d}     -> {row['out']}")
+              f"  {row['self'] * 1000:5.0f}   {row['push'] * 100:5.1f}   {row['knocked']:3d}     -> {row['out']}"
+              + (f"  [attempt {row['attempts']}]" if row['attempts'] > 1 else ""))
     for s, by in sorted(S["knocked"][i].items()):
         print(f"      spot {s:2d}: KNOCKED OFF while picking #{by}")
     rows = S["rows"][i]
@@ -523,7 +579,8 @@ def report_tree(i):
 
 
 print(f"[tree bench] {N} envs x {M} apples, reach {reach_path} ({reach_layout} obs), grasp "
-      f"{'SCRIPTED (plan B)' if args.grasp == 'scripted' else args.policy}", flush=True)
+      f"{'SCRIPTED (plan B)' if args.grasp == 'scripted' else args.policy} ({grasp_dim} inputs), fingers after READY: "
+      f"{'policy' if FINGERS_POLICY else 'frozen'}", flush=True)
 new_trees()
 rnd, step = 1, 0
 twist_rad = math.radians(args.twist_deg)
@@ -614,7 +671,11 @@ while app.is_running():
         q_cmd = torch.where(rl.unsqueeze(-1), S["q_to"], q_cmd)
         h = st != GRASP
         a[h, :arm_dim] = ((q_cmd - arm._anchor) / arm._scale)[h]
-        a[h, arm_dim:] = ((S["hand_hold"] - hand._grasp_offset) / hand._scale)[h]
+        if FINGERS_POLICY:                                    # the policy keeps the fingers while the fruit is carried
+            h_frozen = h & ~((st == TWIST) | (st == HOME) | (st == BASKET))
+        else:
+            h_frozen = h
+        a[h_frozen, arm_dim:] = ((S["hand_hold"] - hand._grasp_offset) / hand._scale)[h_frozen]
 
         pending = T().next_request.clone()
         env.step(a)

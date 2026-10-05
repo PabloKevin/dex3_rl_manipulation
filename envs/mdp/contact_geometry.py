@@ -93,8 +93,13 @@ def apple_contact_faces(
     link_names: Sequence[str],
     object_name: str = "apple",
     robot_name: str = "robot",
+    filter_index: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apple-filtered force on each link, and where on the link it lands.
+
+    filter_index picks which of the sensors' filter bodies to read (0 = the
+    target "apple"; the multi-apple tree adds its other apples as further
+    filters, in entity order); object_name must be that body.
 
     Returns (force_w [N, L, 3], cos_pad [N, L]):
       force_w  -- apple-filtered contact force on the link, world frame, N.
@@ -127,13 +132,13 @@ def apple_contact_faces(
         )
     body_ids, n_local = cache[key]
 
-    force = torch.stack([group[l].data.force_matrix_w[:, 0, 0, :] for l in link_names], dim=1)  # [N, L, 3]
+    force = torch.stack([group[l].data.force_matrix_w[:, 0, filter_index, :] for l in link_names], dim=1)  # [N, L, 3]
     f_mag = force.norm(dim=-1, keepdim=True)
     from_force = -force / f_mag.clamp(min=1e-6)
 
     pts = [group[l].data.contact_pos_w for l in link_names]
     if all(p is not None for p in pts):
-        p = torch.stack([q[:, 0, 0, :] for q in pts], dim=1)                     # [N, L, 3]
+        p = torch.stack([q[:, 0, filter_index, :] for q in pts], dim=1)          # [N, L, 3]
         has_pt = torch.isfinite(p).all(dim=-1, keepdim=True)
         radial = apple.data.root_pos_w.unsqueeze(1) - torch.nan_to_num(p)
         radial = radial / radial.norm(dim=-1, keepdim=True).clamp(min=1e-6)
