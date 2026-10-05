@@ -137,6 +137,31 @@ def penalty_neighbour_knocked(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return newly.float().sum(-1)
 
 
+_HAND_POINTS = ["right_hand_palm_link", "right_hand_index_1_link", "right_hand_middle_1_link",
+                "right_hand_thumb_2_link"]
+
+
+def penalty_hand_speed_near_fruit(env: "ManagerBasedRLEnv", near: float = 0.10, v_ref: float = 0.3) -> torch.Tensor:
+    """[N] hand speed where it passes close to the NEIGHBOURS: per hand point
+    (palm, fingertip links), (speed / v_ref)^2 weighted by proximity to the
+    nearest hanging neighbour's surface, 1 at contact falling to 0 at `near`.
+    The trained reach still crossed the wall at full speed and pushed fruit
+    on the way; slowing down near fruit is what a careful picker does. The
+    target itself is left to the v1 brake term."""
+    if not hasattr(env, "_tree"):
+        return torch.zeros(env.num_envs, device=env.device)
+    robot = env.scene["robot"]
+    if not hasattr(env, "_hand_pt_ids"):
+        env._hand_pt_ids = [robot.data.body_names.index(n) for n in _HAND_POINTS]
+    p = robot.data.body_pos_w[:, env._hand_pt_ids]                           # [N, H, 3]
+    v = robot.data.body_lin_vel_w[:, env._hand_pt_ids].norm(dim=-1)          # [N, H]
+    q, hanging = _neighbour_state(env)                                       # [N, K, 3]
+    d = (p.unsqueeze(2) - q.unsqueeze(1)).norm(dim=-1) - env._apple_radius.view(-1, 1, 1)
+    d = torch.where(hanging.unsqueeze(1), d, torch.full_like(d, 1.0e3))
+    w = (1.0 - d.amin(-1).clamp(min=0.0) / near).clamp(min=0.0)               # [N, H]
+    return (w * (v / v_ref) ** 2).sum(-1)
+
+
 def penalty_target_knocked(env: "ManagerBasedRLEnv") -> torch.Tensor:
     """[N] 1 on the step the target's own stem breaks during the reach."""
     if not hasattr(env, "_tree"):

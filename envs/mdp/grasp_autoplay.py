@@ -115,8 +115,13 @@ def _reach_obs(
     object_cfg: SceneEntityCfg,
     palm_local_offset: tuple[float, float, float],
     prev_raw_action: torch.Tensor,
+    layout: str = "v1",
 ) -> torch.Tensor:
-    """Reassemble the reach policy's own 29-dim observation vector (all
+    """layout "tree": the AppleReachTree-v1 policy's 37-dim vector instead --
+    the same 29 with palm_touch_force from ANY contact, then the 8-sector
+    neighbour clearance ring (envs/apple_reach_tree_env_cfg.py).
+
+    Reassemble the reach policy's own 29-dim observation vector (all
     envs) by calling the SAME functions envs/apple_grasp_env_cfg.py's
     ObservationsCfg.PolicyObs wires up -- NOT the ObservationManager, which
     belongs to the grasp task here.
@@ -150,17 +155,19 @@ def _reach_obs(
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
 
-    return torch.cat(
-        [
-            joint_pos_selected(env, arm_cfg),
-            joint_vel_selected(env, arm_cfg),
-            object_pos_relative_to_body(env, object_cfg, robot_body_cfg, local_offset=palm_local_offset),
-            body_quat_relative_to_body(env, robot_body_cfg, env._autoplay_torso_cfg),
-            prev_raw_action,
-            palm_contact_force(env, env._autoplay_sensor_cfg),
-        ],
-        dim=-1,
-    )
+    parts = [
+        joint_pos_selected(env, arm_cfg),
+        joint_vel_selected(env, arm_cfg),
+        object_pos_relative_to_body(env, object_cfg, robot_body_cfg, local_offset=palm_local_offset),
+        body_quat_relative_to_body(env, robot_body_cfg, env._autoplay_torso_cfg),
+        prev_raw_action,
+    ]
+    if layout == "tree":
+        from .tree_reach import neighbour_clearance_ring, palm_contact_force_any
+        parts += [palm_contact_force_any(env, env._autoplay_sensor_cfg), neighbour_clearance_ring(env)]
+    else:
+        parts.append(palm_contact_force(env, env._autoplay_sensor_cfg))
+    return torch.cat(parts, dim=-1)
 
 
 # ─────────────────────────────────────────────
@@ -559,7 +566,7 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
             policy = _load_reach_policy(self.cfg.reach_policy_path, self.device)
             obs = _reach_obs(
                 self._env, self._reach_arm_cfg, self._palm_cfg, self._apple_cfg,
-                self.cfg.palm_local_offset, self._reach_prev_raw,
+                self.cfg.palm_local_offset, self._reach_prev_raw, layout=self.cfg.reach_obs_layout,
             )
             with torch.inference_mode():
                 reach_raw = policy(obs)
@@ -664,6 +671,10 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     drive_with_reach_policy: bool = False
     anchor_to_handoff: bool = False
     reach_policy_path: str = PINNED_REACH_POLICY
+    reach_obs_layout: str = "v1"
+    """"v1": the 29-dim AppleReach-v1 observation; "tree": the 37-dim
+    AppleReachTree-v1 one (any-contact palm force + clearance ring) -- must
+    match the policy at reach_policy_path."""
     reach_scale: float = 0.5
     # With unlock_with_grip, the LAST pre_grip_free_dims joints (in
     # cfg.joint_names order) keep their normal scale even before the first

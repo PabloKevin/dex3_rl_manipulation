@@ -108,8 +108,16 @@ class RewardsCfg(ReachRewardsCfg):
     target_knocked = RewTerm(func=trr.penalty_target_knocked, weight=-100.0)
     # Smooth COMMANDED motion: 1.0 per step = every joint at the limiter's
     # max acceleration / asking 0.5 rad beyond reach, on every joint.
-    commanded_accel = RewTerm(func=trr.penalty_commanded_accel, weight=-1.0)
+    # -1 -> -3 at iteration 700: the first run smoothed its targets
+    # (limiter_lead halved) but kept accelerating as hard (flat ~0.2 of the
+    # cap, i.e. ~3.6 rad/s^2 RMS).
+    commanded_accel = RewTerm(func=trr.penalty_commanded_accel, weight=-3.0)
     limiter_lead = RewTerm(func=trr.penalty_limiter_lead, weight=-1.0, params={"ref": 0.5})
+    # Slow down near the neighbours (added at iteration 700: the reach still
+    # swept past fruit at full speed and pushed it). Passing 2 cm from a
+    # neighbour at 0.6 m/s costs ~3/step per hand point before the weight.
+    hand_speed_near_fruit = RewTerm(func=trr.penalty_hand_speed_near_fruit, weight=-1.0,
+                                    params={"near": 0.10, "v_ref": 0.3})
 
 
 @configclass

@@ -40,6 +40,12 @@ the peak during reach + grasp (on the pinned fruit), in the basket, worst self-c
 how far the hand pushed the neighbours still on the tree, and how many it
 knocked off. FINISHED = held through everything and in the basket.
 
+Reach: --reach_policy last (default) = the newest AppleReachTree-v1 checkpoint,
+exported on the fly (scripts/export_policy_jit.py); v1 = the single-apple
+reach the grasp task pins. Grasp: the trained policy, or --grasp scripted
+(plan B for sim2real): each finger closes until it feels --close_force, then
+holds a target --squeeze past that point.
+
 Usage:
   python scripts/tree_harvest_bench.py --num_envs 2                       (viewer)
   python scripts/tree_harvest_bench.py --headless --num_envs 1 --video logs/videos/tree_harvest.mp4
@@ -58,6 +64,18 @@ p = argparse.ArgumentParser(description="Harvest every apple of a tree, one at a
                             formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("--policy", type=str, default="last",
                help="JIT-exported grasp policy.pt, or 'last' for the newest logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt")
+p.add_argument("--reach_policy", type=str, default="last",
+               help="'last' = newest AppleReachTree-v1 checkpoint (exported on the fly), 'v1' = the pinned "
+                    "single-apple reach the grasp task was trained with, or a model_*.pt / exported policy .pt")
+p.add_argument("--grasp", type=str, default="policy", choices=["policy", "scripted"],
+               help="'scripted' = plan B: close each finger until it feels --close_force, then squeeze --squeeze")
+p.add_argument("--close_speed", type=float, default=0.8, help="(scripted) finger closing speed, rad/s")
+p.add_argument("--close_force", type=float, default=1.0, help="(scripted) contact force that stops a finger, N")
+p.add_argument("--squeeze", type=float, default=0.8,
+               help="(scripted) target past the contact point, rad: the Dex3 PD (kp 1 N*m/rad) only presses by "
+                    "error. Measured, 4 trees each: 0.35 -> 2/28 in the basket (slips out), 0.8 -> 10/28, "
+                    "1.2 -> 9/28 with 5 bruised")
+p.add_argument("--settle_s", type=float, default=0.3, help="(scripted) hold after the last finger stops before READY")
 p.add_argument("--num_envs", type=int, default=4)
 p.add_argument("--rounds", type=int, default=1, help="trees per env before exiting (0 = until the window is closed)")
 p.add_argument("--apples", type=int, default=None, help="apples per tree (default APPLES_PER_TREE of the env cfg)")
@@ -68,8 +86,8 @@ p.add_argument("--grasp_timeout", type=float, default=5.0,
 p.add_argument("--twist_deg", type=float, default=90.0)
 p.add_argument("--twist_s", type=float, default=1.5)
 p.add_argument("--home_speed", type=float, default=1.2, help="peak joint-space speed (rad/s) going home")
-p.add_argument("--move_speed", type=float, default=1.0, help="peak joint speed (rad/s) on the basket path")
-p.add_argument("--drop_speed", type=float, default=0.4, help="peak joint speed (rad/s) for the last descent to the drop pose")
+p.add_argument("--move_speed", type=float, default=1.5, help="peak joint speed (rad/s) on the basket path")
+p.add_argument("--drop_speed", type=float, default=0.8, help="peak joint speed (rad/s) for the last descent to the drop pose")
 p.add_argument("--release_s", type=float, default=1.5)
 p.add_argument("--leave_margin", type=float, default=0.06, help="fruit this far from the grasp pocket = dropped")
 p.add_argument("--video", type=str, default=None, help="mp4 in SIMULATED time (works headless)")
@@ -105,6 +123,30 @@ from envs.mdp.self_collision import self_collision_depth
 if args.apples is not None:
     tree_cfg_mod.APPLES_PER_TREE = args.apples           # read by the scene / event cfgs below
 cfg = tree_cfg_mod.AppleGraspTreeEnvCfg()
+
+
+def _resolve_reach_policy(spec):
+    """Path of an exported reach policy for --reach_policy, and its obs layout."""
+    import importlib.util
+    from envs.mdp.grasp_autoplay import PINNED_REACH_POLICY
+    _sp = importlib.util.spec_from_file_location("export_policy_jit", os.path.join(REPO, "scripts", "export_policy_jit.py"))
+    ex = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(ex)
+    if spec == "v1":
+        path = PINNED_REACH_POLICY
+    else:
+        if spec == "last":
+            runs = [d for d in glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_reach_tree/20*/")) if "validate" not in d]
+            ckpts = [c for d in runs for c in glob.glob(os.path.join(d, "model_*.pt"))]
+            if not ckpts:
+                sys.exit("no AppleReachTree-v1 checkpoint found -- pass --reach_policy v1 or a path")
+            spec = max(ckpts, key=lambda c: (os.path.getmtime(os.path.dirname(c)), int(c.rsplit("_", 1)[1][:-3])))
+        path = ex.export(spec) if os.path.basename(spec).startswith("model_") else spec
+    return path, ("tree" if ex.input_dim(path) == 37 else "v1")
+
+
+reach_path, reach_layout = _resolve_reach_policy(args.reach_policy)
+cfg.actions.right_arm.reach_policy_path = reach_path
+cfg.actions.right_arm.reach_obs_layout = reach_layout
 cfg.scene.num_envs = args.num_envs
 bk.add_to_scene(cfg.scene)
 cfg.episode_length_s = 1.0e5
@@ -158,6 +200,71 @@ palm_id = robot.data.body_names.index("right_hand_palm_link")
 arm_ids = list(arm._joint_ids)
 sc = SceneEntityCfg("contact_forces"); sc.resolve(env.scene)
 ready_det = hv.GraspReadyDetector(env, sc, hand._joint_ids)
+
+# ── plan B: scripted grasp (close each finger until it feels the fruit) ──
+_hn = list(hand._joint_names)                                      # action order = articulation order
+_lim = robot.data.soft_joint_pos_limits[0, hand._joint_ids]        # [7, 2]
+_open = robot.data.default_joint_pos[0, hand._joint_ids]
+_far = torch.where((_lim[:, 1] - _open).abs() > (_lim[:, 0] - _open).abs(), _lim[:, 1], _lim[:, 0])
+_dir = torch.sign(_far - _open)                                    # closing direction per joint
+_goal = _open + 0.95 * (_far - _open)                              # fully closed (if nothing is felt)
+SC_GROUPS = {"thumb": ["right_hand_thumb_1_joint", "right_hand_thumb_2_joint"],
+             "index": ["right_hand_index_0_joint", "right_hand_index_1_joint"],
+             "middle": ["right_hand_middle_0_joint", "right_hand_middle_1_joint"]}
+SC_LINKS = {"thumb": ["right_hand_thumb_1_link", "right_hand_thumb_2_link"],
+            "index": ["right_hand_index_0_link", "right_hand_index_1_link"],
+            "middle": ["right_hand_middle_0_link", "right_hand_middle_1_link"]}
+_sensor = env.scene["contact_forces"]
+_sc_joint_mask = torch.zeros(3, len(_hn), device=dev)
+_sc_link_ids = []
+for g, name in enumerate(SC_GROUPS):
+    for j in SC_GROUPS[name]:
+        _sc_joint_mask[g, _hn.index(j)] = 1.0
+    _sc_link_ids.append([_sensor.body_names.index(l) for l in SC_LINKS[name]])
+sc_state = dict(target=torch.zeros(N, len(_hn), device=dev), stopped=torch.zeros(N, 3, dtype=torch.bool, device=dev),
+                t_all=torch.full((N,), float("nan"), device=dev), started=torch.zeros(N, dtype=torch.bool, device=dev))
+if args.grasp == "scripted":
+    print("[tree bench] scripted grasp: closing directions " + ", ".join(
+        f"{n.replace('right_hand_', '').replace('_joint', '')} {'+' if d > 0 else '-'}{abs(float(g_ - o)):.2f}"
+        for n, d, g_, o in zip(_hn, _dir.tolist(), _goal.tolist(), _open.tolist())), flush=True)
+
+
+def scripted_grasp(a, st):
+    """Hand actions for envs in GRASP after the hand-off: per finger group,
+    close at --close_speed until its links feel --close_force (any contact,
+    as real pads), then hold the target --squeeze past that point. Arm holds
+    the hand-off pose. Returns [N] bool: every finger stopped, settled."""
+    act = (st == GRASP) & env._grasp_phase_active
+    new = act & ~sc_state["started"]
+    if bool(new.any()):                                            # start from the grasp-phase pre-shape
+        sc_state["target"][new] = hand._grasp_offset[new] if hand._grasp_offset.dim() == 2 else hand._grasp_offset
+        sc_state["stopped"][new] = False
+        sc_state["t_all"][new] = float("nan")
+        sc_state["started"] |= new
+    if not bool(act.any()):
+        return torch.zeros(N, dtype=torch.bool, device=dev)
+    f = _sensor.data.net_forces_w.norm(dim=-1)                     # [N, links]
+    feel = torch.stack([f[:, ids].amax(-1) for ids in _sc_link_ids], dim=1)   # [N, 3]
+    newly = act.unsqueeze(-1) & ~sc_state["stopped"] & (feel >= args.close_force)
+    tgt = sc_state["target"]
+    if bool(newly.any()):                                          # squeeze past the contact point
+        tgt += (newly.float() @ _sc_joint_mask) * _dir * args.squeeze
+    sc_state["stopped"] |= newly
+    moving = (~sc_state["stopped"]).float() @ _sc_joint_mask       # [N, 7] joints still closing
+    tgt += act.unsqueeze(-1).float() * moving * _dir * args.close_speed * dt
+    # a finger that reached full closure without feeling anything stops there
+    lo, hi = torch.minimum(_open, _goal + _dir * args.squeeze), torch.maximum(_open, _goal + _dir * args.squeeze)
+    sc_state["target"] = torch.maximum(torch.minimum(tgt, hi), lo)
+    at_goal = (((sc_state["target"] - _goal) * _dir) >= 0)
+    full = torch.stack([(at_goal | (_sc_joint_mask[g] == 0)).all(-1) for g in range(3)], dim=1)
+    sc_state["stopped"] |= act.unsqueeze(-1) & full
+    a[act, :arm_dim] = 0.0                                         # = the hand-off pose (anchored)
+    a[act, arm_dim:] = ((sc_state["target"] - hand._grasp_offset) / hand._scale)[act]
+    all_stop = act & sc_state["stopped"].all(-1)
+    first = all_stop & torch.isnan(sc_state["t_all"])
+    since = (env.episode_length_buf - env._grasp_handoff_step).float() * dt
+    sc_state["t_all"] = torch.where(first, since, sc_state["t_all"])
+    return all_stop & (since - sc_state["t_all"] >= args.settle_s)
 ik = hv.DifferentialIK(robot, "right_hand_palm_link", arm_ids)
 c_local = torch.tensor(GRASP_CENTER_LOCAL, device=dev).expand(N, 3)
 _bp = np.load(os.path.join(REPO, "envs", "assets", "basket_drop_path.npz"))
@@ -252,6 +359,7 @@ def new_apple(ids):
         S["hanging0"][i] = hanging[i].clone()
         S["spot"][i] = T().current_spot(i)
     ready_det.reset(torch.tensor(ids, device=dev))
+    sc_state["started"][ids] = False
 
 
 def new_trees():
@@ -279,7 +387,18 @@ def new_trees():
 
 
 def start_chain(i, points):
-    S["chain"][i], S["seg"][i] = points, 0
+    """Joint-space path through `points`, one quintic segment per leg (zero
+    velocity and acceleration at every waypoint: the basket path turns ~140
+    deg over the basket, too sharp to blend through without cutting the
+    planned clearance). Legs shorter than 0.02 rad are dropped (e.g. home ->
+    home after the way back), they only added a pause."""
+    pts = [points[0]]
+    for q in points[1:]:
+        if float((q - pts[-1]).norm()) > 0.02:
+            pts.append(q)
+    if len(pts) < 2:
+        pts.append(points[-1])
+    S["chain"][i], S["seg"][i] = pts, 0
     next_segment(i)
 
 
@@ -289,7 +408,7 @@ def next_segment(i):
     slow = S["state"][i] == BASKET and k + 1 == len(S["chain"][i]) - 1
     speed = args.drop_speed if slow else args.move_speed
     S["q_from"][i], S["q_to"][i] = q0, q1
-    S["seg_T"][i] = max(0.8, 1.875 * float((q1 - q0).norm()) / speed)
+    S["seg_T"][i] = max(0.4, 1.875 * float((q1 - q0).norm()) / speed)
     S["t"][i] = 0.0
 
 
@@ -385,7 +504,7 @@ def report_tree(i):
     tr = T()
     r = float(env._apple_radius[i])
     print(f"\n===== TREE env {i}  ({M} apples, radius {r * 1000:.0f} mm, clusters "
-          f"{sorted(torch.bincount(tr.cluster[i]).tolist(), reverse=True)})   policy: {args.policy}")
+          f"{sorted(torch.bincount(tr.cluster[i]).tolist(), reverse=True)})   reach {os.path.basename(reach_path)}, grasp {'scripted' if args.grasp == 'scripted' else os.path.basename(os.path.dirname(os.path.dirname(args.policy)))}")
     print("  #  spot clu  z(m) gap mm ready_s stem   cause twist@brk dir (clear +/- cm)  slip   peak_F (thr)  reach+grasp_F  "
           "self mm  push cm knocked -> outcome")
     for row in S["rows"][i]:
@@ -403,7 +522,8 @@ def report_tree(i):
     sys.stdout.flush()
 
 
-print(f"[tree bench] {N} envs x {M} apples, policy {args.policy}", flush=True)
+print(f"[tree bench] {N} envs x {M} apples, reach {reach_path} ({reach_layout} obs), grasp "
+      f"{'SCRIPTED (plan B)' if args.grasp == 'scripted' else args.policy}", flush=True)
 new_trees()
 rnd, step = 1, 0
 twist_rad = math.radians(args.twist_deg)
@@ -422,6 +542,8 @@ while app.is_running():
                 S["handoff_idx"][i] = len(S["path"][i])
 
         ready = ready_det.update() & (st == GRASP)
+        if args.grasp == "scripted":
+            ready = scripted_grasp(a, st) & (st == GRASP)
         timeout = (st == GRASP) & env._grasp_phase_active & (since_handoff > args.grasp_timeout) & ~ready
         if bool(timeout.any()):
             L = ready_det.last
@@ -543,7 +665,7 @@ while app.is_running():
                     finish_apple(i)
                 else:
                     go_basket(i)
-            elif s_i in (BASKET, RETURN) and t_i >= float(S["seg_T"][i]) + 0.15:
+            elif s_i in (BASKET, RETURN) and t_i >= float(S["seg_T"][i]) + 0.05:
                 S["seg"][i] += 1
                 if S["seg"][i] < len(S["chain"][i]) - 1:
                     next_segment(i)
