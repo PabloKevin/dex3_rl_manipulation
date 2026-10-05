@@ -185,3 +185,10 @@ class AppleGraspHarvestPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class AppleReachTreePPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachTree-v1: the v1 reach recipe, on the multi-apple tree. Own
+    log folder (logs/rsl_rl/apple_reach_tree)."""
+    experiment_name = "apple_reach_tree"

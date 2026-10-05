@@ -22,7 +22,16 @@ from .apple_grasp_harvest_env_cfg import (
     AppleGraspHarvestEnvCfg,
     AppleGraspHarvestEnvCfg_PLAY,
 )
-from .agents.rsl_rl_ppo_cfg import AppleGraspPPORunnerCfg, AppleGraspGraspPPORunnerCfg, AppleGraspHarvestPPORunnerCfg
+from .apple_reach_tree_env_cfg import (
+    AppleReachTreeEnvCfg,
+    AppleReachTreeEnvCfg_PLAY,
+)
+from .agents.rsl_rl_ppo_cfg import (
+    AppleGraspPPORunnerCfg,
+    AppleGraspGraspPPORunnerCfg,
+    AppleGraspHarvestPPORunnerCfg,
+    AppleReachTreePPORunnerCfg,
+)
 
 gym.register(
     id="AppleReach-v1",
@@ -87,6 +96,27 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleGraspHarvestEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleGraspHarvestPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Reach on the multi-apple tree (neighbours on stems, clearance-ring input).
+gym.register(
+    id="AppleReachTree-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachTreeEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachTreePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachTree-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachTreeEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachTreePPORunnerCfg,
     },
     disable_env_checker=True,
 )

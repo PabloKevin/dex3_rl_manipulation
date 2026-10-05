@@ -407,6 +407,7 @@ def place_apple_tree(
     sep_min: float,
     order: str = "top_down",
     stem_params: dict | None = None,
+    new_tree_each_reset: bool = False,
     stem_radius: float = 0.003,
     branch_radius: float = 0.015,
     trunk_radius: float = 0.06,
@@ -415,7 +416,11 @@ def place_apple_tree(
     """mode="reset", in place of randomize_tree_and_apple. Per env: a NEW
     tree when env._tree.new_tree is set (the first reset, and whenever the
     bench asks), otherwise the NEXT apple of the same tree (swap, see the
-    module docstring). Leaves the same bookkeeping as randomize_tree_and_
+    module docstring). stem_params overrides harvest.StemParams fields for
+    every stem of the tree (target and neighbours alike).
+    new_tree_each_reset: a fresh tree at every reset (reach training: one
+    apple per episode; with order="random" the target is any of them,
+    cluster members included). Leaves the same bookkeeping as randomize_tree_and_
     apple for the target ("apple" pose, _stem_anchor_pos, _stem_dir,
     _tree_segments / _tree_radii: target stem first, then the other stems,
     the branches and the trunk)."""
@@ -461,7 +466,7 @@ def place_apple_tree(
         origin = env.scene.env_origins[i]
         idt = torch.tensor([i], device=dev)
         r = float(env._apple_radius[i])
-        if bool(T.new_tree[i]) or T.trees[i] is None:
+        if new_tree_each_reset or bool(T.new_tree[i]) or T.trees[i] is None:
             tree = sample_tree(rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter,
                                stem_heading_max_deg, stem_length_range, cluster_sizes, cluster_weights,
                                cluster_gap, sep_min)
