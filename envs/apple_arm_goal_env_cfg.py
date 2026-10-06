@@ -94,9 +94,15 @@ class RewardsCfg:
                              params={"pocket_local": POCKET, "deadband": 0.03, "ref": 0.05})
     brake = RewTerm(func=ag.penalty_near_goal_speed, weight=-2.0, params={"pocket_local": POCKET, "dist": 0.10})
     # ── safety: body, held apple, basket, joints ──
-    self_collision = RewTerm(func=task_mdp.penalty_self_collision, weight=-8.0, params={"margin": 0.015, "ref": 0.05})
-    apple_body = RewTerm(func=ag.penalty_apple_body, weight=-8.0, params={"pocket_local": POCKET})
-    basket = RewTerm(func=ag.penalty_basket, weight=-8.0, params={"pocket_local": POCKET})
+    # Body and basket: a 4 cm DANGER ZONE, steep (2 cm into it costs 1.0 per
+    # step before the weight), and a real overlap ends the episode with
+    # `collision` -- the first policy still cut through the body now and
+    # then (1.5 cm margin, gentle penalty: a brief pass cost less than a detour).
+    self_collision = RewTerm(func=task_mdp.penalty_self_collision, weight=-10.0, params={"margin": 0.04, "ref": 0.02})
+    apple_body = RewTerm(func=ag.penalty_apple_body, weight=-10.0,
+                         params={"pocket_local": POCKET, "margin": 0.04, "ref": 0.02})
+    basket = RewTerm(func=ag.penalty_basket, weight=-10.0, params={"pocket_local": POCKET, "margin": 0.04, "ref": 0.02})
+    collision = RewTerm(func=ag.reward_collision, weight=-150.0)
     joint_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0, params={"asset_cfg": ARM})
     posture_box = RewTerm(
         func=rr.penalty_joint_range_box, weight=-2.4,
@@ -109,6 +115,7 @@ class RewardsCfg:
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    collision = DoneTerm(func=ag.collision, params={"pocket_local": POCKET})
     goal_reached = DoneTerm(func=ag.goal_reached, params={"pocket_local": POCKET, "pos_tol": 0.02,
                                                           "ang_tol_deg": 20.0, "speed_tol": 0.15, "hold_time": 0.3})
 

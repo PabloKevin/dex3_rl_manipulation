@@ -121,6 +121,16 @@ def reset_arm_goal(
         wp = np.load(library.replace("harvest_pose_library.npz", "basket_drop_path.npz"))
         order = [list(wp["joint_names"]).index(n) for n in names]
         env._arm_goal_drop_q = torch.tensor(wp["waypoints"][2][order], device=dev, dtype=torch.float32)
+        dist = (q - env._arm_goal_drop_q).norm(dim=-1)
+        env._arm_goal_near_drop = dist.argsort()[:200]
+        # real reach end poses (scripts/record_reach_starts.py), if recorded
+        bank = library.replace("harvest_pose_library.npz", "reach_end_poses.npz")
+        import os
+        env._arm_goal_bank = None
+        if os.path.exists(bank):
+            b = np.load(bank)
+            border = [list(b["joint_names"]).index(n) for n in names]
+            env._arm_goal_bank = torch.tensor(b["q"][:, border], device=dev, dtype=torch.float32)
     q_lib, pick_idx = env._arm_goal_lib
     n = len(env_ids)
     u = torch.rand(n, device=dev)
@@ -130,10 +140,16 @@ def reset_arm_goal(
     any_i = torch.randint(0, len(q_lib), (n,), device=dev)
     pick_i = pick_idx[torch.randint(0, len(pick_idx), (n,), device=dev)]
     q = q_lib[pick_i]
+    if env._arm_goal_bank is not None:            # where the reach really leaves the arm (70%)
+        bank_q = env._arm_goal_bank[torch.randint(0, len(env._arm_goal_bank), (n,), device=dev)]
+        q = torch.where((torch.rand(n, device=dev) < 0.7).unsqueeze(-1), bank_q, q)
     use_any = (kind == DROP) & (torch.rand(n, device=dev) < 0.3)
     q = torch.where(use_any.unsqueeze(-1), q_lib[any_i], q)
-    near_drop = env._arm_goal_drop_q + home_noise * torch.randn(n, 7, device=dev)
-    home_start = torch.where((torch.rand(n, device=dev) < 0.6).unsqueeze(-1), near_drop, q_lib[any_i])
+    # HOME starts near the drop pose: library poses (validated collision-free),
+    # not the drop configuration plus raw noise (unchecked -- some started
+    # inside the body)
+    near_i = env._arm_goal_near_drop[torch.randint(0, len(env._arm_goal_near_drop), (n,), device=dev)]
+    home_start = torch.where((torch.rand(n, device=dev) < 0.6).unsqueeze(-1), q_lib[near_i], q_lib[any_i])
     q = torch.where((kind == HOME).unsqueeze(-1), home_start, q)
     lo = robot.data.soft_joint_pos_limits[env_ids][:, env._arm_goal_jids, 0]
     hi = robot.data.soft_joint_pos_limits[env_ids][:, env._arm_goal_jids, 1]
@@ -174,9 +190,12 @@ def resolve_goals(
     body_margin: float = 0.06,
     min_from_shoulder: float = 0.22,
     apple_radius: float = 0.045,
+    basket_range: float = 0.15,
+    drop_height: tuple[float, float] = (0.10, 0.16),
 ) -> None:
     """mode="interval" (every step): on the first step of an episode, record
-    the start pocket and, for SAFE goals, the safe-zone point -- see
+    the start pocket, move the basket off the start pose if it overlaps it
+    (_clear_basket) and, for SAFE goals, set the safe-zone point -- see
     safe_zone_point."""
     G = goal_state(env)
     todo = G.pending & (env.episode_length_buf >= 1)
@@ -185,12 +204,46 @@ def resolve_goals(
     ids = todo.nonzero(as_tuple=True)[0]
     pocket, normal = pocket_and_normal(env, pocket_local)
     G.start[ids] = pocket[ids]
+    _clear_basket(env, ids, pocket_local, basket_range, drop_height)
     safe = ids[G.kind[ids] == SAFE]
     if len(safe):
         d = torch.empty(len(safe), device=env.device).uniform_(*retreat_range)
         G.target[safe] = safe_zone_point(env, safe, d, pocket_local, body_margin, min_from_shoulder, apple_radius)
         G.normal[safe] = normal[safe]
     G.pending[ids] = False
+
+
+def _clear_basket(env, ids, pocket_local, basket_range, drop_height, apple_radius: float = 0.045,
+                  margin: float = 0.03, tries: int = 20) -> None:
+    """Starts are validated against the basket at its NOMINAL place; the
+    episode's random basket (+-basket_range) can land on the arm. Redraw it
+    (analytic obstacle only, so it may move) until arm, hand and held apple
+    clear it by margin, and re-aim DROP goals at it."""
+    from . import self_collision as scm
+
+    G = goal_state(env)
+    if not hasattr(env, "_self_collision_spheres"):
+        scm.self_collision_depth(env)
+    sets = env._self_collision_spheres
+    o = env.scene.env_origins[ids].unsqueeze(1)
+    arm = scm._world_spheres(env, sets["arm"])[ids] - o
+    pocket, _ = pocket_and_normal(env, pocket_local)
+    pk = pocket[ids].unsqueeze(1) - o
+    nominal = torch.tensor(BASKET_NOMINAL, device=env.device)
+    for _ in range(tries):
+        b = G.basket[ids]
+        bad = (_basket_signed_dist(arm, b) < sets["arm"]["r"].view(1, -1) + margin).any(-1) | \
+              ((_basket_signed_dist(pk, b)[:, 0] < apple_radius + margin) & G.carry[ids])
+        if not bool(bad.any()):
+            break
+        k = bad.nonzero(as_tuple=True)[0]
+        G.basket[ids[k]] = nominal + (torch.rand(len(k), 3, device=env.device) * 2 - 1) * basket_range
+    drop = ids[G.kind[ids] == DROP]
+    if len(drop):
+        b = G.basket[drop]
+        z = b[:, 2] + torch.empty(len(drop), device=env.device).uniform_(*drop_height)
+        G.target[drop] = env.scene.env_origins[drop] + torch.stack(
+            [b[:, 0] + DROP_OFFSET_XY[0], b[:, 1] + DROP_OFFSET_XY[1], z], dim=-1)
 
 
 def safe_zone_point(env: "ManagerBasedRLEnv", ids: torch.Tensor, depth: torch.Tensor, pocket_local,
@@ -320,14 +373,49 @@ def goal_reached(env: "ManagerBasedRLEnv", pocket_local, pos_tol: float = 0.02, 
     return G.success.clone()
 
 
+def _body_overlap(env, pocket_local, apple_radius: float = 0.045) -> torch.Tensor:
+    """[N] bool: arm/hand spheres, or the held apple, actually overlapping
+    the body spheres or the stand + basket (margin 0)."""
+    from . import self_collision as scm
+
+    G = goal_state(env)
+    if not hasattr(env, "_self_collision_spheres"):
+        scm.self_collision_depth(env)
+    sets = env._self_collision_spheres
+    arm_body = scm.self_collision_depth(env, margin=0.0).amax(-1) > 0.0
+    body = scm._world_spheres(env, sets["body"])
+    pocket, _ = pocket_and_normal(env, pocket_local)
+    apple_body = (((body - pocket.unsqueeze(1)).norm(dim=-1) - sets["body"]["r"] - apple_radius).amin(-1) < 0.0) & G.carry
+    o = env.scene.env_origins.unsqueeze(1)
+    arm = scm._world_spheres(env, sets["arm"]) - o
+    arm_basket = (_basket_signed_dist(arm, G.basket) < sets["arm"]["r"].view(1, -1)).any(-1)
+    apple_basket = (_basket_signed_dist(pocket.unsqueeze(1) - o, G.basket)[:, 0] < apple_radius) & G.carry
+    return arm_body | apple_body | arm_basket | apple_basket
+
+
+def collision(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
+    """Termination: any real collision with the body or the basket ends the
+    episode (and costs reward_collision) -- on the robot it would be a mess,
+    so it must never pay to cut through, however briefly."""
+    hit = _body_overlap(env, pocket_local) & ~goal_state(env).pending
+    env._arm_goal_hit = hit
+    return hit
+
+
+def reward_collision(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    return getattr(env, "_arm_goal_hit", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)).float()
+
+
 def reward_success(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return goal_state(env).success.float()
 
 
 def penalty_path_deviation(env: "ManagerBasedRLEnv", pocket_local, deadband: float = 0.03, ref: float = 0.05) -> torch.Tensor:
     """[N] (distance of the pocket from the straight start->goal segment,
-    beyond deadband) / ref, squared: predictable, near-straight paths --
-    near the tree, where it starts, the way out is straight back."""
+    beyond deadband) / ref, squared -- SAFE goals only: the way out of the
+    fruit wall is straight back. For the basket and home the straight line
+    can run through the torso (pick -> basket behind the right shoulder),
+    and paying for it taught the first policy to cut through the body."""
     G = goal_state(env)
     pocket, _ = pocket_and_normal(env, pocket_local)
     a, b = G.start, G.target
@@ -335,7 +423,7 @@ def penalty_path_deviation(env: "ManagerBasedRLEnv", pocket_local, deadband: flo
     t = (((pocket - a) * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-6)).clamp(0.0, 1.0)
     dev = (pocket - (a + t.unsqueeze(-1) * ab)).norm(dim=-1)
     # capped: a wild early policy would otherwise pay more here than everything else together
-    return ((((dev - deadband).clamp(min=0.0) / ref) ** 2).clamp(max=4.0)) * (~G.pending).float()
+    return ((((dev - deadband).clamp(min=0.0) / ref) ** 2).clamp(max=4.0)) * ((~G.pending) & (G.kind == SAFE)).float()
 
 
 def penalty_near_goal_speed(env: "ManagerBasedRLEnv", pocket_local, dist: float = 0.10) -> torch.Tensor:
