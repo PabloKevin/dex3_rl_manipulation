@@ -94,6 +94,22 @@ p.add_argument("--home_speed", type=float, default=1.2, help="peak joint-space s
 p.add_argument("--move_speed", type=float, default=1.9,
                help="peak joint speed (rad/s) on the basket path (the arm's rate limiter caps at 2.0)")
 p.add_argument("--drop_speed", type=float, default=1.0, help="peak joint speed (rad/s) for the last descent to the drop pose")
+p.add_argument("--grip_level", type=float, default=0.45,
+               help="grip-force command for the grasp policy (its target_grip_level input), as a fraction of that "
+                    "apple's bruising threshold; training samples it at random, the bench sets it")
+p.add_argument("--grip_step", type=float, default=0.15, help="added to --grip_level on every retry of the same apple")
+p.add_argument("--grip_max", type=float, default=0.75, help="cap on the grip-force command (fraction of the threshold)")
+p.add_argument("--path", type=str, default="policy", choices=["policy", "scripted"],
+               help="after the twist: 'policy' = pull back, then the goal-reaching arm policy (AppleArmGoal-v1) to the "
+                    "safe zone, the basket and home (falls back to 'scripted' if none is trained); 'scripted' = the "
+                    "reach path reversed to home, the planned basket path, the same path back")
+p.add_argument("--goal_policy", type=str, default="last",
+               help="'last' = newest AppleArmGoal-v1 checkpoint (exported on the fly), or a model_*.pt / exported .pt")
+p.add_argument("--pull", type=float, default=0.05, help="(policy path) straight pull back after the twist, m")
+p.add_argument("--pull_s", type=float, default=0.6, help="(policy path) seconds for the pull")
+p.add_argument("--safe_depth", type=float, default=0.18,
+               help="(policy path) safe zone: up to this far straight back from the pick, clamped clear of the body")
+p.add_argument("--goal_timeout", type=float, default=5.0, help="(policy path) seconds per goal before moving on anyway")
 p.add_argument("--max_attempts", type=int, default=3,
                help="attempts per apple: a grasp that fails with the fruit still on its stem is retried")
 p.add_argument("--release_s", type=float, default=1.5)
@@ -305,8 +321,9 @@ _order = [RIGHT_ARM_JOINTS.index(robot.joint_names[j]) for j in arm_ids]
 basket_wps = torch.tensor(_bp["waypoints"], device=dev, dtype=torch.float32)[:, _order]   # home, ..., drop
 hand_open = robot.data.default_joint_pos[:, hand._joint_ids]
 
-GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE = range(8)
-PHASE = {GRASP: "grasp", TWIST: "twist", HOME: "home", BASKET: "basket", RELEASE: "release",
+GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE, PULL, GOAL = range(10)
+G_SAFE, G_DROP, G_HOME = 0, 1, 2
+PHASE = {GRASP: "grasp", TWIST: "twist", HOME: "home", BASKET: "basket", RELEASE: "release", PULL: "pull", GOAL: "goal",
          RETURN: "return", NEXT: "next", TREE_DONE: "done"}
 fmt = lambda x, s="{:.2f}": "-" if x != x else s.format(x)
 _cm = lambda x: "free" if x != x else f"{x * 100:4.1f}"
@@ -336,6 +353,42 @@ def neighbours_on_tree():
     hanging = (tr.status == at.WAITING) & (occ > 0) & ~torch.gather(broken, 1, occ)
     return hanging, (p_spot - tr.spot_pos).norm(dim=-1)
 
+
+# ── goal-reaching arm policy for the harvest path (AppleArmGoal-v1) ──
+PATH_POLICY = False
+if args.path == "policy":
+    import importlib.util
+    from envs.mdp import arm_goal as ag
+    from envs.mdp.observations import joint_pos_selected, joint_vel_selected
+    _sp = importlib.util.spec_from_file_location("export_policy_jit", os.path.join(REPO, "scripts", "export_policy_jit.py"))
+    _ex = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(_ex)
+    spec = args.goal_policy
+    if spec == "last":
+        runs = [d for d in glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_arm_goal/20*/"))
+                if not any(w in d for w in ("validate", "smoke"))]
+        ckpts = [c for d in runs for c in glob.glob(os.path.join(d, "model_*.pt"))]
+        spec = max(ckpts, key=lambda c: (os.path.getmtime(os.path.dirname(c)), int(c.rsplit("_", 1)[1][:-3]))) \
+            if ckpts else None
+    if spec is None:
+        print("[tree bench] no AppleArmGoal-v1 policy trained yet -> scripted harvest path", flush=True)
+    else:
+        goal_path = _ex.export(spec) if os.path.basename(spec).startswith("model_") else spec
+        _goal_jit = torch.jit.load(goal_path, map_location=dev).eval()
+        PATH_POLICY = True
+        G = ag.goal_state(env)
+        G.basket[:] = torch.tensor(ag.BASKET_NOMINAL, device=dev)       # the bench's basket (basket.py)
+        G.pending[:] = False
+        G.mass[:] = 0.0                                                  # the real fruit is in the hand here
+        _goal_arm_cfg = SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS, preserve_order=True)
+        _goal_arm_cfg.resolve(env.scene)
+        _goal_prev = torch.zeros(N, arm_dim, device=dev)
+        _arm_default = robot.data.default_joint_pos[:, arm_ids]
+        _POCKET = tuple(GRASP_CENTER_LOCAL)
+
+        def goal_obs():
+            return torch.cat([joint_pos_selected(env, _goal_arm_cfg), joint_vel_selected(env, _goal_arm_cfg),
+                              ag.obs_goal_pocket(env, _POCKET), ag.obs_goal_normal(env, _POCKET),
+                              ag.obs_basket(env, _POCKET), ag.obs_carrying(env), _goal_prev], dim=-1)
 
 _sph = scm._build(env)["arm"]
 _sph_keep = torch.tensor([robot.data.body_names[int(b)] not in ("right_shoulder_yaw_link", "right_elbow_link")
@@ -390,6 +443,8 @@ def new_apple(ids):
         S["drop_phase"][i], S["not_ready"][i], S["in_basket"][i] = "", "", None
         S["tw_sign"][i], S["tw_clear"][i] = 1.0, (float("nan"), float("nan"))
         S["pending_home"][i] = False
+        S["goal_timeouts"][i] = 0
+        S["hand_hold_open"][i] = False
         S["row_done"][i] = False
         S["home_tries"][i] = 0
         for k in ("t_ready", "twist_at_break"):
@@ -406,6 +461,13 @@ def new_apple(ids):
             S["spot"][i] = T().current_spot(i)
     ready_det.reset(torch.tensor(ids, device=dev))
     sc_state["started"][ids] = False
+    # The grip-force command (the grasp policy's target_grip_level input):
+    # the reset just drew it at random, as in training; here it is set, and a
+    # retry grips harder. Same fraction of this apple's bruising threshold.
+    if hasattr(env, "_target_grip_level"):
+        for i in ids:
+            frac = min(args.grip_level + args.grip_step * (S["attempt"][i] - 1), args.grip_max)
+            env._target_grip_level[i] = frac * env._fruit_damage_force[i]
 
 
 def new_trees():
@@ -424,6 +486,8 @@ def new_trees():
         max_self=torch.zeros(N, device=dev), max_push=torch.zeros(N, device=dev),
         drop_phase=[""] * N, not_ready=[""] * N, in_basket=[None] * N, hanging0=[None] * N, spot=[0] * N,
         tw_sign=torch.ones(N, device=dev), tw_clear=[(float("nan"), float("nan"))] * N, pending_home=[False] * N, row_done=[False] * N, home_tries=[0] * N, retry=[False] * N, attempt=[1] * N,
+        goal_k=torch.zeros(N, dtype=torch.long, device=dev), goal_timeouts=[0] * N, hand_hold_open=[False] * N,
+        pull_p0=torch.zeros(N, 3, device=dev), pull_q0=torch.zeros(N, 4, device=dev), pull_dir=torch.zeros(N, 3, device=dev),
         rows=[[] for _ in range(N)], knocked={i: {} for i in range(N)}, reported=[False] * N,
     )
     if hasattr(env, "_tree"):                      # (created by the first reset, which grows new trees anyway)
@@ -484,6 +548,53 @@ def start_home(i):
     S["home_k"][i] = 0
     S["state"][i] = HOME
     S["t"][i] = 0.0
+
+
+def start_pull(i):
+    """Straight back along the way the hand came in, orientation kept."""
+    pq = robot.data.body_quat_w[i:i + 1, palm_id]
+    n = quat_apply(pq, torch.tensor([[0.0, 1.0, 0.0]], device=dev))[0]
+    back = -n.clone(); back[2] = 0.0
+    back = back / back.norm() if float(back.norm()) > 0.3 else torch.tensor([-1.0, 0.0, 0.0], device=dev)
+    S["pull_p0"][i] = robot.data.body_pos_w[i, palm_id]
+    S["pull_q0"][i] = pq[0]
+    S["pull_dir"][i] = back
+    S["state"][i] = PULL
+    S["t"][i] = 0.0
+
+
+def start_goal(i, k):
+    """Hand the arm to the goal policy, goal k (safe zone / drop / home)."""
+    G = ag.goal_state(env)
+    ii = torch.tensor([i], device=dev)
+    pocket, normal = ag.pocket_and_normal(env, _POCKET)
+    holding = not S["drop_phase"][i] and S["hand_hold_open"][i] is False
+    if k == G_SAFE:
+        G.target[i] = ag.safe_zone_point(env, ii, torch.tensor([args.safe_depth], device=dev), _POCKET)[0]
+        G.normal[i] = normal[i]
+    elif k == G_DROP:
+        b = G.basket[i]
+        G.target[i] = env.scene.env_origins[i] + torch.stack([b[0] + ag.DROP_OFFSET_XY[0], b[1] + ag.DROP_OFFSET_XY[1],
+                                                              b[2] + 0.13])
+        dn = torch.tensor(ag.DROP_NORMAL, device=dev)
+        G.normal[i] = dn / dn.norm()
+    else:
+        G.target[i] = env.scene.env_origins[i] + torch.tensor(ag.HOME_POCKET, device=dev)
+        G.normal[i] = torch.tensor(ag.HOME_NORMAL, device=dev)
+    G.carry[i] = holding and k != G_HOME
+    G.start[i] = pocket[i]
+    S["goal_k"][i] = k
+    S["state"][i] = GOAL
+    S["t"][i] = 0.0
+
+
+def goal_done(i):
+    G = ag.goal_state(env)
+    pocket, normal = ag.pocket_and_normal(env, _POCKET)
+    d = float((G.target[i] - pocket[i]).norm())
+    ang = math.degrees(math.acos(max(-1.0, min(1.0, float((G.normal[i] * normal[i]).sum())))))
+    v = float(robot.data.body_lin_vel_w[i, palm_id].norm())
+    return d < 0.03 and ang < 25.0 and v < 0.2
 
 
 def finish_apple(i):
@@ -549,7 +660,8 @@ def record_row(i):
         slip=float(S["max_slip"][i]), f=float(S["max_f"][i]), f_reach=float(S["max_f_reach"][i]), thr=float(dmg), self=float(S["max_self"][i]),
         push=float(S["max_push"][i]), knocked=len(knocked), out=out, not_ready=S["not_ready"][i],
         tw=("+" if S["tw_sign"][i] > 0 else "-") if not math.isnan(S["tw_clear"][i][0]) else " ",
-        tw_clear=S["tw_clear"][i], attempts=S["attempt"][i]))
+        tw_clear=S["tw_clear"][i], attempts=S["attempt"][i], goal_to=S["goal_timeouts"][i],
+        grip=float(env._target_grip_level[i]) if hasattr(env, "_target_grip_level") else float("nan")))
 
 
 def report_tree(i):
@@ -567,7 +679,9 @@ def report_tree(i):
               f"{fmt(row['ready']):>6s}  {'broke' if row['broke'] else 'intact':6s} {row['cause']:5s} "
               f"{fmt(row['twist'], '{:.0f}deg'):>7s}  {row['tw']}  ({_cm(row['tw_clear'][0])}/{_cm(row['tw_clear'][1])})  {row['slip'] * 100:4.1f}cm {row['f']:5.1f} N ({row['thr']:4.1f})  {row['f_reach']:6.1f} N    "
               f"  {row['self'] * 1000:5.0f}   {row['push'] * 100:5.1f}   {row['knocked']:3d}     -> {row['out']}"
-              + (f"  [attempt {row['attempts']}]" if row['attempts'] > 1 else ""))
+              + (f"  [attempt {row['attempts']}, grip command {row['grip']:.0f} N]" if row['attempts'] > 1 else
+                 f"  [grip command {row['grip']:.0f} N]")
+              + (f"  [goal timeouts {row['goal_to']}]" if row.get('goal_to') else ""))
     for s, by in sorted(S["knocked"][i].items()):
         print(f"      spot {s:2d}: KNOCKED OFF while picking #{by}")
     rows = S["rows"][i]
@@ -658,6 +772,19 @@ while app.is_running():
                                    for i in range(N)])
             q_ik = ik.step(pose_p, pose_q, base=arm._processed_actions, max_dq=0.05, null_target=q_ready, null_gain=0.2)
             q_cmd = torch.where(tw.unsqueeze(-1), q_ik, q_cmd)
+        pl = st == PULL
+        if bool(pl.any()):
+            frac = hv.smoothstep(S["t"] / args.pull_s).unsqueeze(-1)
+            pose_p = S["pull_p0"] + S["pull_dir"] * args.pull * frac
+            q_ik = ik.step(pose_p, S["pull_q0"], base=arm._processed_actions, max_dq=0.05,
+                           null_target=arm._processed_actions, null_gain=0.0)
+            q_cmd = torch.where(pl.unsqueeze(-1), q_ik, q_cmd)
+        gl = st == GOAL
+        if PATH_POLICY and bool(gl.any()):
+            raw = _goal_jit(goal_obs())
+            q_goal = torch.clamp(_arm_default + 0.5 * raw, -3.0, 3.0)        # the reach action's scale and clip
+            q_cmd = torch.where(gl.unsqueeze(-1), q_goal, q_cmd)
+            _goal_prev[gl] = raw[gl]
         mv = (st == BASKET) | (st == RETURN)
         if bool(mv.any()):
             f = hv.smoothstep(S["t"] / S["seg_T"]).unsqueeze(-1)
@@ -672,7 +799,8 @@ while app.is_running():
         h = st != GRASP
         a[h, :arm_dim] = ((q_cmd - arm._anchor) / arm._scale)[h]
         if FINGERS_POLICY:                                    # the policy keeps the fingers while the fruit is carried
-            h_frozen = h & ~((st == TWIST) | (st == HOME) | (st == BASKET))
+            carried = (st == TWIST) | (st == PULL) | (st == HOME) | (st == BASKET) | ((st == GOAL) & (S["goal_k"] != G_HOME))
+            h_frozen = h & ~carried
         else:
             h_frozen = h
         a[h_frozen, arm_dim:] = ((S["hand_hold"] - hand._grasp_offset) / hand._scale)[h_frozen]
@@ -691,7 +819,7 @@ while app.is_running():
 
         # ── bookkeeping ──
         S["t"] = S["t"] + dt * (st != GRASP).float()
-        carrying = (st == TWIST) | (st == HOME) | (st == BASKET)
+        carrying = (st == TWIST) | (st == PULL) | (st == HOME) | (st == BASKET) | ((st == GOAL) & (S["goal_k"] != G_HOME))
         live = carrying & torch.tensor([not d for d in S["drop_phase"]], device=dev)
         slip = (fruit_in_palm() - S["fruit0"]).norm(dim=-1)
         S["max_slip"] = torch.where(live, torch.maximum(S["max_slip"], slip), S["max_slip"])
@@ -710,8 +838,15 @@ while app.is_running():
         newly = stem.broken & torch.isnan(S["twist_at_break"]) & (st != GRASP)
         S["twist_at_break"] = torch.where(newly, stem.twist_deg.abs(), S["twist_at_break"])
         for i in (live & (fruit_to_hand() > args.leave_margin)).nonzero(as_tuple=True)[0].tolist():
-            S["drop_phase"][i] = PHASE[int(st[i])]
-            if st[i] == TWIST:
+            S["drop_phase"][i] = PHASE[int(st[i])] if st[i] != GOAL else ("to safe zone" if S["goal_k"][i] == G_SAFE else "to basket")
+            if PATH_POLICY:
+                if st[i] in (TWIST, PULL):
+                    start_goal(i, G_SAFE)         # empty hand: still out of the wall first, then home
+                elif st[i] == GOAL and S["goal_k"][i] == G_DROP:
+                    start_goal(i, G_HOME)
+                elif st[i] == GOAL:
+                    ag.goal_state(env).carry[i] = False
+            elif st[i] == TWIST:
                 start_home(i)                     # straight home from wherever the twist got to
             elif st[i] == BASKET:
                 go_back_from_basket(i)
@@ -720,7 +855,22 @@ while app.is_running():
         for i in ((st != GRASP) & busy).nonzero(as_tuple=True)[0].tolist():
             s_i, t_i = int(st[i]), float(S["t"][i])
             if s_i == TWIST and (t_i >= args.twist_s or (bool(stem.broken[i]) and t_i >= 0.1)):
-                start_home(i)
+                start_pull(i) if PATH_POLICY else start_home(i)
+            elif s_i == PULL and t_i >= args.pull_s + 0.1:
+                start_goal(i, G_SAFE)
+            elif s_i == GOAL and (goal_done(i) or t_i >= args.goal_timeout):
+                if t_i >= args.goal_timeout:
+                    S["goal_timeouts"][i] += 1
+                k = int(S["goal_k"][i])
+                if k == G_SAFE:
+                    start_goal(i, G_DROP if not S["drop_phase"][i] and bool(stem.broken[i]) else G_HOME)
+                elif k == G_DROP:
+                    S["q_to"][i] = arm._processed_actions[i].clone()
+                    S["hand_hold"][i] = hand_open[i]
+                    S["hand_hold_open"][i] = True
+                    st[i] = RELEASE; S["t"][i] = 0.0
+                else:
+                    finish_apple(i)
             elif s_i == HOME and S["home_k"][i] >= len(S["home"][i]) + int(0.3 / dt):
                 if S["drop_phase"][i] or not bool(stem.broken[i]):
                     finish_apple(i)
@@ -739,8 +889,11 @@ while app.is_running():
                 rad = env._apple_radius[i:i + 1]
                 S["in_basket"][i] = bool(bk.apple_in_basket(
                     apple.data.root_pos_w[i:i + 1] - env.scene.env_origins[i:i + 1], rad)[0])
-                S["state"][i] = RETURN
-                start_chain(i, [S["q_to"][i].clone()] + list(basket_wps.flip(0)[1:]))
+                if PATH_POLICY:
+                    start_goal(i, G_HOME)
+                else:
+                    S["state"][i] = RETURN
+                    start_chain(i, [S["q_to"][i].clone()] + list(basket_wps.flip(0)[1:]))
 
         if step % 250 == 0:
             from collections import Counter

@@ -199,3 +199,11 @@ class AppleGraspTreePPORunnerCfg(AppleGraspGraspPPORunnerCfg):
     """AppleGraspTree-v1: the grasp recipe on the multi-apple tree with the
     hold-under-load stage. Own log folder (logs/rsl_rl/apple_grasp_tree)."""
     experiment_name = "apple_grasp_tree"
+
+
+@configclass
+class AppleArmGoalPPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleArmGoal-v1 (harvest-path goal reaching): the reach network size,
+    512 envs x 32 steps per iteration. Own log folder (logs/rsl_rl/apple_arm_goal)."""
+    experiment_name = "apple_arm_goal"
+    num_steps_per_env = 32

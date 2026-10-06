@@ -30,12 +30,17 @@ from .apple_grasp_tree_train_env_cfg import (
     AppleGraspTreeTrainEnvCfg,
     AppleGraspTreeTrainEnvCfg_PLAY,
 )
+from .apple_arm_goal_env_cfg import (
+    AppleArmGoalEnvCfg,
+    AppleArmGoalEnvCfg_PLAY,
+)
 from .agents.rsl_rl_ppo_cfg import (
     AppleGraspPPORunnerCfg,
     AppleGraspGraspPPORunnerCfg,
     AppleGraspHarvestPPORunnerCfg,
     AppleReachTreePPORunnerCfg,
     AppleGraspTreePPORunnerCfg,
+    AppleArmGoalPPORunnerCfg,
 )
 
 gym.register(
@@ -143,6 +148,27 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleGraspTreeTrainEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleGraspTreePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Goal-reaching arm policy for the harvest path (safe zone -> basket -> home).
+gym.register(
+    id="AppleArmGoal-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleArmGoalEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleArmGoalPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleArmGoal-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleArmGoalEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleArmGoalPPORunnerCfg,
     },
     disable_env_checker=True,
 )
