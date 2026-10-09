@@ -90,6 +90,13 @@ p.add_argument("--grasp_timeout", type=float, default=5.0,
                help="seconds after the hand-off; a grasp not READY by then is harvested anyway ('timeout-ready')")
 p.add_argument("--twist_deg", type=float, default=90.0)
 p.add_argument("--twist_s", type=float, default=1.5)
+p.add_argument("--twist_arm_weight", type=float, default=0.1,
+               help="share of the twist's IK motion for shoulder/elbow (wrist = 1): wrist-first twisting")
+p.add_argument("--twist_body_margin", type=float, default=0.04,
+               help="stop the twist when an arm/hand sphere comes this close to the body (the training danger zone)")
+p.add_argument("--twist_fruit_margin", type=float, default=0.0,
+               help="stop the twist when a hand/wrist sphere comes this close to a neighbour (where it hung when "
+                    "the twist began -- what the robot's vision gives it)")
 p.add_argument("--home_speed", type=float, default=1.2, help="peak joint-space speed (rad/s) going home")
 p.add_argument("--move_speed", type=float, default=1.9,
                help="peak joint speed (rad/s) on the basket path (the arm's rate limiter caps at 2.0)")
@@ -374,6 +381,7 @@ if args.path == "policy":
     else:
         goal_path = _ex.export(spec) if os.path.basename(spec).startswith("model_") else spec
         _goal_jit = torch.jit.load(goal_path, map_location=dev).eval()
+        _goal_dim = _ex.input_dim(goal_path)                   # 31: palm normal only; 34: + finger direction
         PATH_POLICY = True
         G = ag.goal_state(env)
         G.basket[:] = torch.tensor(ag.BASKET_NOMINAL, device=dev)       # the bench's basket (basket.py)
@@ -388,8 +396,16 @@ if args.path == "policy":
         def goal_obs():
             return torch.cat([joint_pos_selected(env, _goal_arm_cfg), joint_vel_selected(env, _goal_arm_cfg),
                               ag.obs_goal_pocket(env, _POCKET), ag.obs_goal_normal(env, _POCKET),
-                              ag.obs_basket(env, _POCKET), ag.obs_carrying(env), _goal_prev], dim=-1)
+                              ag.obs_basket(env, _POCKET), ag.obs_carrying(env), _goal_prev]
+                             + ([ag.obs_goal_finger(env)] if _goal_dim == 34 else []), dim=-1)
 
+# Wrist-first twist: shoulder and elbow get a small share of the IK motion.
+# Rotating the palm about its normal is often not a pure wrist motion, and
+# equal weights swung the shoulder/elbow -- once through the torso. Where
+# the wrist runs out of range the twist simply stops short.
+_twist_w = torch.tensor([args.twist_arm_weight if robot.joint_names[j] in
+                         ("right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+                          "right_elbow_joint") else 1.0 for j in arm_ids], device=dev)
 _sph = scm._build(env)["arm"]
 _sph_keep = torch.tensor([robot.data.body_names[int(b)] not in ("right_shoulder_yaw_link", "right_elbow_link")
                           for b in _sph["ids"]], device=dev)     # hand + wrist: what the twist swings round
@@ -443,6 +459,7 @@ def new_apple(ids):
         S["drop_phase"][i], S["not_ready"][i], S["in_basket"][i] = "", "", None
         S["tw_sign"][i], S["tw_clear"][i] = 1.0, (float("nan"), float("nan"))
         S["pending_home"][i] = False
+        S["twist_stop"][i], S["twist_stop_why"][i], S["twist_fruit"][i], S["twist_base"][i] = False, "", None, None
         S["goal_timeouts"][i] = 0
         S["hand_hold_open"][i] = False
         S["row_done"][i] = False
@@ -486,6 +503,7 @@ def new_trees():
         max_self=torch.zeros(N, device=dev), max_push=torch.zeros(N, device=dev),
         drop_phase=[""] * N, not_ready=[""] * N, in_basket=[None] * N, hanging0=[None] * N, spot=[0] * N,
         tw_sign=torch.ones(N, device=dev), tw_clear=[(float("nan"), float("nan"))] * N, pending_home=[False] * N, row_done=[False] * N, home_tries=[0] * N, retry=[False] * N, attempt=[1] * N,
+        twist_stop=[False] * N, twist_stop_why=[""] * N, twist_fruit=[None] * N, twist_base=[None] * N,
         goal_k=torch.zeros(N, dtype=torch.long, device=dev), goal_timeouts=[0] * N, hand_hold_open=[False] * N,
         pull_p0=torch.zeros(N, 3, device=dev), pull_q0=torch.zeros(N, 4, device=dev), pull_dir=torch.zeros(N, 3, device=dev),
         rows=[[] for _ in range(N)], knocked={i: {} for i in range(N)}, reported=[False] * N,
@@ -550,6 +568,43 @@ def start_home(i):
     S["t"][i] = 0.0
 
 
+_last_danger = ""
+
+
+def twist_danger(i, worse=0.005):
+    """True when the twist should stop because it is making things WORSE:
+    an arm/hand sphere going deeper into the body's danger zone (FK + the
+    self-collision sphere model, as the arm goal policy is trained), or a
+    hand/wrist sphere pressing further into a neighbour (where it hung when
+    the twist began), by more than `worse` m beyond the twist's start -- in a
+    cluster the (slightly inflated) spheres often touch at the start already."""
+    global _last_danger
+    body = float(self_collision_depth(env, margin=args.twist_body_margin)[i].amax())
+    if S["twist_fruit"][i] is None:
+        hanging, _ = neighbours_on_tree()
+        ent = T().occupant[i][hanging[i]]
+        S["twist_fruit"][i] = torch.stack([T().objs[int(e)].data.root_pos_w[i] for e in ent]) if len(ent) else \
+            torch.zeros(0, 3, device=dev)
+        S["twist_base"][i] = (body, None)
+    q = S["twist_fruit"][i]
+    fruit = 0.0
+    if len(q):
+        c = scm._world_spheres(env, _sph)[i][_sph_keep]
+        gap = (c.unsqueeze(1) - q.unsqueeze(0)).norm(dim=-1) - _sph["r"][_sph_keep].unsqueeze(1) - float(env._apple_radius[i])
+        fruit = float((args.twist_fruit_margin - gap).clamp(min=0.0).max())
+    b0, f0 = S["twist_base"][i]
+    if f0 is None:
+        S["twist_base"][i] = (b0, fruit)
+        f0 = fruit
+    if body > b0 + worse:
+        _last_danger = "body"
+        return True
+    if fruit > f0 + worse:
+        _last_danger = "neighbour"
+        return True
+    return False
+
+
 def start_pull(i):
     """Straight back along the way the hand came in, orientation kept."""
     pq = robot.data.body_quat_w[i:i + 1, palm_id]
@@ -572,15 +627,18 @@ def start_goal(i, k):
     if k == G_SAFE:
         G.target[i] = ag.safe_zone_point(env, ii, torch.tensor([args.safe_depth], device=dev), _POCKET)[0]
         G.normal[i] = normal[i]
+        G.finger[i] = ag.palm_finger(env)[i]
     elif k == G_DROP:
         b = G.basket[i]
         G.target[i] = env.scene.env_origins[i] + torch.stack([b[0] + ag.DROP_OFFSET_XY[0], b[1] + ag.DROP_OFFSET_XY[1],
                                                               b[2] + 0.13])
         dn = torch.tensor(ag.DROP_NORMAL, device=dev)
         G.normal[i] = dn / dn.norm()
+        G.finger[i] = torch.tensor(ag.DROP_FINGER, device=dev)
     else:
         G.target[i] = env.scene.env_origins[i] + torch.tensor(ag.HOME_POCKET, device=dev)
         G.normal[i] = torch.tensor(ag.HOME_NORMAL, device=dev)
+        G.finger[i] = torch.tensor(ag.HOME_FINGER, device=dev)
     G.carry[i] = holding and k != G_HOME
     G.start[i] = pocket[i]
     S["goal_k"][i] = k
@@ -661,6 +719,7 @@ def record_row(i):
         push=float(S["max_push"][i]), knocked=len(knocked), out=out, not_ready=S["not_ready"][i],
         tw=("+" if S["tw_sign"][i] > 0 else "-") if not math.isnan(S["tw_clear"][i][0]) else " ",
         tw_clear=S["tw_clear"][i], attempts=S["attempt"][i], goal_to=S["goal_timeouts"][i],
+        tw_stop=S["twist_stop_why"][i],
         grip=float(env._target_grip_level[i]) if hasattr(env, "_target_grip_level") else float("nan")))
 
 
@@ -681,7 +740,8 @@ def report_tree(i):
               f"  {row['self'] * 1000:5.0f}   {row['push'] * 100:5.1f}   {row['knocked']:3d}     -> {row['out']}"
               + (f"  [attempt {row['attempts']}, grip command {row['grip']:.0f} N]" if row['attempts'] > 1 else
                  f"  [grip command {row['grip']:.0f} N]")
-              + (f"  [goal timeouts {row['goal_to']}]" if row.get('goal_to') else ""))
+              + (f"  [goal timeouts {row['goal_to']}]" if row.get('goal_to') else "")
+              + (f"  [twist stopped: {row['tw_stop']}]" if row.get('tw_stop') else ""))
     for s, by in sorted(S["knocked"][i].items()):
         print(f"      spot {s:2d}: KNOCKED OFF while picking #{by}")
     rows = S["rows"][i]
@@ -770,7 +830,8 @@ while app.is_running():
                                                   twist_rad * frac * S["tw_sign"])
             q_ready = torch.stack([S["q_ready"][i] if S["q_ready"][i] is not None else arm._processed_actions[i]
                                    for i in range(N)])
-            q_ik = ik.step(pose_p, pose_q, base=arm._processed_actions, max_dq=0.05, null_target=q_ready, null_gain=0.2)
+            q_ik = ik.step(pose_p, pose_q, base=arm._processed_actions, max_dq=0.05, null_target=q_ready, null_gain=0.2,
+                           weights=_twist_w)
             q_cmd = torch.where(tw.unsqueeze(-1), q_ik, q_cmd)
         pl = st == PULL
         if bool(pl.any()):
@@ -854,7 +915,11 @@ while app.is_running():
         # ── transitions ──
         for i in ((st != GRASP) & busy).nonzero(as_tuple=True)[0].tolist():
             s_i, t_i = int(st[i]), float(S["t"][i])
-            if s_i == TWIST and (t_i >= args.twist_s or (bool(stem.broken[i]) and t_i >= 0.1)):
+            if s_i == TWIST and not S["twist_stop"][i] and twist_danger(i):
+                S["twist_stop"][i] = True                 # into the body's danger zone / onto a neighbour
+                S["twist_stop_why"][i] = _last_danger
+                start_pull(i) if PATH_POLICY else start_home(i)
+            elif s_i == TWIST and (t_i >= args.twist_s or (bool(stem.broken[i]) and t_i >= 0.1)):
                 start_pull(i) if PATH_POLICY else start_home(i)
             elif s_i == PULL and t_i >= args.pull_s + 0.1:
                 start_goal(i, G_SAFE)

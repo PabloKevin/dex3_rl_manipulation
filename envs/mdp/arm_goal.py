@@ -45,6 +45,27 @@ SAFE, DROP, HOME = 0, 1, 2
 HOME_POCKET = (0.262, -0.095, 0.719)
 HOME_NORMAL = (0.0, 1.0, 0.0)
 DROP_NORMAL = (0.187, -0.254, -0.949)       # palm (nearly) down at the planned drop pose
+#: Full palm orientations (w, x, y, z) at home and at the planned drop pose:
+#: the goal also fixes where the FINGERS point (palm-local +x), not only the
+#: palm normal (+y). With the normal alone the finger direction was free and
+#: the first policies came home with the fingers pointing at the ground.
+HOME_QUAT = (0.9552, -0.0001, 0.2959, 0.0001)
+DROP_QUAT = (0.5011, -0.5498, 0.3491, -0.5699)
+
+
+def _axis(q, a):
+    """Rotate unit axis a by quaternion q (w, x, y, z), plain floats."""
+    w, x, y, z = q
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    R = [[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+         [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]]
+    return tuple(sum(R[i][j] * a[j] for j in range(3)) for i in range(3))
+
+
+HOME_FINGER = _axis(HOME_QUAT, (1.0, 0.0, 0.0))
+DROP_FINGER = _axis(DROP_QUAT, (1.0, 0.0, 0.0))
 DROP_OFFSET_XY = (-0.019, 0.006)            # pocket vs basket axis at that pose
 BASKET_NOMINAL = (-0.05, -0.50, 0.81)       # basket axis x, y and rim height (basket.py)
 
@@ -54,6 +75,7 @@ class _Goal:
         N, d = env.num_envs, env.device
         z3 = lambda: torch.zeros(N, 3, device=d)
         self.target, self.normal, self.start, self.basket = z3(), z3(), z3(), z3()
+        self.finger = z3()                   # goal finger direction (palm-local +x)
         self.kind = torch.zeros(N, dtype=torch.long, device=d)
         self.carry = torch.zeros(N, dtype=torch.bool, device=d)
         self.mass = torch.zeros(N, device=d)
@@ -73,6 +95,12 @@ def _ids(env, name):
     if name not in cache:
         cache[name] = env.scene["robot"].data.body_names.index(name)
     return cache[name]
+
+
+def palm_finger(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """World finger direction (palm-local +x) [N, 3]."""
+    q = env.scene["robot"].data.body_quat_w[:, _ids(env, PALM)]
+    return quat_apply(q, torch.tensor([1.0, 0.0, 0.0], device=env.device).expand(env.num_envs, 3))
 
 
 def pocket_and_normal(env: "ManagerBasedRLEnv", pocket_local) -> tuple[torch.Tensor, torch.Tensor]:
@@ -175,6 +203,8 @@ def reset_arm_goal(
     home = torch.tensor(HOME_POCKET, device=dev).expand(n, 3)
     G.target[env_ids] = origin + torch.where((kind == DROP).unsqueeze(-1), drop, home)
     dn = torch.tensor(DROP_NORMAL, device=dev); dn = dn / dn.norm()
+    G.finger[env_ids] = torch.where((kind == DROP).unsqueeze(-1), torch.tensor(DROP_FINGER, device=dev).expand(n, 3),
+                                    torch.tensor(HOME_FINGER, device=dev).expand(n, 3))
     G.normal[env_ids] = torch.where((kind == DROP).unsqueeze(-1), dn.expand(n, 3),
                                     torch.tensor(HOME_NORMAL, device=dev).expand(n, 3))
     G.pending[env_ids] = True              # start (and the SAFE goal) set on the first step
@@ -210,6 +240,7 @@ def resolve_goals(
         d = torch.empty(len(safe), device=env.device).uniform_(*retreat_range)
         G.target[safe] = safe_zone_point(env, safe, d, pocket_local, body_margin, min_from_shoulder, apple_radius)
         G.normal[safe] = normal[safe]
+        G.finger[safe] = palm_finger(env)[safe]
     G.pending[ids] = False
 
 
@@ -314,6 +345,15 @@ def obs_goal_pocket(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
     return _to_torso(env, tgt - pocket)
 
 
+def obs_goal_finger(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[N, 3] goal finger direction in the PALM frame (1, 0, 0 = there)."""
+    G = goal_state(env)
+    cur = palm_finger(env)
+    tgt = torch.where(G.pending.unsqueeze(-1), cur, G.finger)
+    q = env.scene["robot"].data.body_quat_w[:, _ids(env, PALM)]
+    return quat_apply_inverse(q, tgt)
+
+
 def obs_goal_normal(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
     """[N, 3] goal palm-normal direction in the PALM frame (0, 1, 0 = there)."""
     G = goal_state(env)
@@ -360,14 +400,30 @@ def reward_goal_normal(env: "ManagerBasedRLEnv", pocket_local, std_rad: float, g
     return r * live.float()
 
 
+def finger_error(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[N] angle (rad) between the finger direction and the goal's."""
+    G = goal_state(env)
+    return torch.acos((G.finger * palm_finger(env)).sum(-1).clamp(-1.0, 1.0))
+
+
+def reward_goal_finger(env: "ManagerBasedRLEnv", pocket_local, std_rad: float, gate: float | None = None) -> torch.Tensor:
+    d, _, live = _errors(env, pocket_local)
+    r = torch.exp(-0.5 * (finger_error(env) / std_rad) ** 2)
+    if gate is not None:
+        r = r * torch.exp(-0.5 * (d / gate) ** 2)
+    return r * live.float()
+
+
 def goal_reached(env: "ManagerBasedRLEnv", pocket_local, pos_tol: float = 0.02, ang_tol_deg: float = 20.0,
-                 speed_tol: float = 0.15, hold_time: float = 0.3) -> torch.Tensor:
+                 speed_tol: float = 0.15, hold_time: float = 0.3, finger_tol_deg: float = 30.0) -> torch.Tensor:
     """Termination (and cached for reward_success): pocket within pos_tol,
-    normal within ang_tol, palm slower than speed_tol, held hold_time."""
+    normal within ang_tol, fingers within finger_tol, palm slower than
+    speed_tol, held hold_time."""
     G = goal_state(env)
     d, ang, live = _errors(env, pocket_local)
     v = env.scene["robot"].data.body_lin_vel_w[:, _ids(env, PALM)].norm(dim=-1)
-    ok = live & (d < pos_tol) & (ang < math.radians(ang_tol_deg)) & (v < speed_tol)
+    ok = live & (d < pos_tol) & (ang < math.radians(ang_tol_deg)) & (v < speed_tol) \
+        & (finger_error(env) < math.radians(finger_tol_deg))
     G.hold = torch.where(ok, G.hold + env.step_dt, torch.zeros_like(G.hold))
     G.success = G.hold >= hold_time
     return G.success.clone()

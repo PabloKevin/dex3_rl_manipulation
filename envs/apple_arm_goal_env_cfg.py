@@ -12,9 +12,12 @@ place (+-15 cm in x, y and height around its nominal position), the load is
 the apple's weight (0.10-0.35 kg) applied at the pocket. Thousands of cheap
 envs; the harvest bench then tests it with real held fruit.
 
-Observation (31): arm joint positions/velocities (14), goal - pocket in the
+Observation (34): arm joint positions/velocities (14), goal - pocket in the
 torso frame (3), goal palm normal in the palm frame (3), basket (axis at rim
-height) - pocket in the torso frame (3), carrying flag (1), last action (7).
+height) - pocket in the torso frame (3), carrying flag (1), last action (7),
+goal finger direction in the palm frame (3) -- the goal is a full
+orientation: with the palm normal alone the fingers were free and the policy
+came home with them pointing at the ground.
 Action: the reach task's arm action (rate-limited joint position targets,
 same limits), so the motion budget matches everything else on the arm.
 """
@@ -69,6 +72,9 @@ class ObservationsCfg:
         basket = ObsTerm(func=ag.obs_basket, params={"pocket_local": POCKET})
         carrying = ObsTerm(func=ag.obs_carrying)
         last_action = ObsTerm(func=mdp.last_action, params={"action_name": "right_arm"})
+        # where the fingers must point (31 -> 34; appended so the 31-input
+        # policy warm-starts with these columns at zero)
+        goal_finger = ObsTerm(func=ag.obs_goal_finger)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -84,6 +90,9 @@ class RewardsCfg:
     normal_coarse = RewTerm(func=ag.reward_goal_normal, weight=1.0, params={"pocket_local": POCKET, "std_rad": 0.6})
     normal_fine = RewTerm(func=ag.reward_goal_normal, weight=3.0,
                           params={"pocket_local": POCKET, "std_rad": 0.25, "gate": 0.06})
+    finger_coarse = RewTerm(func=ag.reward_goal_finger, weight=1.0, params={"pocket_local": POCKET, "std_rad": 0.6})
+    finger_fine = RewTerm(func=ag.reward_goal_finger, weight=3.0,
+                          params={"pocket_local": POCKET, "std_rad": 0.3, "gate": 0.06})
     success = RewTerm(func=ag.reward_success, weight=95.0)
     # ── how: smooth, straight, slowing down at the goal ──
     commanded_accel = RewTerm(func=trr.penalty_commanded_accel, weight=-3.0)

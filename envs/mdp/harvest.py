@@ -350,7 +350,7 @@ class DifferentialIK:
 
     def step(self, pos_des: torch.Tensor, quat_des: torch.Tensor, max_dq: float = 0.2,
              base: torch.Tensor | None = None, null_target: torch.Tensor | None = None,
-             null_gain: float = 0.0) -> torch.Tensor:
+             null_gain: float = 0.0, weights: torch.Tensor | None = None) -> torch.Tensor:
         """Joint position targets (for self.joint_ids) one DLS step toward
         the desired pose, added to `base` -- pass the CURRENTLY COMMANDED
         targets, not the measured angles: under gravity the joint PD sits a
@@ -362,11 +362,18 @@ class DifferentialIK:
         null_target / null_gain: secondary task in the Jacobian's null space,
         pulling the joints toward null_target without disturbing the pose
         (keeps the elbow/shoulder from drifting into the body while the
-        hand only has to turn)."""
+        hand only has to turn).
+
+        weights [n]: per-joint share of the motion (weighted DLS, dq = W J^T
+        (J W J^T + lambda)^-1 e): small weights keep a joint nearly still --
+        e.g. a wrist-first twist that does not swing the shoulder and elbow.
+        None = all joints equal (the original behaviour)."""
         J = self.robot.root_physx_view.get_jacobians()[:, self.jac_body][:, :, self.jac_cols]   # [N, 6, n]
         e_pos, e_rot = self.pose_error(pos_des, quat_des)
         e = torch.cat([e_pos, e_rot], dim=-1).unsqueeze(-1)                                 # [N, 6, 1]
         JT = J.transpose(1, 2)
+        if weights is not None:
+            JT = weights.view(1, -1, 1) * JT
         lam = (self.damping ** 2) * torch.eye(6, device=J.device).unsqueeze(0)
         J_pinv = JT @ torch.linalg.solve(J @ JT + lam, torch.eye(6, device=J.device).expand(J.shape[0], 6, 6))
         dq = (J_pinv @ e).squeeze(-1)
