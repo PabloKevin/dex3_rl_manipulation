@@ -160,6 +160,20 @@ def penalty_self_collision(
     return ((self_collision_depth(env, margin) / ref) ** 2).sum(dim=-1)
 
 
+def _capsule_depth(env: "ManagerBasedRLEnv", spheres: dict, margin: float) -> torch.Tensor:
+    """Per sphere of `spheres`: deepest intrusion (m, >= 0) into the stem,
+    branch or trunk capsules (env._tree_segments / _tree_radii)."""
+    p = _world_spheres(env, spheres)                               # [N, A, 3]
+    a = env._tree_segments[:, :, 0].unsqueeze(1)                   # [N, 1, T, 3]
+    b = env._tree_segments[:, :, 1].unsqueeze(1)
+    ab = b - a
+    ap = p.unsqueeze(2) - a                                        # [N, A, T, 3]
+    t = ((ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-9)).clamp(0.0, 1.0)
+    dist = (ap - t.unsqueeze(-1) * ab).norm(dim=-1)                # [N, A, T]
+    need = spheres["r"].view(1, -1, 1) + env._tree_radii.view(1, 1, -1) + margin
+    return (need - dist).clamp(min=0.0).amax(dim=-1)
+
+
 def tree_contact_depth(env: "ManagerBasedRLEnv", margin: float = 0.01) -> torch.Tensor:
     """Per right-arm/hand sphere: deepest intrusion (m, >= 0) into the stem,
     branch or trunk, modelled as capsules (env._tree_segments / _tree_radii,
@@ -176,15 +190,48 @@ def tree_contact_depth(env: "ManagerBasedRLEnv", margin: float = 0.01) -> torch.
     arm = env._self_collision_spheres["arm"]
     if not hasattr(env, "_tree_segments"):
         return torch.zeros(env.num_envs, len(arm["r"]), device=env.device)
-    p = _world_spheres(env, arm)                                   # [N, A, 3]
-    a = env._tree_segments[:, :, 0].unsqueeze(1)                   # [N, 1, T, 3]
-    b = env._tree_segments[:, :, 1].unsqueeze(1)
-    ab = b - a
-    ap = p.unsqueeze(2) - a                                        # [N, A, T, 3]
-    t = ((ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-9)).clamp(0.0, 1.0)
-    dist = (ap - t.unsqueeze(-1) * ab).norm(dim=-1)                # [N, A, T]
-    need = arm["r"].view(1, -1, 1) + env._tree_radii.view(1, 1, -1) + margin
-    return (need - dist).clamp(min=0.0).amax(dim=-1)
+    return _capsule_depth(env, arm, margin)
+
+
+#: Body links that turn with the waist yaw: the torso (its top sphere covers
+#: the head) and the parked left arm. Pelvis and legs never move.
+def _turns_with_waist(link: str) -> bool:
+    return link == "torso_link" or (link.startswith("left_") and not any(k in link for k in ("hip", "knee", "ankle")))
+
+
+def body_tree_contact_depth(env: "ManagerBasedRLEnv", margin: float = 0.01) -> torch.Tensor:
+    """tree_contact_depth for the body spheres that turn with the waist
+    (torso, left arm). Only matters when the waist yaw is driven
+    (AppleReachTreeWaist-v1): turning the torso swings the parked left arm
+    through the wall.
+
+    Returns: [num_envs, num_turning_spheres] (zeros if the tree is not set up)
+    """
+    if not hasattr(env, "_self_collision_spheres"):
+        env._self_collision_spheres = _build(env)
+    sets = env._self_collision_spheres
+    if "turning" not in sets:
+        names = env.scene["robot"].data.body_names
+        body = sets["body"]
+        keep = torch.tensor([_turns_with_waist(names[i]) for i in body["ids"].tolist()], device=env.device)
+        sets["turning"] = {k: v[keep] for k, v in body.items()}
+    turning = sets["turning"]
+    if not hasattr(env, "_tree_segments"):
+        return torch.zeros(env.num_envs, len(turning["r"]), device=env.device)
+    return _capsule_depth(env, turning, margin)
+
+
+def penalty_body_tree_contact(
+    env: "ManagerBasedRLEnv",
+    margin: float = 0.01,
+    ref: float = 0.02,
+) -> torch.Tensor:
+    """penalty_tree_contact for the torso / left arm (body_tree_contact_depth).
+    Use a NEGATIVE weight.
+
+    Returns: [num_envs]
+    """
+    return ((body_tree_contact_depth(env, margin) / ref) ** 2).sum(dim=-1)
 
 
 def penalty_tree_contact(

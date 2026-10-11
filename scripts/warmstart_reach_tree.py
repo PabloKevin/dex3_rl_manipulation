@@ -19,7 +19,19 @@ AppleGraspTree-v1 from AppleGrasp-v1, keeping only the hand-side inputs
   - optimizer: fresh Adam state (the old moments have the wrong shapes),
     learning rate --lr; iteration counter back to 0.
 
-Writes logs/rsl_rl/apple_reach_tree/<--name>/model_0.pt; train from it with
+AppleReachTreeWaist-v1 from AppleReachTree-v1 (37 -> 40 inputs: waist yaw
+position, velocity, last action, all ~0; 7 -> 8 actions: the waist, its
+output row ZERO = hold the waist at 0 until it learns to turn):
+  python scripts/warmstart_reach_tree.py --src logs/rsl_rl/apple_reach_tree/2026-10-05_01-33-22 \
+      --experiment apple_reach_tree_waist --name warmstart_tree --new_inputs 3 --new_mean 0 \
+      --new_var 0.1 --new_outputs 1 --new_output_std 0.5
+
+Same task, new rewards (AppleReachTreeWaist-v1 second run, from the first
+run's best checkpoint, the waist's exploration noise restored):
+  python scripts/warmstart_reach_tree.py --src logs/rsl_rl/apple_reach_tree_waist/2026-10-10_05-01-43/model_500.pt \
+      --experiment apple_reach_tree_waist --name warmstart_500 --new_inputs 0 --set_std 7:0.5
+
+Writes logs/rsl_rl/<--experiment>/<--name>/model_0.pt; train from it with
   python scripts/train.py --task AppleReachTree-v1 --headless --resume --load_run <--name> --checkpoint model_0.pt
 Plain torch, no Isaac Sim needed.
 """
@@ -42,6 +54,11 @@ p.add_argument("--new_var", type=float, default=0.05, help="normalizer variance 
 p.add_argument("--keep", type=str, default=None,
                help="old input columns to keep, in the new order, e.g. 14-27,32-51,59-65 (default: all); "
                     "the --new_inputs zero columns go after them")
+p.add_argument("--new_outputs", type=int, default=0,
+               help="action dims appended to the actor's output (zero weights: mean 0 = default target)")
+p.add_argument("--new_output_std", type=float, default=0.5, help="exploration noise of the new action dims")
+p.add_argument("--set_std", type=str, default=None,
+               help="exploration noise of given action dims after everything else, e.g. 7:0.5 (comma-separated)")
 p.add_argument("--lr", type=float, default=1.0e-4)
 p.add_argument("--min_std", type=float, default=0.3, help="exploration noise floor per action dim")
 p.add_argument("--norm_count", type=float, default=1.0e5)
@@ -60,6 +77,8 @@ if args.keep:
         a, _, b = part.partition("-")
         keep += list(range(int(a), int(b or a) + 1))
 pick = (lambda t: t[:, keep]) if keep is not None else (lambda t: t)
+k_out = args.new_outputs
+last = max((n for n in sd if n.startswith("actor.") and n.endswith(".weight")), key=lambda n: int(n.split(".")[1]))
 out = {}
 for name, t in sd.items():
     if name in ("actor.0.weight", "critic.0.weight"):
@@ -73,7 +92,16 @@ for name, t in sd.items():
     elif name.endswith("_obs_normalizer.count"):
         t = torch.tensor(args.norm_count, dtype=t.dtype)
     elif name == "std":
-        t = t.clamp(min=args.min_std)
+        t = torch.cat([t.clamp(min=args.min_std), torch.full((k_out,), args.new_output_std)])
+    if k_out and name == last:
+        t = torch.cat([t, torch.zeros(k_out, t.shape[1])], dim=0)
+    elif k_out and name == last.replace(".weight", ".bias"):
+        t = torch.cat([t, torch.zeros(k_out)])
+    if name == "std" and args.set_std:
+        t = t.clone()
+        for item in args.set_std.split(","):
+            i, v = item.split(":")
+            t[int(i)] = float(v)
     out[name] = t
 groups = ck["optimizer_state_dict"]["param_groups"]
 for g in groups:
@@ -84,4 +112,5 @@ dst = os.path.join(dst_dir, "model_0.pt")
 torch.save({"model_state_dict": out, "optimizer_state_dict": {"state": {}, "param_groups": groups},
             "iter": 0, "infos": None}, dst)
 print(f"[warmstart] {src}\n  -> {dst}  (inputs {sd['actor.0.weight'].shape[1]} -> {out['actor.0.weight'].shape[1]}, "
+      f"actions {sd[last].shape[0]} -> {out[last].shape[0]}, "
       f"std {[round(float(x), 2) for x in out['std']]}, lr {args.lr})")

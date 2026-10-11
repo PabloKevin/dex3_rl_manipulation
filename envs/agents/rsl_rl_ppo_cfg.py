@@ -195,6 +195,20 @@ class AppleReachTreePPORunnerCfg(AppleGraspPPORunnerCfg):
 
 
 @configclass
+class AppleReachTreeWaistPPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachTreeWaist-v1: the tree reach with the waist yaw. Own log
+    folder (logs/rsl_rl/apple_reach_tree_waist)."""
+    experiment_name = "apple_reach_tree_waist"
+
+
+@configclass
+class AppleReachTreeWaistFacePPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachTreeWaistFace-v1: the waist reach that faces the apple when
+    it can. Own log folder (logs/rsl_rl/apple_reach_tree_waist_face)."""
+    experiment_name = "apple_reach_tree_waist_face"
+
+
+@configclass
 class AppleGraspTreePPORunnerCfg(AppleGraspGraspPPORunnerCfg):
     """AppleGraspTree-v1: the grasp recipe on the multi-apple tree with the
     hold-under-load stage. Own log folder (logs/rsl_rl/apple_grasp_tree)."""

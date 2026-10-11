@@ -25,6 +25,12 @@ cells. It is also the robot's safe reach workspace for planning where to
 stand (locomotion).
 
     ~/miniconda3/envs/env_isaaclab/bin/python scripts/probe_side_reach.py --headless --num_envs 512 --rounds 8
+
+--waist: the waist yaw joins the IK (within +-WAIST_YAW_LIMIT, the
+AppleReachTreeWaist-v1 action range) and the sweep/grid widen toward the
+front-centre and further out. Cells stay relative to the shoulder AT WAIST
+YAW 0 (a fixed point, as placement uses it). Writes
+envs/assets/reach_workspace_waist.npz (REACH_WAIST_WORKSPACE_MAP).
 """
 import argparse
 import os
@@ -42,6 +48,11 @@ parser.add_argument("--focus", action="store_true",
                     help="Sample only around the training placement box (FOCUS) for more samples per cell there.")
 parser.add_argument("--merge", type=str, default=None,
                     help="Existing map .npz whose samples are merged with this run's before binning.")
+parser.add_argument("--union", type=str, default=None,
+                    help="Map .npz whose feasible cells are added (e.g. the arm-only map into the --waist one: "
+                         "waist yaw 0 is always available, and the 8-DOF IK stalls more often).")
+parser.add_argument("--waist", action="store_true",
+                    help="Waist yaw in the IK (+-WAIST_YAW_LIMIT), wider sweep; writes reach_workspace_waist.npz.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 app = AppLauncher(args_cli).app
@@ -59,6 +70,7 @@ import envs  # noqa: E402,F401
 from envs.apple_grasp_env_cfg import (  # noqa: E402
     AppleGraspEnvCfg, GRASP_STANDOFF, PALM_LOCAL_OFFSET, PALM_NORMAL_AXIS, RIGHT_ARM_JOINTS,
 )
+from envs.apple_reach_tree_waist_env_cfg import WAIST_YAW_JOINT, WAIST_YAW_LIMIT  # noqa: E402
 from envs.mdp import reach_rewards as rr  # noqa: E402
 from envs.mdp.self_collision import self_collision_depth  # noqa: E402
 
@@ -70,10 +82,17 @@ SWEEP = dict(reach_min=0.12, reach_max=0.42, reach_azimuth_center_deg=-35.0,
 FOCUS = dict(reach_min=0.17, reach_max=0.37, reach_azimuth_center_deg=-45.0,
              reach_azimuth_span_deg=80.0, target_dz_range=(-0.33, 0.31),
              reach_min_forward=0.05, reach_min_horizontal=0.09, workspace_map=None)
+# --waist: the torso turns too, so further out and across the front.
+SWEEP_WAIST = dict(reach_min=0.12, reach_max=0.55, reach_azimuth_center_deg=-25.0,
+                   reach_azimuth_span_deg=170.0, target_dz_range=(-0.40, 0.35),
+                   reach_min_forward=0.0, reach_min_horizontal=0.0, workspace_map=None)
 OK_POS, OK_FACE = 0.02, 0.30
 CELL = 0.05
 GRID_LO = np.array([-0.15, -0.45, -0.40])   # shoulder-relative x (fwd), y (left), z (up)
 GRID_HI = np.array([0.45, 0.20, 0.35])
+if args_cli.waist:
+    GRID_LO = np.array([-0.15, -0.55, -0.40])
+    GRID_HI = np.array([0.60, 0.40, 0.35])
 MIN_SAMPLES, MIN_CLEAN_FRAC = 3, 0.8
 
 
@@ -83,35 +102,40 @@ def main():
     cfg.episode_length_s = 1.0e6
     cfg.terminations.reach_success = None
     cfg.events.reset_arm_jitter = None
-    cfg.events.randomize_tree.params.update(FOCUS if args_cli.focus else SWEEP)
+    cfg.events.randomize_tree.params.update(SWEEP_WAIST if args_cli.waist else FOCUS if args_cli.focus else SWEEP)
     env = ManagerBasedRLEnv(cfg)
 
     robot = env.scene["robot"]
     palm_cfg = SceneEntityCfg("robot", body_names=["right_hand_palm_link"])
     palm_cfg.resolve(env.scene)
     apple_cfg = SceneEntityCfg("apple")
-    arm_ids = [robot.joint_names.index(n) for n in RIGHT_ARM_JOINTS]
     term = env.action_manager.get_term("right_arm")
     term_ids = [term._joint_names.index(n) for n in RIGHT_ARM_JOINTS]
+    # IK joints: the arm, plus the waist yaw with --waist (last column; the
+    # base env holds it by PD target, so teleporting it works the same way)
+    arm_ids = [robot.joint_names.index(n) for n in RIGHT_ARM_JOINTS]
+    ik_ids = arm_ids + ([robot.joint_names.index(WAIST_YAW_JOINT)] if args_cli.waist else [])
     palm_id = palm_cfg.body_ids[0]
     jac_id = palm_id - 1 if robot.is_fixed_base else palm_id
-    jac_cols = arm_ids if robot.is_fixed_base else [i + 6 for i in arm_ids]
+    jac_cols = ik_ids if robot.is_fixed_base else [i + 6 for i in ik_ids]
     off_local = torch.tensor(PALM_LOCAL_OFFSET, device=env.device)
     n_local = torch.tensor(PALM_NORMAL_AXIS, device=env.device)
-    lo = robot.data.soft_joint_pos_limits[:, arm_ids, 0]
-    hi = robot.data.soft_joint_pos_limits[:, arm_ids, 1]
-    default = robot.data.default_joint_pos[:, arm_ids]
+    lo = robot.data.soft_joint_pos_limits[:, ik_ids, 0].clone()
+    hi = robot.data.soft_joint_pos_limits[:, ik_ids, 1].clone()
+    if args_cli.waist:
+        lo[:, -1], hi[:, -1] = -WAIST_YAW_LIMIT, WAIST_YAW_LIMIT
+    default = robot.data.default_joint_pos[:, ik_ids]
     shoulder_roll = RIGHT_ARM_JOINTS.index("right_shoulder_roll_joint")
     state = {"q": default.clone()}
 
     def set_arm(q0):
         jp = robot.data.joint_pos.clone()
-        jp[:, arm_ids] = q0
+        jp[:, ik_ids] = q0
         robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
         tgt = robot.data.joint_pos_target.clone()
-        tgt[:, arm_ids] = q0
+        tgt[:, ik_ids] = q0
         robot.set_joint_position_target(tgt)
-        term._prev_target[:, term_ids] = q0
+        term._prev_target[:, term_ids] = q0[:, :len(arm_ids)]
         term._prev_vel[:] = 0.0
 
     def ik_step():
@@ -145,11 +169,16 @@ def main():
                  - rr._palm_ref_pos(env, palm_cfg, PALM_LOCAL_OFFSET)).norm(dim=-1)
         face = rr._palm_normal_angle(env, palm_cfg, PALM_NORMAL_AXIS, apple_cfg)
         coll = self_collision_depth(env).amax(dim=-1)
-        q = robot.data.joint_pos[:, arm_ids]
+        q = robot.data.joint_pos[:, ik_ids]
         reached = (d_pos < OK_POS) & (face < OK_FACE)
         clean = reached & (coll <= 0.0) & (q[:, shoulder_roll] < 0.35)
         score = d_pos / OK_POS + face / OK_FACE + coll / 0.01 - 10.0 * clean.float() - 5.0 * reached.float()
-        return score, [d_pos, face, coll, q[:, shoulder_roll], clean.float()]
+        cols = [d_pos, face, coll, q[:, shoulder_roll]]
+        if args_cli.waist:
+            # among clean solutions, prefer the least torso turn
+            score = score + 0.5 * q[:, -1].abs() / WAIST_YAW_LIMIT
+            cols.append(q[:, -1])
+        return score, cols + [clean.float()]
 
     # Sanity: the default pose must be collision-free under the model.
     env.reset()
@@ -180,6 +209,8 @@ def main():
               f"{np.concatenate(rows)[:, -1].mean():.2f}", flush=True)
 
     a = np.concatenate(rows)
+    columns = ["x", "y", "z", "pos_err", "face_err", "collision_depth", "shoulder_roll"] \
+        + (["waist_yaw"] if args_cli.waist else []) + ["clean"]
     if args_cli.merge:
         a = np.concatenate([np.load(args_cli.merge)["samples"], a])
     xyz, clean = a[:, :3], a[:, -1] > 0.5
@@ -197,6 +228,16 @@ def main():
     frac = np.where(count > 0, nclean / np.maximum(count, 1), 0.0)
     feasible = (count >= MIN_SAMPLES) & (frac >= MIN_CLEAN_FRAC)
     sampled = count >= MIN_SAMPLES
+    if args_cli.union:
+        u = np.load(args_cli.union)
+        added = 0
+        for i, j, k in zip(*np.nonzero(u["feasible"])):
+            c = np.array([u["x_edges"][i], u["y_edges"][j], u["z_edges"][k]]) + 0.5 * CELL
+            n = np.floor((c - GRID_LO) / CELL).astype(int)
+            if np.all((n >= 0) & (n < np.array(shape))):
+                added += int(not feasible[tuple(n)])
+                feasible[tuple(n)] = sampled[tuple(n)] = True
+        print(f"union with {args_cli.union}: +{added} cells")
     print(f"cells: {sampled.sum()} sampled (>= {MIN_SAMPLES}), {feasible.sum()} feasible "
           f"({CELL*100:.0f} cm cells, volume {feasible.sum() * CELL**3 * 1e3:.1f} L)")
 
@@ -212,10 +253,15 @@ def main():
                            for i in range(shape[0]))
             print(f"  y {edges[1][j]:+.2f}   {line}")
 
-    out = args_cli.out or os.path.join(REPO, "envs", "assets", "reach_workspace.npz")
+    if args_cli.waist:
+        w = a[clean, 7]
+        print(f"\nwaist yaw over clean samples: median |yaw| {np.degrees(np.median(np.abs(w))):.0f} deg, "
+              f"at the limit {np.mean(np.abs(w) > WAIST_YAW_LIMIT - 0.02):.2f}")
+    default_map = "reach_workspace_waist.npz" if args_cli.waist else "reach_workspace.npz"
+    out = args_cli.out or os.path.join(REPO, "envs", "assets", default_map)
     np.savez(out, x_edges=edges[0], y_edges=edges[1], z_edges=edges[2], feasible=feasible,
              count=count, clean_frac=frac, samples=a,
-             sample_columns=np.array(["x", "y", "z", "pos_err", "face_err", "collision_depth", "shoulder_roll", "clean"]),
+             sample_columns=np.array(columns),
              min_samples=MIN_SAMPLES, min_clean_frac=MIN_CLEAN_FRAC, cell=CELL)
     print(f"\nsaved {out}")
     env.close()

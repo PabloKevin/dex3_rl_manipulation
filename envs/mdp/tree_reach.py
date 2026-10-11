@@ -175,12 +175,13 @@ def penalty_commanded_accel(env: "ManagerBasedRLEnv", action_name: str = "right_
     bang-bang the frozen v1 reach ran all the way (visible jerk)."""
     term = env.action_manager.get_term(action_name)
     v = term._prev_vel                                                         # this step's commanded velocity
-    prev = getattr(env, "_cmd_vel_prev", None)
+    cache = env.__dict__.setdefault("_cmd_vel_prev", {})                     # per action term
+    prev = cache.get(action_name)
     if prev is None or prev.shape != v.shape:
         prev = v.clone()
     fresh = (env.episode_length_buf <= 1).unsqueeze(-1)
     acc = torch.where(fresh, torch.zeros_like(v), (v - prev) / env.step_dt)
-    env._cmd_vel_prev = v.clone()
+    cache[action_name] = v.clone()
     return ((acc / term.cfg.max_acceleration) ** 2).mean(-1)
 
 

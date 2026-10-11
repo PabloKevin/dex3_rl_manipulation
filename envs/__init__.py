@@ -26,6 +26,12 @@ from .apple_reach_tree_env_cfg import (
     AppleReachTreeEnvCfg,
     AppleReachTreeEnvCfg_PLAY,
 )
+from .apple_reach_tree_waist_env_cfg import (
+    AppleReachTreeWaistEnvCfg,
+    AppleReachTreeWaistEnvCfg_PLAY,
+    AppleReachTreeWaistFaceEnvCfg,
+    AppleReachTreeWaistFaceEnvCfg_PLAY,
+)
 from .apple_grasp_tree_train_env_cfg import (
     AppleGraspTreeTrainEnvCfg,
     AppleGraspTreeTrainEnvCfg_PLAY,
@@ -39,6 +45,8 @@ from .agents.rsl_rl_ppo_cfg import (
     AppleGraspGraspPPORunnerCfg,
     AppleGraspHarvestPPORunnerCfg,
     AppleReachTreePPORunnerCfg,
+    AppleReachTreeWaistPPORunnerCfg,
+    AppleReachTreeWaistFacePPORunnerCfg,
     AppleGraspTreePPORunnerCfg,
     AppleArmGoalPPORunnerCfg,
 )
@@ -127,6 +135,48 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleReachTreeEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleReachTreePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Tree reach that also turns the torso (waist yaw): further, more central fruit.
+gym.register(
+    id="AppleReachTreeWaist-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachTreeWaistEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachTreeWaistPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachTreeWaist-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachTreeWaistEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachTreeWaistPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Same, preferring the torso (head camera) facing the apple where the reach still works.
+gym.register(
+    id="AppleReachTreeWaistFace-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachTreeWaistFaceEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachTreeWaistFacePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachTreeWaistFace-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachTreeWaistFaceEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachTreeWaistFacePPORunnerCfg,
     },
     disable_env_checker=True,
 )

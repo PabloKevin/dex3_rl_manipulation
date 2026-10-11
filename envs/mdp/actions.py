@@ -88,6 +88,13 @@ class RateLimitedJointPositionAction(JointPositionAction):
         dt = self._env.step_dt
         v_desired = (target_desired - self._prev_target) / dt
         v_cmd = torch.clamp(v_desired, -self.cfg.max_velocity, self.cfg.max_velocity)
+        if self.cfg.brake_to_target:
+            # fastest speed that can still stop at the target under the
+            # acceleration cap (discrete: v^2/2a + v*dt/2 <= |error|)
+            a = self.cfg.max_acceleration
+            err = (target_desired - self._prev_target).abs()
+            v_stop = -0.5 * a * dt + torch.sqrt((0.5 * a * dt) ** 2 + 2.0 * a * err)
+            v_cmd = torch.maximum(torch.minimum(v_cmd, v_stop), -v_stop)
         max_dv = self.cfg.max_acceleration * dt
         v_cmd = torch.clamp(v_cmd, self._prev_vel - max_dv, self._prev_vel + max_dv)
 
@@ -132,3 +139,8 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
 
     max_velocity: float = 2.0
     max_acceleration: float = 15.0
+    # Brake toward the desired target so the command never overshoots it.
+    # Off by default: without it, a target further than the stopping
+    # distance (v^2 / 2a) overshoots and rings, and the trained arm policies
+    # were all trained that way.
+    brake_to_target: bool = False
