@@ -32,6 +32,10 @@ from .apple_reach_tree_waist_env_cfg import (
     AppleReachTreeWaistFaceEnvCfg,
     AppleReachTreeWaistFaceEnvCfg_PLAY,
 )
+from .apple_reach_spindle_env_cfg import (
+    AppleReachSpindleEnvCfg,
+    AppleReachSpindleEnvCfg_PLAY,
+)
 from .apple_grasp_tree_train_env_cfg import (
     AppleGraspTreeTrainEnvCfg,
     AppleGraspTreeTrainEnvCfg_PLAY,
@@ -47,6 +51,7 @@ from .agents.rsl_rl_ppo_cfg import (
     AppleReachTreePPORunnerCfg,
     AppleReachTreeWaistPPORunnerCfg,
     AppleReachTreeWaistFacePPORunnerCfg,
+    AppleReachSpindlePPORunnerCfg,
     AppleGraspTreePPORunnerCfg,
     AppleArmGoalPPORunnerCfg,
 )
@@ -177,6 +182,27 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleReachTreeWaistFaceEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleReachTreeWaistFacePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Facing waist reach on the tall-spindle tree (thin leaning trunk, short branches).
+gym.register(
+    id="AppleReachSpindle-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSpindleEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachSpindlePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachSpindle-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSpindleEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachSpindlePPORunnerCfg,
     },
     disable_env_checker=True,
 )

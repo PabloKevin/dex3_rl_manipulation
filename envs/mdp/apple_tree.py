@@ -193,6 +193,98 @@ def sample_tree(rng: random.Random, n: int, radius: float, seed_env: Envelope, m
     raise RuntimeError(f"sample_tree: could not place {n} apples in {tries} trees -- too many for the envelope?")
 
 
+def trunk_axis(tree: dict, z: float) -> np.ndarray:
+    """Trunk axis point (env-local) at height z: vertical from tree["trunk"]
+    (base x, y) up to tree["kink"], straight along tree["lean"] (dx/dz,
+    dy/dz) above it. Trees without a kink are plain vertical trunks."""
+    k = tree.get("kink", float("inf"))
+    lean = tree.get("lean", np.zeros(2))
+    xy = np.asarray(tree["trunk"], float) + lean * max(z - k, 0.0)
+    return np.array([xy[0], xy[1], z])
+
+
+def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Envelope, member_env: Envelope,
+                        standoff: float, heading_max_deg: float, stem_len_range: tuple[float, float],
+                        cluster_sizes, cluster_weights, cluster_gap: tuple[float, float], sep_min: float,
+                        spindle: dict, tries: int = 300) -> dict:
+    """Tall-spindle tree: ONE thin trunk, vertical up to a kink (spindle
+    ["kink_range"], m), then straight, leaning spindle["lean_deg"] in a
+    random direction. Every apple hangs off it on a short branch
+    (spindle["branch_range"]) plus its stem, on the side facing the aisle:
+    the stem (apple -> trunk) points into the row, within heading_max_deg of
+    +x, as in the fruiting-wall tree. Clusters (sizes / gap / sep_min as in
+    sample_tree) stack along the trunk. Every apple's grasp target lies in
+    the envelope, as in sample_tree.
+
+    Same dict as sample_tree, plus "kink" (z) and "lean" (dx/dz, dy/dz)."""
+    lim = math.radians(heading_max_deg)
+    tr = spindle["trunk_radius"]
+
+    def hang(axis_pt, h, stem_len, branch):
+        """apple centre, stem direction, tip for an apple on the trunk."""
+        d = np.array([math.cos(h), math.sin(h), 0.0])
+        a = axis_pt - d * (tr + branch + stem_len + radius)
+        return a, d
+
+    for _ in range(tries):
+        t0 = seed_env.sample_target(rng)
+        h0 = rng.uniform(-lim, lim)
+        L0, b0 = rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
+        d0 = np.array([math.cos(h0), math.sin(h0), 0.0])
+        a0 = t0 + d0 * (radius + standoff)
+        p0 = a0 + d0 * (radius + L0 + b0 + tr)                 # trunk axis at the seed's height
+        kink = rng.uniform(*spindle["kink_range"])
+        alpha, psi = math.radians(rng.uniform(*spindle["lean_deg"])), rng.uniform(0.0, 2 * math.pi)
+        lean = math.tan(alpha) * np.array([math.cos(psi), math.sin(psi)])
+        tree = {"trunk": p0[:2] - lean * max(p0[2] - kink, 0.0), "kink": kink, "lean": lean}
+        z_lo = seed_env.sh[2] + seed_env.dz[0] - 0.02
+        z_hi = seed_env.sh[2] + seed_env.dz[1] + 0.02
+
+        apples, dirs, stems, cluster = [a0], [d0], [L0], [0]
+        size = min(rng.choices(cluster_sizes, weights=cluster_weights)[0], n)
+        c, ok = 0, True
+        while len(apples) < n and ok:
+            if c > 0:                                          # a new cluster's seed, anywhere on the trunk
+                size = min(rng.choices(cluster_sizes, weights=cluster_weights)[0], n - len(apples))
+                for _ in range(80):
+                    h, L, b = rng.uniform(-lim, lim), rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
+                    a, d = hang(trunk_axis(tree, rng.uniform(z_lo, z_hi)), h, L, b)
+                    if seed_env.contains(a - d * (radius + standoff)) and \
+                            all(np.linalg.norm(a - q) >= 2 * radius + sep_min for q in apples):
+                        apples.append(a); dirs.append(d); stems.append(L); cluster.append(c)
+                        break
+                else:
+                    ok = False
+                    break
+            members = [len(apples) - 1]
+            for _ in range(size - 1):                          # the rest of the cluster, touching it
+                for _ in range(80):
+                    anchor = apples[members[rng.randrange(len(members))]]
+                    z = anchor[2] + rng.uniform(-1.0, 1.0) * (2 * radius + cluster_gap[1])
+                    h, L, b = rng.uniform(-lim, lim), rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
+                    a, d = hang(trunk_axis(tree, z), h, L, b)
+                    gaps_in = [np.linalg.norm(a - apples[m]) - 2 * radius for m in members]
+                    if not (cluster_gap[0] - 1e-6 <= min(gaps_in) <= cluster_gap[1] + 0.01):
+                        continue
+                    if any(np.linalg.norm(a - q) < 2 * radius + sep_min
+                           for j, q in enumerate(apples) if cluster[j] != c):
+                        continue
+                    if not member_env.contains(a - d * (radius + standoff), slack=0.01):
+                        continue
+                    apples.append(a); dirs.append(d); stems.append(L); cluster.append(c); members.append(len(apples) - 1)
+                    break
+                else:
+                    break                                      # a smaller cluster than drawn
+            c += 1
+        if not ok or len(apples) < n:
+            continue
+        apples, dirs, stems = np.array(apples), np.array(dirs), np.array(stems)
+        tree.update({"apple": apples, "stem_dir": dirs, "stem_len": stems,
+                     "tip": apples + dirs * (radius + stems)[:, None], "cluster": np.array(cluster)})
+        return tree
+    raise RuntimeError(f"sample_spindle_tree: could not place {n} apples on one trunk in {tries} trees")
+
+
 def harvest_order(tree: dict, mode: str, rng: random.Random) -> np.ndarray:
     n = len(tree["apple"])
     if mode == "random":
@@ -315,6 +407,32 @@ def _set_cylinder(stage, path: str, center, yaw: float, length: float) -> None:
     op.Set(Gf.Vec3f(*v) if op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat else Gf.Vec3d(*v))
 
 
+def _set_z_segment(stage, path: str, a, b, spawn_height: float) -> None:
+    """Place a Z-axis cylinder prim (spawned spawn_height long) between the
+    points a and b: centre, tilt and length (z scale)."""
+    from pxr import Gf, UsdGeom
+    from .domain_randomization import _get_or_add_xform_op, _set_translate
+
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        return
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    v = b - a
+    length = float(np.linalg.norm(v))
+    _set_translate(prim, *map(float, (a + b) / 2))
+    u = v / max(length, 1e-9)
+    axis = np.cross([0.0, 0.0, 1.0], u)                 # rotation taking +z onto u
+    sa, ca = float(np.linalg.norm(axis)), float(u[2])
+    ang = math.atan2(sa, ca)
+    axis = axis / sa if sa > 1e-9 else np.array([1.0, 0.0, 0.0])
+    w, x, y, z = math.cos(ang / 2), *(axis * math.sin(ang / 2))
+    op = _get_or_add_xform_op(prim, UsdGeom.XformOp.TypeOrient)
+    op.Set(Gf.Quatf(w, x, y, z) if op.GetPrecision() == UsdGeom.XformOp.PrecisionFloat else Gf.Quatd(w, x, y, z))
+    sc = _get_or_add_xform_op(prim, UsdGeom.XformOp.TypeScale)
+    vs = (1.0, 1.0, max(length, 1e-3) / spawn_height)
+    sc.Set(Gf.Vec3f(*vs) if sc.GetPrecision() == UsdGeom.XformOp.PrecisionFloat else Gf.Vec3d(*vs))
+
+
 class _TreeState:
     def __init__(self, env: "ManagerBasedRLEnv", n: int, stem_params: dict | None = None):
         from .harvest import BreakableStem, StemParams
@@ -327,7 +445,9 @@ class _TreeState:
         self.spot_stem = torch.zeros(N, n, 3, device=dev)       # unit, apple -> branch tip
         self.spot_tip = torch.zeros(N, n, 3, device=dev)
         self.cluster = torch.zeros(N, n, dtype=torch.long, device=dev)
-        self.trunk = torch.zeros(N, 2, device=dev)
+        self.trunk = torch.zeros(N, 2, device=dev)             # base x, y
+        self.trunk_kink = torch.full((N,), 1.0e3, device=dev)  # spindle: height where the lean starts
+        self.trunk_lean = torch.zeros(N, 2, device=dev)        # spindle: dx/dz, dy/dz above the kink
         self.order = torch.zeros(N, n, dtype=torch.long, device=dev)
         self.cursor = torch.zeros(N, dtype=torch.long, device=dev)   # index into order of the current target
         self.status = torch.zeros(N, n, dtype=torch.long, device=dev)
@@ -413,6 +533,7 @@ def place_apple_tree(
     branch_radius: float = 0.015,
     trunk_radius: float = 0.06,
     shoulder_body_name: str = "right_shoulder_pitch_link",
+    spindle: dict | None = None,
 ) -> None:
     """mode="reset", in place of randomize_tree_and_apple. Per env: a NEW
     tree when env._tree.new_tree is set (the first reset, and whenever the
@@ -424,7 +545,12 @@ def place_apple_tree(
     cluster members included). Leaves the same bookkeeping as randomize_tree_and_
     apple for the target ("apple" pose, _stem_anchor_pos, _stem_dir,
     _tree_segments / _tree_radii: target stem first, then the other stems,
-    the branches and the trunk)."""
+    the branches and the trunk).
+    spindle: a tall-spindle tree instead (sample_spindle_tree: one thin
+    trunk, vertical then leaning, short branches); keys kink_range,
+    lean_deg, branch_range, trunk_radius, and top_prim (the upper trunk
+    segment's prim, a 1 m Z cylinder). The capsule list then ends with the
+    two trunk segments (other trees: the trunk, then a dummy far away)."""
     import omni.usd
 
     stage = omni.usd.get_context().get_stage()
@@ -445,8 +571,8 @@ def place_apple_tree(
                                - env.scene.env_origins[0]).clone()
         env._stem_anchor_pos = torch.zeros(N, 3, device=dev)
         env._stem_dir = torch.zeros(N, 3, device=dev)
-        env._tree_segments = torch.full((N, 2 * n_apples + 1, 2, 3), 1.0e3, device=dev)
-        env._tree_radii = torch.tensor([stem_radius] * n_apples + [branch_radius] * n_apples + [trunk_radius],
+        env._tree_segments = torch.full((N, 2 * n_apples + 2, 2, 3), 1.0e3, device=dev)
+        env._tree_radii = torch.tensor([stem_radius] * n_apples + [branch_radius] * n_apples + [trunk_radius] * 2,
                                        device=dev)
         orig = env.scene.write_data_to_sim
 
@@ -472,10 +598,17 @@ def place_apple_tree(
             # nothing moves, the bookkeeping below is refreshed
             T.retry_request[i] = False
         elif new_tree_each_reset or bool(T.new_tree[i]) or T.trees[i] is None:
-            tree = sample_tree(rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter,
-                               stem_heading_max_deg, stem_length_range, cluster_sizes, cluster_weights,
-                               cluster_gap, sep_min)
+            if spindle is not None:
+                tree = sample_spindle_tree(rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg,
+                                           stem_length_range, cluster_sizes, cluster_weights, cluster_gap,
+                                           sep_min, spindle)
+            else:
+                tree = sample_tree(rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter,
+                                   stem_heading_max_deg, stem_length_range, cluster_sizes, cluster_weights,
+                                   cluster_gap, sep_min)
             T.trees[i] = tree
+            T.trunk_kink[i] = float(tree.get("kink", 1.0e3))
+            T.trunk_lean[i] = torch.tensor(tree.get("lean", np.zeros(2)), device=dev, dtype=torch.float32)
             T.new_tree[i] = False
             T.spot_pos[i] = torch.tensor(tree["apple"], device=dev, dtype=torch.float32)
             T.spot_stem[i] = torch.tensor(tree["stem_dir"], device=dev, dtype=torch.float32)
@@ -489,14 +622,26 @@ def place_apple_tree(
             # visuals: trunk, and per spot a branch (trunk -> tip) and a stem (apple -> tip)
             ns = f"/World/envs/env_{i}"
             from .domain_randomization import _set_translate
-            for name, z in (("TreeBase", 0.03), ("TreeTrunk", float(env._trunk_height[i]) / 2)):
-                p = stage.GetPrimAtPath(f"{ns}/{name}")
+            H = float(env._trunk_height[i])
+            if spindle is not None:
+                kink = float(tree["kink"])
+                _set_z_segment(stage, f"{ns}/TreeTrunk", trunk_axis(tree, 0.0), trunk_axis(tree, kink), H)
+                _set_z_segment(stage, f"{ns}/{spindle.get('top_prim', 'TreeTrunkTop')}",
+                               trunk_axis(tree, kink), trunk_axis(tree, H), 1.0)
+                p = stage.GetPrimAtPath(f"{ns}/TreeBase")
                 if p.IsValid():
-                    _set_translate(p, float(tree["trunk"][0]), float(tree["trunk"][1]), z)
+                    _set_translate(p, float(tree["trunk"][0]), float(tree["trunk"][1]), 0.03)
+            else:
+                for name, z in (("TreeBase", 0.03), ("TreeTrunk", H / 2)):
+                    p = stage.GetPrimAtPath(f"{ns}/{name}")
+                    if p.IsValid():
+                        _set_translate(p, float(tree["trunk"][0]), float(tree["trunk"][1]), z)
             for k in range(n):
                 a, d, tip, L = tree["apple"][k], tree["stem_dir"][k], tree["tip"][k], tree["stem_len"][k]
                 _set_cylinder(stage, f"{ns}/{stem_prim(k)}", a + d * (r + L / 2), math.atan2(d[1], d[0]), L)
-                tr = np.array([tree["trunk"][0], tree["trunk"][1], tip[2]])
+                tr = trunk_axis(tree, float(tip[2]))
+                if spindle is not None:                  # branch ends at the bark, not the axis
+                    tr = tr - d * spindle["trunk_radius"]
                 b = tr - tip
                 _set_cylinder(stage, f"{ns}/{branch_prim(k)}", (tip + tr) / 2, math.atan2(b[1], b[0]),
                               float(np.linalg.norm(b)))
@@ -566,13 +711,20 @@ def place_apple_tree(
         env._stem_anchor_pos[i] = env.scene[apple_entity(0)].data.root_pos_w[i]
         env._stem_dir[i] = T.spot_stem[i, s]
         stems = [s] + [k for k in range(n) if k != s]
-        seg = torch.zeros(2 * n + 1, 2, 3, device=dev)
+        def axis(z):
+            xy = T.trunk[i] + T.trunk_lean[i] * (z - T.trunk_kink[i]).clamp(min=0.0)
+            return torch.cat([xy, z.view(1)])
+
+        seg = torch.full((2 * n + 2, 2, 3), 1.0e3, device=dev)
         for j, k in enumerate(stems):
             a = T.spot_pos[i, k] + T.spot_stem[i, k] * r
             seg[j] = torch.stack([a, T.spot_tip[i, k]])
             tip = T.spot_tip[i, k]
-            seg[n + j] = torch.stack([tip, torch.stack([T.trunk[i, 0], T.trunk[i, 1], tip[2]])])
-        seg[2 * n] = torch.stack([torch.cat([T.trunk[i], torch.zeros(1, device=dev)]),
-                                  torch.cat([T.trunk[i], env._trunk_height[i:i + 1]])])
+            seg[n + j] = torch.stack([tip, axis(tip[2])])
+        zero, top = torch.zeros((), device=dev), env._trunk_height[i]
+        kink = torch.minimum(T.trunk_kink[i], top)
+        seg[2 * n] = torch.stack([axis(zero), axis(kink)])
+        if bool(T.trunk_kink[i] < top):
+            seg[2 * n + 1] = torch.stack([axis(kink), axis(top)])
         env._tree_segments[i] = seg + origin
         T.next_request[i] = False

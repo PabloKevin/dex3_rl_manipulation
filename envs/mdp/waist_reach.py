@@ -202,3 +202,28 @@ def reward_face_apple_success(env: "ManagerBasedRLEnv", object_cfg: SceneEntityC
     """[N] reach_rewards.reward_reach_success x facing: extra on a success
     made while looking at the apple."""
     return rr.reward_reach_success(env) * _facing(env, object_cfg, std_rad)
+
+
+def reward_gentle_touch_heading(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg,
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    heading_full_rad: float,
+    heading_zero_rad: float,
+    floor: float = 0.5,
+    good_min: float = 0.5,
+    good_max: float = 5.0,
+    link_names: list[str] | None = None,
+    palm_normal_axis: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> torch.Tensor:
+    """reach_rewards.reward_gentle_touch scaled by palm heading: full within
+    heading_full_rad of the stem, down to `floor` at heading_zero_rad and
+    beyond. The plain term paid a side-on touch in full, so the policy
+    touched first and fixed the heading slowly in contact (the hover before
+    the hold); the floor keeps touching itself worth more than not."""
+    touch = rr.reward_gentle_touch(env, sensor_cfg, robot_cfg, good_min=good_min, good_max=good_max,
+                                   link_names=link_names, palm_normal_axis=palm_normal_axis)
+    theta = rr._palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
+    fade = ((heading_zero_rad - theta) / (heading_zero_rad - heading_full_rad)).clamp(0.0, 1.0)
+    return touch * (floor + (1.0 - floor) * fade)

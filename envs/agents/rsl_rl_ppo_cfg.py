@@ -209,6 +209,13 @@ class AppleReachTreeWaistFacePPORunnerCfg(AppleGraspPPORunnerCfg):
 
 
 @configclass
+class AppleReachSpindlePPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachSpindle-v1: the facing waist reach on the tall-spindle tree.
+    Own log folder (logs/rsl_rl/apple_reach_spindle)."""
+    experiment_name = "apple_reach_spindle"
+
+
+@configclass
 class AppleGraspTreePPORunnerCfg(AppleGraspGraspPPORunnerCfg):
     """AppleGraspTree-v1: the grasp recipe on the multi-apple tree with the
     hold-under-load stage. Own log folder (logs/rsl_rl/apple_grasp_tree)."""
