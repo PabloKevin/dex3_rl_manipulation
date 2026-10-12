@@ -464,3 +464,127 @@ def reach_check(target: np.ndarray, shoulder: np.ndarray, env: dict) -> dict:
         if not in_map:
             why.append("not a feasible cell of " + os.path.basename(env["map"]))
     return {"ok": not why, "why": why, "rel": rel, "r": r, "az_deg": az, "dz": float(rel[2]), "in_map": in_map}
+
+
+# ─────────────────────────────────────────────
+#  GRASP policy (AppleGraspSpindle-v2: hand-only 44 inputs, 14 outputs)
+#  envs/apple_grasp_tree_env_cfg.HandOnlyObservationsCfg + the grasp phase of
+#  envs/mdp/grasp_autoplay.ReachHandoffJointPositionAction
+# ─────────────────────────────────────────────
+
+GRASP_POLICY_DEFAULT = os.path.join(REPO, "envs", "agents", "best_weights", "grasp_spindle_v2_1499.pt")
+#: where the fruit centre sits in the palm link's frame in a tripod hold (apple_grasp_grasp_env_cfg)
+GRASP_CENTER_LOCAL = np.array([0.073, 0.057, 0.0])
+GRASP_ARM_SCALE = 0.05            # trainee arm action: anchor + 0.05 * raw (reach phase uses 0.5)
+GRASP_HAND_SCALE = 0.3
+GRASP_ARM_VMAX, GRASP_ARM_AMAX = 2.0, 8.0
+GRASP_HAND_VMAX, GRASP_HAND_AMAX = 3.0, 20.0
+#: the right_hand action term's 7 dims are in ARTICULATION order (not R.DEX3_ORDER); the
+#: collect step of validate_grasp_io.py compares this with the term's own joint names
+HAND_ART_ORDER = ["index_0", "middle_0", "thumb_0", "index_1", "middle_1", "thumb_1", "thumb_2"]
+#: default joint positions of the hand (robot init_state), by name; the observation is q - default
+HAND_DEFAULT = {"thumb_0": 0.0, "thumb_1": 0.6, "thumb_2": 0.0, "index_0": 0.0, "index_1": 0.0,
+                "middle_0": 0.0, "middle_1": 0.0}
+#: a ZERO trainee hand action in the grasp phase: the thumb pre-shaped in opposition
+GRASP_HAND_OFFSET = dict(HAND_DEFAULT, thumb_0=0.0, thumb_1=0.1, thumb_2=-0.4)
+#: the sim's soft joint limits (rad) -- what the policy was trained against (the real hand's
+#: URDF limits are wider: thumb_1 up to 0.724; validate_grasp_io.py compares with the env)
+HAND_LIMITS = {"thumb_0": (-0.9948, 0.9948), "thumb_1": (-1.0057, 0.5694), "thumb_2": (-1.7017, -0.0436),
+               "index_0": (0.0393, 1.5315), "index_1": (0.0436, 1.7017),
+               "middle_0": (0.0393, 1.5315), "middle_1": (0.0436, 1.7017)}
+#: the nine taxels (scripts/tactile_layout.TAXELS order) and the finger each belongs to
+TAXEL_FINGER = ["thumb", "thumb", "middle", "middle", "index", "index", "palm", "palm", "palm"]
+#: damage force sampled in training: 22-28 N for apples (60%), 20-40 N otherwise
+FRUIT_DAMAGE_N = 25.0
+
+
+def hand_art_to_dex3(v_art) -> np.ndarray:
+    v = np.asarray(v_art, float)
+    return np.array([v[HAND_ART_ORDER.index(n)] for n in DEX3_ORDER])
+
+
+def hand_dex3_to_art(v_dex) -> np.ndarray:
+    v = np.asarray(v_dex, float)
+    return np.array([v[DEX3_ORDER.index(n)] for n in HAND_ART_ORDER])
+
+
+def hand_limits_art():
+    lo = np.array([HAND_LIMITS[n][0] for n in HAND_ART_ORDER])
+    hi = np.array([HAND_LIMITS[n][1] for n in HAND_ART_ORDER])
+    return lo, hi
+
+
+def make_grasp_limiters(dtype=np.float64) -> dict:
+    """The trainee's limiters of the grasp phase. Arm: offset = the target the reach phase
+    was commanding at the hand-off (set with .reset_to), scale 0.05. Hand: offset =
+    GRASP_HAND_OFFSET (articulation order), scale 0.3, clip +-3 on the target (the
+    joint limits do the rest on the hand)."""
+    off = np.array([GRASP_HAND_OFFSET[n] for n in HAND_ART_ORDER])
+    lo, hi = np.full(7, -3.0), np.full(7, 3.0)              # the env clips the TARGET to +-3 only
+    return {
+        "arm": RateLimiter(ARM_DEFAULT, GRASP_ARM_SCALE, ARM_DEFAULT - 3.0, ARM_DEFAULT + 3.0,
+                           GRASP_ARM_VMAX, GRASP_ARM_AMAX, dtype=dtype),
+        "hand": RateLimiter(off, GRASP_HAND_SCALE, lo, hi, GRASP_HAND_VMAX, GRASP_HAND_AMAX, dtype=dtype),
+    }
+
+
+class TactileFeatures:
+    """envs/mdp/observations.tactile_slip / finger_balance / force_level from nine taxel
+    forces [N] (TAXEL_FINGER order). Slip = (f - f_prev)/dt per taxel (zero on the first
+    call); balance = (per-finger mean - mean of the three)/(|mean| + 1e-3) over
+    (thumb, index, middle); level = those per-finger means."""
+
+    def __init__(self, dt: float = DT):
+        self.dt, self.prev = dt, None
+        self.idx = {f: [i for i, g in enumerate(TAXEL_FINGER) if g == f] for f in ("thumb", "index", "middle")}
+
+    def step(self, taxels):
+        f = np.asarray(taxels, float)
+        slip = np.zeros(9) if self.prev is None else (f - self.prev) / self.dt
+        self.prev = f.copy()
+        per = np.array([f[self.idx[k]].mean() for k in ("thumb", "index", "middle")])
+        m = per.mean()
+        return slip, (per - m) / (abs(m) + 1e-3), per
+
+
+def build_grasp_obs(hand_q_dex3, hand_dq_dex3, slip, balance, level, grip_level_n, apple_in_palm,
+                    last_hand_raw_art, gravity_palm, phase: float = 1.0) -> np.ndarray:
+    """The 44-dim hand-only observation, in the env's term order:
+    hand q-default (R.DEX3_ORDER = RIGHT_HAND_JOINTS) 7 | hand dq 7 | slip 9 | balance 3 |
+    level 3 | grip command [N] 1 | grasp phase 1 | fruit centre in the palm frame minus
+    GRASP_CENTER_LOCAL 3 | last HAND action (articulation order) 7 | gravity in the palm frame 3."""
+    q = np.asarray(hand_q_dex3, float) - np.array([HAND_DEFAULT[n] for n in DEX3_ORDER])
+    pocket = np.asarray(apple_in_palm, float) - GRASP_CENTER_LOCAL
+    return np.concatenate([q, np.asarray(hand_dq_dex3, float), slip, balance, level, [grip_level_n], [phase],
+                           pocket, np.asarray(last_hand_raw_art, float), np.asarray(gravity_palm, float)])
+
+
+def apple_in_palm_frame(fr: "Frames", apple: np.ndarray) -> np.ndarray:
+    """object_pos_in_body_frame: the fruit centre in right_hand_palm_link's own axes, from
+    the palm link ORIGIN (not the reach reference point)."""
+    return fr.palm_R.T @ (np.asarray(apple, float) - fr.palm_pos)
+
+
+def gravity_in_palm(fr: "Frames", up_in_pelvis=(0.0, 0.0, 1.0)) -> np.ndarray:
+    """Unit gravity direction in the palm frame (tree_grasp.gravity_in_palm). The pelvis is
+    taken as upright (the robot stands on level ground); pass the IMU's up vector otherwise."""
+    return fr.palm_R.T @ (-np.asarray(up_in_pelvis, float))
+
+
+class GraspPolicy:
+    """The exported hand-only grasp policy: 44 -> 14 (arm 7, hand 7 in articulation order)."""
+
+    def __init__(self, path: str = GRASP_POLICY_DEFAULT):
+        import torch
+        torch.set_num_threads(1)
+        self.torch, self.path = torch, path
+        self.net = torch.jit.load(path, map_location="cpu").eval()
+        ws = [p for _, p in self.net.named_parameters() if p.dim() == 2]
+        self.n_in, self.n_out = int(ws[0].shape[1]), int(ws[-1].shape[0])
+        if (self.n_in, self.n_out) != (44, 14):
+            raise ValueError(f"{path}: {self.n_in} in / {self.n_out} out -- not the hand-only grasp policy (44 / 14)")
+
+    def __call__(self, obs: np.ndarray) -> np.ndarray:
+        with self.torch.no_grad():
+            x = self.torch.as_tensor(np.asarray(obs, np.float32)).view(1, -1)
+            return self.net(x)[0].numpy().astype(float)

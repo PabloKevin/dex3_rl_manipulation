@@ -90,7 +90,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import reach_io as R  # noqa: E402
+import reach_io as R
+import tactile_io as TIO  # noqa: E402
 
 PICKER_DIR = os.path.expanduser("~/g1_fruits_picker/apple_picker")
 #: the daemon's enable blend after an exec_mode switch (arm_mpc_server ENABLE_RAMP_S)
@@ -158,6 +159,42 @@ def parse_args():
     p.add_argument("--home_only", action="store_true",
                    help="only move the arm HOME (waist to 0), hold it there and exit -- e.g. at the start of a "
                         "session or after an E-STOP reset")
+    p.add_argument("--reach_scale", type=float, default=1.25,
+                   help="the policy's envelope is judged as F times larger (the real arm reaches further than "
+                        "the sim's probed map); 1 = exactly the training envelope. Outside the training range "
+                        "the policy is untested: the safety watch still applies")
+    g = p.add_argument_group("grasp (toy_grasp.py)")
+    g.add_argument("--grasp", action="store_true",
+                   help="after the reach, hand off to the GRASP policy (hand-only, 44 in / 14 out): close the "
+                        "fingers on the fruit, hold, release, back home")
+    g.add_argument("--grasp_policy", default=R.GRASP_POLICY_DEFAULT)
+    g.add_argument("--grip_n", type=float, default=6.0,
+                   help="N: the grip-force COMMAND (trained 0.45-0.75 x the 20-40 N damage force = 11-19 N; the "
+                        "pad force is uncalibrated -- start low)")
+    g.add_argument("--grip_stop_n", type=float, default=20.0,
+                   help="N: the estimated pad force of any finger above this opens the hand")
+    g.add_argument("--grasp_s", type=float, default=4.0, help="s of grasp policy before it is judged")
+    g.add_argument("--grasp_hold_s", type=float, default=2.0, help="s the grip is kept (policy running) after it formed")
+    g.add_argument("--handoff_s", type=float, default=0.5, help="s the arm holds at the reach target before the hand-off")
+    g.add_argument("--grasp_speed", type=float, default=None, help="speed factor of the grasp limiters (default --speed)")
+    g.add_argument("--grasp_arm_free", action="store_true",
+                   help="unlock the shoulder/elbow (scale 0.05) once a grip formed, as in training; default: only "
+                        "the wrist is free (as in training before the grip)")
+    g.add_argument("--grasp_wrist_max", type=float, default=0.15,
+                   help="rad: the wrist targets stay within this of the hand-off pose (sim: up to 0.2-0.4 against a "
+                        "compliant stem; at the arm's kp 100 each 0.1 rad blocked is 10 N*m)")
+    g.add_argument("--grasp_move_stop", type=float, default=0.04,
+                   help="m: the palm moving further than this from the hand-off point stops the grasp")
+    g.add_argument("--tactile_calib", default=None,
+                   help="tactile_calibrate.py's file (default: logs/sim2real/tactile_calib.json when it exists)")
+    g.add_argument("--tactile_gain", type=float, default=3000.0,
+                   help="raw Dex3 pressure counts per Newton (the sim's placeholder: tactile_layout."
+                        "SIM_FORCE_TO_RAW_GAIN; uncalibrated on the real hand)")
+    g.add_argument("--tactile_top", type=int, default=3,
+                   help="the pad force is the mean of this many strongest pad rises above their baseline")
+    g.add_argument("--tactile_map", default="pool",
+                   help="'pool' (every pad feeds every finger: the grouping of the nine press_sensor_state "
+                        "entries is not documented) or 'thumb=0,1;index=2,3;middle=4,5;palm=6,7,8' (entry numbers)")
     p.add_argument("--force", action="store_true", help="run a target outside the policy's training envelope")
     p.add_argument("--shadow_s", type=float, default=5.0, help="--shadow: seconds of read-only policy")
     p.add_argument("--realtime", action="store_true", help="--mock: run in real time (default: as fast as possible)")
@@ -239,6 +276,8 @@ class Snap:
     waist_dq: np.ndarray
     arm_temp: np.ndarray | None = None
     hand_q: np.ndarray | None = None         # Dex3 order (R.DEX3_ORDER)
+    hand_dq: np.ndarray | None = None
+    pads: np.ndarray | None = None           # every press_sensor_state element, raw counts (9 entries x 12)
     tactile: float | None = None             # raw Dex3 pressure mean (not a force)
     age: float = 0.0                         # s since the lowstate sample
     mode: str | None = None                  # daemon exec_mode, right arm
@@ -275,6 +314,9 @@ class MockIO:
         self.wd = np.zeros(3)
         self.q_ref, self.mode, self.frozen, self.ramp = None, "mpc", False, None
         self.hand = np.array([math.radians(30), 0, 0, 0, 0, 0, 0], float)
+        self.hand_tgt = self.hand.copy()
+        self.hand_dq = np.zeros(7)
+        self.pad_base = np.full(9, 100000.0)
         self.kp, self.kd = args.kp, args.kd
         self.estop_why = None
 
@@ -288,7 +330,20 @@ class MockIO:
         tau = self.kin.gravity_torque(self.w, self.q)
         return Snap(arm_q=self.q.copy(), arm_dq=self.dq.copy(), arm_tau=tau, waist_q=self.w.copy(),
                     waist_dq=self.wd.copy(), arm_temp=np.full(7, 40.0), hand_q=self.hand.copy(),
-                    tactile=0.0, age=0.002, mode=self.mode, frozen=self.frozen, daemon_age=0.05, t=self.t)
+                    hand_dq=self.hand_dq.copy(), pads=self._pads(), tactile=0.0, age=0.002, mode=self.mode,
+                    frozen=self.frozen, daemon_age=0.05, t=self.t)
+
+    def _pads(self):
+        """Stand-in tactile: a fruit in the closed fingers (index/middle bases + thumb flexed)
+        presses the pads; 2 N per 0.1 rad past the contact angle, 3000 counts per N."""
+        close = max(0.0, self.hand[4] - 1.45) + max(0.0, self.hand[3] - 0.5) + max(0.0, -self.hand[2] - 0.7)
+        n = 20.0 * close
+        p = np.full(108, 100000.0) + np.random.normal(0.0, 30.0, 108)
+        p[:72] += 3000.0 * n
+        return p
+
+    def hand_cmd(self, q):
+        self.hand_tgt = np.asarray(q, float).copy()
 
     def _physics(self, dt):
         if self.mode == "qref" and self.q_ref is not None and not self.frozen:
@@ -303,6 +358,12 @@ class MockIO:
                 self.q += self.dq * h
         else:
             self.dq *= 0.0
+        # hand: a rate-limited follow of its target (thumb_0 locked at its rest)
+        step = 3.0 * dt
+        new = self.hand + np.clip(self.hand_tgt - self.hand, -step, step)
+        new[0] = self.hand[0]
+        self.hand_dq = (new - self.hand) / max(dt, 1e-6)
+        self.hand = new
         if self.ramp is not None:
             w0, w1, t0, d = self.ramp
             f = (self.t - t0) / d
@@ -326,6 +387,7 @@ class MockIO:
         self.frozen = False
 
     qref_waist = True
+    waist_src = "qref"
 
     def send_arm(self, q, dq=None, waist=None, waist_dq=0.0):
         self.q_ref = np.asarray(q, float).copy()
@@ -343,9 +405,9 @@ class MockIO:
         if kind == "cup":
             for i, n in enumerate(R.DEX3_ORDER):
                 if i:
-                    self.hand[i] = R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"]
+                    self.hand[i] = self.hand_tgt[i] = R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"]
         elif kind == "open":
-            self.hand[1:] = 0.0
+            self.hand_tgt[1:] = 0.0
 
     def detection_info(self) -> str:
         return "mock"
@@ -572,9 +634,18 @@ class PickerIO:
         except Exception:
             tac = None
         d = self._dstate
+        hdq = pads = None
+        try:
+            hs = self.app.right_hand_state
+            if hs is not None and len(hs.motor_state) >= 7:
+                hdq = np.array([float(getattr(hs.motor_state[i], "dq", 0.0)) for i in range(7)])
+            if self.args.grasp:
+                pads = TIO.flat_from_handstate(hs)
+        except Exception:
+            pass
         return Snap(arm_q=g(arm_i, "q"), arm_dq=g(arm_i, "dq"), arm_tau=g(arm_i, "tau_est"),
                     waist_q=g(w_i, "q"), waist_dq=g(w_i, "dq"), arm_temp=temp,
-                    hand_q=None if hq is None else np.asarray(hq, float), tactile=tac,
+                    hand_q=None if hq is None else np.asarray(hq, float), hand_dq=hdq, pads=pads, tactile=tac,
                     age=(time.monotonic() - rx) if rx else 0.0,
                     mode=d.get("exec_mode"), frozen=d.get("frozen"),
                     daemon_age=None if self._dstate_t is None else time.monotonic() - self._dstate_t,
@@ -588,6 +659,12 @@ class PickerIO:
     def qref_waist(self) -> bool:
         """The daemon takes the waist yaw in the qref stream (v22-estop and later)."""
         return bool(getattr(self, "_dfull", {}).get("qref_waist"))
+
+    @property
+    def waist_src(self):
+        """Who drives the daemon's waist: 'qref' only while OUR stream (slot 12) is arriving
+        fresh -- the proof that the daemon's reader has matched this process's writer."""
+        return getattr(self, "_dfull", {}).get("waist_src")
 
     def send_arm(self, q, dq=None, waist=None, waist_dq=0.0):
         if not self.commands or self.estop_why is not None:
@@ -621,6 +698,14 @@ class PickerIO:
             if i == 0:
                 continue
             self.app.set_hand_joint_deg("right", i, math.degrees(R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"]))
+
+    def hand_cmd(self, q_dex3):
+        """Joint targets [rad] for the seven Dex3 joints (R.DEX3_ORDER). thumb_0 is runtime-locked
+        by the picker (30 deg) and is not commanded."""
+        if not self.commands or self.estop_why is not None:
+            return
+        for i in range(1, 7):
+            self.app.set_hand_joint_deg("right", i, math.degrees(float(q_dex3[i])))
 
     def detection_info(self) -> str:
         """The tracker's own account of the last message (what it kept, what it dropped, why)."""
@@ -663,7 +748,12 @@ class PickerIO:
                 # stop streaming first (the daemon latches a hold at the last command),
                 # then hand the side back to the default mode for the picker
                 time.sleep(0.3)
-                self.arm.set_exec_mode("right", "mpc")
+                t_end = time.monotonic() + 4.0
+                while time.monotonic() < t_end:         # one send can be lost: until the daemon says so
+                    self.arm.set_exec_mode("right", "mpc")
+                    time.sleep(0.3)
+                    if self._dstate.get("exec_mode") == "mpc":
+                        break
         except Exception:
             pass
         try:
@@ -926,6 +1016,75 @@ def simplify_path(qs, tol=0.05):
 
 
 # ─────────────────────────────────────────────
+#  Tactile: the real Dex3 pads -> the nine sim taxels [N]
+# ─────────────────────────────────────────────
+
+class PadTactile:
+    """The real Dex3 pads -> the nine sim taxel forces [N] (thumb x2, middle x2, index x2, palm
+    x3). With a calibration file (tactile_calibrate.py: which of the 108 pressure elements
+    answer at each named place, and counts per newton) every taxel is the summed rise of its
+    place's elements over the baseline taken at the start of the grasp, divided by the gain.
+    Without one, a stopgap: the nine press_sensor_state entries' means, 'pool' (every entry
+    feeds every finger: the mean of the --tactile_top strongest rises) or an explicit
+    'thumb=0,1;index=2,3;middle=4,5;palm=6,7,8' entry grouping, at --tactile_gain counts/N."""
+
+    def __init__(self, gain: float, top: int, mapping: str, calib=None):
+        self.gain, self.top = float(gain), int(top)
+        self.calib = calib
+        if calib is not None:
+            self.gain = calib.gain
+        self.groups = None
+        if calib is None and mapping != "pool":
+            self.groups = {}
+            for part in mapping.split(";"):
+                k, v = part.split("=")
+                self.groups[k.strip()] = [int(x) for x in v.split(",")]
+        self.base = None
+        self.noise = None
+        self.samples = []
+
+    def _view(self, flat):
+        if flat is None:
+            return None
+        a = np.asarray(flat, float)
+        return a if self.calib is not None else TIO.entry_means(a)
+
+    def add_baseline(self, flat):
+        v = self._view(flat)
+        if v is not None and len(v) >= 9:
+            self.samples.append(v)
+
+    def finish_baseline(self) -> bool:
+        if len(self.samples) < 5:
+            return False
+        self.base, self.noise = TIO.baseline(self.samples)
+        return bool(np.any(np.isfinite(self.base)))
+
+    def taxels(self, flat):
+        """(9 taxel forces [N] in R.TAXEL_FINGER order, the strongest finger taxel [N], the
+        per-element / per-entry rises in N for the log)."""
+        v = self._view(flat)
+        if self.base is None or v is None or len(v) != len(self.base):
+            return np.zeros(9), 0.0, np.zeros(9 if self.calib is None else 1)
+        if self.calib is not None:
+            # zero = the baseline of this grasp's start + 4 sigma of each element's own noise
+            zero = self.base + 4.0 * np.nan_to_num(self.noise)
+            r = np.maximum(np.nan_to_num(v - zero, nan=0.0, posinf=0.0, neginf=0.0), 0.0) / self.gain
+            t = self.calib.taxels(v, zero)
+            return t, float(t[:6].max()), r
+        r = np.maximum(np.nan_to_num(v - self.base, nan=0.0, posinf=0.0, neginf=0.0), 0.0) / self.gain
+        if self.groups is None:
+            f = float(np.sort(r)[::-1][:max(1, self.top)].mean())
+            return np.array([f] * 6 + [0.0] * 3), f, r
+        out = np.zeros(9)
+        place = {"thumb": [0, 1], "middle": [2, 3], "index": [4, 5], "palm": [6, 7, 8]}
+        for k, idx in place.items():
+            e = [i for i in self.groups.get(k, []) if 0 <= i < 9]
+            out[idx] = float(np.mean(r[e])) if e else 0.0
+        return out, float(out[:6].max()), r
+
+
+# ─────────────────────────────────────────────
 #  The test
 # ─────────────────────────────────────────────
 
@@ -935,6 +1094,19 @@ class Toy:
         self.kin = R.G1Kinematics(args.urdf)
         self.pol = R.ReachPolicy(args.policy)
         self.layout = self.pol.layout
+        self.gpol = R.GraspPolicy(args.grasp_policy) if args.grasp else None
+        self.grasp_rows = []
+        self.tcal = None
+        if args.grasp:
+            path = args.tactile_calib or (TIO.DEFAULT_CALIB if os.path.exists(TIO.DEFAULT_CALIB) else None)
+            if path:
+                self.tcal = TIO.TactileCalib.load(path)
+                print(f"  tactile calibration {path}: " + ", ".join(
+                    f"{k} {len(v)}" for k, v in self.tcal.locations.items()) + f" elements, "
+                    f"{self.tcal.gain:g} counts/N")
+            else:
+                print(f"{C_YEL}  no tactile calibration (python3 sim2real/tactile_calibrate.py): the pads are "
+                      f"read as nine entry means at {args.tactile_gain:g} counts/N{C_OFF}")
         if self.layout == "tree" and args.waist == "follow":
             sys.exit(f"{args.policy} is an arm-only policy: --waist follow needs a waist policy")
         sys.path.insert(0, os.path.abspath(args.picker_dir))
@@ -1133,12 +1305,26 @@ class Toy:
 
     def check(self, target, sh, quiet=False):
         env = R.ENVELOPE_WAIST if self.args.waist == "follow" else R.ENVELOPE_ARM
-        chk = R.reach_check(target, sh, env)
+        # --reach_scale F: the real arm reaches further than the sim envelope, so the target is
+        # judged as if it were F times closer to the shoulder (distance, height, map cell). The
+        # policy still gets the true target.
+        F = max(self.args.reach_scale, 1e-3)
+        sh_a = np.asarray(sh, float)
+        t_eff = sh_a + (np.asarray(target, float) - sh_a) / F
+        chk = R.reach_check(t_eff, sh, env)
+        if F != 1.0:
+            plain = R.reach_check(target, sh, env)          # the scale only ever EXTENDS the envelope
+            if plain["ok"] and not chk["ok"]:
+                chk, t_eff, F = plain, np.asarray(target, float), 1.0
+            else:
+                chk["r"] *= F
+                chk["dz"] *= F
         if not quiet:
-            other = R.reach_check(target, sh, R.ENVELOPE_ARM if env is R.ENVELOPE_WAIST else R.ENVELOPE_WAIST)
+            other = R.reach_check(t_eff, sh, R.ENVELOPE_ARM if env is R.ENVELOPE_WAIST else R.ENVELOPE_WAIST)
             name = "waist" if env is R.ENVELOPE_WAIST else "arm-only"
             print(f"  from the shoulder: {chk['r']:.3f} m, azimuth {chk['az_deg']:+.0f} deg, "
-                  f"height {chk['dz']:+.3f} m")
+                  f"height {chk['dz']:+.3f} m"
+                  + (f"   (envelope judged x{F:g}: as if {chk['r'] / F:.3f} m)" if F != 1.0 else ""))
             print(f"  {name} envelope ({os.path.basename(env['map'])}): "
                   + (f"{C_GRN}inside{C_OFF}" if chk["ok"] else f"{C_RED}{'; '.join(chk['why'])}{C_OFF}"))
             if not chk["ok"] and other["ok"] and self.args.waist == "hold":
@@ -1146,7 +1332,7 @@ class Toy:
         return chk
 
     # ---------- scripted moves ----------
-    def stream(self, traj, waist_to=None, label="", check=True):
+    def stream(self, traj, waist_to=None, label="", check=True, waist_cmd=None):
         """Play per-tick joint targets with the light checks: plumbing, and (check) the
         measured joint SPEED and ACCELERATION against what a scripted move at
         --move_speed can produce -- an arm that speeds up beyond that is falling or
@@ -1178,7 +1364,7 @@ class Toy:
                     self.halted = f"{label}: {why}"
                     self.stream([self.gravity_hold(s)] * int(0.5 / R.DT), check=False)
                     return f"{label}: SAFETY STOP ({why})"
-            io.send_arm(q)
+            io.send_arm(q, waist=waist_cmd, waist_dq=0.0)
             self.q_sent = np.asarray(q, float).copy()
             self.status(s)
             t_next += R.DT
@@ -1219,6 +1405,54 @@ class Toy:
                     + ("moves away from it" if bad is None else "goes DEEPER"))
         return bad is None and end_ok, c[0], min(c), c[-1], (bad if bad is not None else
                                                           (None if end_ok else len(c) - 1)), note
+
+    def plan_home(self, q_from, s):
+        """Joint-space path from where the arm IS to HOME, from a small library plus a
+        seeded random search of 1-2 via points (shoulder abducted away from the legs,
+        elbow/wrist on the way), every candidate judged by path_check's rule with the
+        picker's body cover. Picks the shortest clear one that spends the least time
+        inside the cover. Returns (via tuple or None, text)."""
+        a = self.args
+        BC = self.watch.BC
+        w = float(s.waist_q[0])
+        qf = None if s.hand_q is None else list(s.hand_q)
+        lo, hi, H = self.lo, self.hi, R.HOME_Q
+        q_from = np.asarray(q_from, float)
+        line = BC.DEFAULT_MARGIN_M
+
+        def opened(q, roll):
+            q = np.array(q, float)
+            q[1] = float(np.clip(min(q[1], roll), lo[1], hi[1]))
+            return q
+        cands = [((), "straight")]
+        rolls = [r for r in (a.open_roll, -0.6, -0.8) if r < 0.0] or [-0.4]
+        for r in rolls:
+            cands.append(((opened(q_from, r),), f"open to roll {r:+.2f}, then home"))
+            cands.append(((opened(q_from, r), opened(H, r)), f"open {r:+.2f}, home pose abducted, then home"))
+        rng = np.random.default_rng(1)
+        for _ in range(60):
+            f = rng.uniform(0.2, 0.8)
+            qa = q_from + f * (H - q_from) + rng.normal(0.0, 0.12, 7)
+            qa = np.clip(opened(qa, rng.uniform(-0.9, -0.3)), lo, hi)
+            cands.append(((qa,), "random via"))
+            qb = np.clip(opened(q_from, rng.uniform(-0.9, -0.3)) + rng.normal(0.0, 0.05, 7), lo, hi)
+            cands.append(((qb, qa), "random via x2"))
+        best = None
+        for via, name in cands:
+            traj = joint_path_traj([q_from, *via, H], a.move_speed)
+            pts = list(traj[::5]) + [traj[-1]]
+            c = np.array([float(BC.self_clearance("right", np.asarray(q, float), waist=w, q_fingers=qf)) for q in pts])
+            floor = min(line, c[0] - self.PATH_NO_WORSE_M)
+            if np.any(c < floor) or c[-1] < line:
+                continue
+            length = sum(float(np.max(np.abs(b - x))) for x, b in zip([q_from, *via], [*via, H]))
+            score = length + 1.0 * float(np.mean(c < line)) - 2.0 * min(float(c.min()), 0.05) * (c[0] >= line)
+            if best is None or score < best[0]:
+                best = (score, via, name, float(c.min()), float(c[0]), float(c[-1]))
+        if best is None:
+            return None, "every candidate path (%d) goes deeper into the body cover or ends inside it" % len(cands)
+        _, via, name, cmin, c0, c1 = best
+        return via, f"{name}: clearance start {c0 * 100:+.1f} / worst {cmin * 100:+.1f} / end {c1 * 100:+.1f} cm"
 
     def move_to(self, q_from, q_goal, label, waist_to=None, via=()):
         s = self.io.read()
@@ -1280,15 +1514,14 @@ class Toy:
             if err:
                 return self.finish(err)
             t_mode = io.now()
-            # the arm often rests wedged against the leg: first ABDUCT it (shoulder roll
-            # outward) until it is clear of the legs, then go home
-            via = ()
-            if a.open_roll < 0.0 and q0[1] > a.open_roll:
-                q_open = q0.copy()
-                q_open[1] = float(np.clip(a.open_roll, self.lo[1], self.hi[1]))
-                via = (q_open,)
-                print(f"  first OPEN the arm outward (shoulder roll {q0[1]:+.2f} -> {q_open[1]:+.2f}), then home")
-            err = self.move_to(q0, R.HOME_Q, "open + move home" if via else "move home", via=via)
+            # from wherever the arm is (resting on the leg, stopped mid-reach, ...): the best
+            # collision-checked joint path home
+            via, why = self.plan_home(q0, s)
+            if via is None:
+                return self.finish(f"no clear path home from here ({why}): move the arm by hand away "
+                                   "from the body, or turn it with the picker")
+            print(f"  path home: {why}")
+            err = self.move_to(q0, R.HOME_Q, "move home" if not via else f"move home (via {len(via)})", via=via)
             if err:
                 return self.finish(err)
             # the policy starts at waist ~0 (training: +-0.1 rad); turned with the arm at the
@@ -1330,6 +1563,17 @@ class Toy:
             e_home = s.arm_q - R.HOME_Q
             print(f"  at home: q err {np.round(e_home, 3).tolist()} "
                   f"(gravity sag under kp {a.kp:g} is expected; the sim sags too)")
+            if a.grasp and a.hand == "cup" and s.hand_q is not None:
+                want = np.array([R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER])
+                dev = np.asarray(s.hand_q) - want
+                dev[0] = 0.0                               # thumb_0 is locked by the picker
+                print(f"  hand cup: measured {np.round(s.hand_q, 2).tolist()} vs commanded "
+                      f"{np.round(want, 2).tolist()} rad (R.DEX3_ORDER)")
+                if io.commands and float(np.max(np.abs(dev))) > 0.45:
+                    j = int(np.argmax(np.abs(dev)))
+                    return self.finish(f"the hand did not reach the commanded cup: {R.DEX3_ORDER[j]} is "
+                                       f"{dev[j]:+.2f} rad off. The grasp policy's joint convention or the hand's "
+                                       "output is wrong -- not going on (check with the picker's hand tools)")
             if io.commands and float(np.max(np.abs(e_home))) > 0.25:
                 j = int(np.argmax(np.abs(e_home)))
                 return self.finish(f"the arm did NOT reach home ({R.RIGHT_ARM_JOINTS[j][6:-6]} "
@@ -1349,7 +1593,26 @@ class Toy:
             if outcome.startswith("REACHED") and a.after_reach == "freeze":
                 self.set_phase("HOLD")
                 self.ctx["doing"] = "holding where the palm reached the target"
-                self.hold(self.q_sent, a.hold_s)
+                self.hold(self.q_sent, a.handoff_s if a.grasp else a.hold_s)
+            # 4b. the grasp policy, if asked: the fingers close on the fruit, the arm stays
+            if a.grasp and outcome.startswith("REACHED") and not stopped and io.estop_why is None:
+                if not self.confirm(f"  -> HAND OFF to the grasp policy (close the fingers, grip command "
+                                    f"{a.grip_n:g} N, stop at {a.grip_stop_n:g} N)?"):
+                    outcome += "; grasp aborted by the operator"
+                else:
+                    g_out, g_stopped, held = self.grasp_phase()
+                    col = C_GRN if held else C_RED if g_stopped else C_YEL
+                    self.say(f"  grasp: {g_out}", col)
+                    outcome += "; " + g_out
+                    stopped = stopped or g_stopped
+                    if io.estop_why is None:
+                        # let go (the fruit stays on its tree), arm held where it is
+                        self.set_phase("RELEASE")
+                        self.ctx["doing"] = "opening the hand"
+                        io.hand_set("open")
+                        self.hold(self.gravity_hold(io.read()) if g_stopped else self.q_sent, 1.5)
+            if io.estop_why is not None:
+                return self.finish(outcome if outcome.startswith("E-STOP") else f"E-STOP: {io.estop_why}")
             s = io.read()
             if stopped:
                 q_hold = self.gravity_hold(s)
@@ -1402,28 +1665,41 @@ class Toy:
               f"whole path{C_OFF}")
         return simplify_path([self.q_sent] + self.path_cmd[::-1] + [R.HOME_Q], tol=0.08)
 
-    def enter_qref(self, q_hold, timeout_s=15.0):
-        """Switch the right arm to the daemon's exec_mode "qref" and WAIT until its state
-        says so, re-sending (a command sent before the daemon has discovered this process
-        is lost; it then ignores the whole stream and the arm does not move)."""
+    def enter_qref(self, q_hold, timeout_s=45.0):
+        """Switch the right arm to the daemon's exec_mode "qref" and WAIT until the daemon
+        proves it is receiving THIS process's stream. A command or a stream sent before the
+        daemon has discovered this process is lost (a fresh process takes ~20-35 s): the
+        arm would not move. 'mode == qref' alone is not proof -- a previous run can leave
+        the daemon in qref, and then the stream of this run is lost while the mode already
+        reads right. The proof is the daemon's waist source: it reads 'qref' only while
+        slot 12 of our stream arrives fresh, so the stream carries the waist's CURRENT
+        yaw (no motion; the daemon rate-limits from where the waist stands)."""
         io = self.io
         if not io.commands:
             return None
+        s0 = io.read()
+        w0 = float(s0.waist_q[0])
+        proof = bool(getattr(io, "qref_waist", False))
+        if s0.mode == "qref":
+            print("  daemon was left in exec_mode qref by an earlier run: waiting for proof that it "
+                  "receives this stream" if proof else "  daemon was left in exec_mode qref by an earlier run")
         t0 = io.now()
         t_send = -9.0
         while io.now() - t0 < timeout_s:
             if io.now() - t_send > 0.5:
                 io.exec_mode("qref")
                 t_send = io.now()
-            err = self.stream([q_hold] * 5, check=False)        # keep a fresh reference flowing
+            err = self.stream([q_hold] * 5, check=False, waist_cmd=w0 if proof else None)
             if err:
                 return err
-            if io.read().mode == "qref":
-                print(f"  daemon in exec_mode qref after {io.now() - t0:.1f} s")
+            if io.read().mode == "qref" and (not proof or io.waist_src == "qref"):
+                print(f"  daemon in exec_mode qref{' and receiving the stream' if proof else ''} "
+                      f"after {io.now() - t0:.1f} s")
                 self.hold(q_hold, 0.3)
                 return None
-        return (f"the arm daemon did not switch to exec_mode qref in {timeout_s:.0f} s (it reports "
-                f"'{io.read().mode}'): nothing would move. Is it running / discovered? estop_cli.py status")
+        return (f"the arm daemon did not confirm exec_mode qref + our stream in {timeout_s:.0f} s (mode "
+                f"'{io.read().mode}', waist source '{io.waist_src}'): nothing would move. Is it running / "
+                f"discovered? estop_cli.py status")
 
     def gravity_hold(self, s):
         """Hold where the arm IS: the measured q plus the gravity sag the PD needs
@@ -1604,6 +1880,156 @@ class Toy:
         self.say(f"  policy: {outcome}", col)
         return outcome, stopped
 
+    def make_tactile(self):
+        a = self.args
+        return PadTactile(a.tactile_gain, a.tactile_top, a.tactile_map, self.tcal)
+
+    def grasp_phase(self):
+        """The hand-only grasp policy, from where the reach left the palm at the fruit:
+        close the fingers on it (arm frozen at the hand-off pose except the wrist, as in
+        training before a grip), judge the grip from the pads, keep it --grasp_hold_s,
+        return (outcome, stopped, held). Nothing pulls: the arm does not move away."""
+        a, io, W = self.args, self.io, self.watch
+        sm = W.sm
+        spd = a.grasp_speed or a.speed
+        L = R.make_grasp_limiters()
+        s = io.read()
+        fr = self.frames(s)
+        # arm: offset = the target the reach was commanding (not the default pose); hand: from where
+        # the fingers are (the reach cup)
+        L["arm"].offset = self.q_sent.copy()
+        L["arm"].prev, L["arm"].vel, L["arm"].k = self.q_sent.copy(), np.zeros(7), L["arm"].ANCHOR_STEPS
+        hq_art = R.hand_dex3_to_art(s.hand_q if s.hand_q is not None else
+                                    np.array([R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER]))
+        hq_art[R.HAND_ART_ORDER.index("thumb_0")] = R.REACH_HAND_PRESHAPE["right_hand_thumb_0_joint"]   # locked at 30 deg
+        anchor = self.q_sent.copy()
+        L["hand"].prev, L["hand"].vel, L["hand"].k = hq_art.copy(), np.zeros(7), L["hand"].ANCHOR_STEPS
+        tact = self.make_tactile()
+        feats = R.TactileFeatures()
+        # tactile baseline: the pads at rest, the arm held
+        self.set_phase("GRASP_BASE")
+        self.ctx["doing"] = "tactile baseline (hand still)"
+        t_b = io.now()
+        for _ in range(int(0.8 / R.DT)):
+            if io.estop_why is not None:
+                return f"E-STOP: {io.estop_why}", True, False
+            s = io.read()
+            tact.add_baseline(s.pads)
+            io.send_arm(self.q_sent)
+            t_b += R.DT
+            io.sleep_until(t_b)
+        if not tact.finish_baseline():
+            self.say("no tactile data from the hand (press_sensor_state): the grip is judged from the "
+                     "fingers only and the force input is 0", C_YEL)
+        else:
+            ok_el = np.isfinite(tact.base) & (tact.base > TIO.PRESENT_ABOVE)
+            print(f"  tactile baseline: {int(ok_el.sum())} of {len(tact.base)} readings report, "
+                  f"{np.nanmedian(tact.base[ok_el]) if ok_el.any() else float('nan'):.0f} counts at rest, noise "
+                  f"{np.nanmax(tact.noise[ok_el]) / tact.gain if ok_el.any() else float('nan'):.2f} N max")
+        palm0 = fr.palm_ref.copy()
+        W.reset()
+        self.ctx.update(segment=None, gap=None, commanding=True, lo=self.lo, hi=self.hi)
+        self.set_phase("GRASP")
+        self.ctx["doing"] = "grasp policy closing the fingers"
+        prev_raw = np.zeros(7)
+        t_start = io.now()
+        t_next = t_start
+        t_print = -1.0
+        held_since = None
+        unlocked = False
+        grip_since = None
+        outcome, stopped, held = None, False, False
+        peak = 0.0
+        level = sm.OK
+        try:
+            while True:
+                if io.estop_why is not None:
+                    return f"E-STOP: {io.estop_why}", True, False
+                s = io.read()
+                fr = self.frames(s)
+                t = io.now() - t_start
+                taxels, pooled, rises = tact.taxels(s.pads)
+                slip, bal, lvl = feats.step(taxels)
+                hq = np.array(s.hand_q if s.hand_q is not None else R.hand_art_to_dex3(L["hand"].prev), float)
+                hdq = np.zeros(7) if s.hand_dq is None else np.asarray(s.hand_dq, float)
+                # thumb_0 is runtime-locked at 30 deg by the picker; the policy believes its own command
+                hq[0] = float(R.hand_art_to_dex3(L["hand"].prev)[0])
+                hdq[0] = 0.0
+                obs = R.build_grasp_obs(hq, hdq, slip, bal, lvl, a.grip_n, R.apple_in_palm_frame(fr, self.apple),
+                                        prev_raw, R.gravity_in_palm(fr))
+                raw = self.gpol(obs)
+                arm_raw = raw[:7].copy()
+                if not (unlocked and a.grasp_arm_free):
+                    arm_raw[:4] = 0.0                       # shoulder + elbow frozen until a grip (training: unlock_with_grip)
+                slow = a.safety == "on" and level >= sm.SLOW
+                spd_now = spd * (a.safety_slow if slow else 1.0)
+                tgt_arm = L["arm"].step(arm_raw, s.arm_q, spd_now)
+                lim = np.array([0.05] * 4 + [a.grasp_wrist_max] * 3)
+                tgt_arm = np.clip(tgt_arm, np.maximum(anchor - lim, self.lo), np.minimum(anchor + lim, self.hi))
+                hit = np.abs(tgt_arm - L["arm"].prev) > 1e-9
+                if hit.any():                              # keep the limiter on what is really sent
+                    L["arm"].prev = tgt_arm.copy()
+                    L["arm"].vel[hit] = 0.0
+                tgt_hand_art = L["hand"].step(raw[7:14], None, spd_now)
+                lo_h = np.array([R.HAND_LIMITS[n][0] for n in R.HAND_ART_ORDER])
+                hi_h = np.array([R.HAND_LIMITS[n][1] for n in R.HAND_ART_ORDER])
+                hand_dex = R.hand_art_to_dex3(np.clip(tgt_hand_art, lo_h, hi_h))
+                level, out = W.step(s, fr, tgt_arm, L["arm"].vel, a.speed, self.ctx)
+                self.ctx["level_name"] = sm.LEVEL_NAMES[level]
+                self.ctx["warnings"] = [w for _, w in out][:4]
+                W.print_new(out, t)
+                moved = float(np.linalg.norm(fr.palm_ref - palm0))
+                peak = max(peak, pooled)
+                why = None
+                if level >= sm.STOP and a.safety == "on":
+                    why = "SAFETY STOP: " + "; ".join(w for l, w in out if l >= sm.STOP)
+                elif moved > a.grasp_move_stop:
+                    why = f"the palm moved {moved * 100:.1f} cm from the hand-off point (> {a.grasp_move_stop * 100:.0f})"
+                elif pooled > a.grip_stop_n:
+                    why = f"estimated pad force {pooled:.1f} N > {a.grip_stop_n:.0f} N"
+                if why:
+                    self.halted = why
+                    return why, True, False
+                io.send_arm(tgt_arm)
+                io.hand_cmd(hand_dex)
+                self.q_sent = tgt_arm.copy()
+                prev_raw = raw[7:14].copy()
+                # grip: two finger groups loaded (> 0.5 N) for 0.3 s (the training's latch is tactile too)
+                n_on = int(np.sum(lvl > 0.5))
+                grip_now = n_on >= 2
+                grip_since = (grip_since if grip_since is not None else t) if grip_now else None
+                gripped = grip_since is not None and t - grip_since >= 0.3
+                if gripped and not unlocked:
+                    unlocked = True
+                    self.say(f"  grip formed at t={t:.2f} s: finger forces {np.round(lvl, 1).tolist()} N "
+                             f"(thumb, index, middle; command {a.grip_n:g} N)", C_GRN)
+                held_since = (held_since if held_since is not None else t) if gripped else None
+                self.grasp_rows.append(dict(t=t, obs=obs, raw=raw, hand=hq, tgt_hand=hand_dex, tgt_arm=tgt_arm,
+                                            taxels=taxels, rises=rises, pads=np.nan_to_num(
+                                                np.full(1, np.nan) if s.pads is None else s.pads, nan=-1.0).astype(np.float32),
+                                            moved=moved, level=level))
+                if t - t_print >= 0.5:
+                    t_print = t
+                    print(f"  t={t:4.1f}s  finger N (thumb, index, middle) {np.round(lvl, 1).tolist()}  index_1 "
+                          f"{hq[4]:+.2f} middle_1 {hq[6]:+.2f} thumb_2 {hq[2]:+.2f} rad  palm moved "
+                          f"{moved * 1000:4.1f} mm  [{sm.LEVEL_NAMES[level]}{' SLOW' if slow else ''}]", flush=True)
+                self.status(s, extra="GRASP")
+                if held_since is not None and t - held_since >= a.grasp_hold_s:
+                    outcome, held = (f"GRASPED: held {a.grasp_hold_s:.1f} s, pad force peak {peak:.1f} N, finger "
+                                     f"forces {np.round(lvl, 1).tolist()} N"), True
+                    break
+                if t >= a.grasp_s + (a.grasp_hold_s if held_since is not None else 0.0) and held_since is None:
+                    outcome = (f"NO GRIP in {a.grasp_s:.0f} s: finger forces {np.round(lvl, 1).tolist()} N, "
+                               f"index_1 {hq[4]:+.2f} middle_1 {hq[6]:+.2f} rad (peak pad force {peak:.1f} N)")
+                    break
+                t_next += R.DT
+                if io.now() - t_next > R.DT:
+                    t_next = io.now()
+                io.sleep_until(t_next)
+        except KeyboardInterrupt:
+            return "OPERATOR STOP (Ctrl-C)", True, False
+        return outcome, False, held
+
     def shadow_run(self):
         """Read-only: the policy on the real robot's state, nothing sent. The arm
         does not move, so this checks the observation, FK, target, collision and
@@ -1658,7 +2084,56 @@ class Toy:
                   f"WARN at {12 * a.resid_scale:.0f}%)")
         print("  (the daemon holds the arm with ITS gains here: the residual is the model error / friction "
               "the watchdog will see at rest)")
+        if a.grasp and self.gpol is not None:
+            self.shadow_grasp()
         return self.finish("shadow run done (nothing was commanded)")
+
+    def shadow_grasp(self):
+        """Read-only look at the grasp inputs: the hand, the pads (baseline + noise), and what the
+        grasp policy would do if the palm were at the fruit (pocket 0, nothing touching)."""
+        a, io = self.args, self.io
+        tact = self.make_tactile()
+        t_b = io.now()
+        s = io.read()
+        for _ in range(int(1.0 / R.DT)):
+            s = io.read()
+            tact.add_baseline(s.pads)
+            t_b += R.DT
+            io.sleep_until(t_b)
+        print("\n  grasp inputs (shadow):")
+        if s.hand_q is None:
+            print("    no hand state (rt/dex3/right/state)")
+            return
+        np.set_printoptions(precision=3, suppress=True, linewidth=150)
+        print(f"    hand q  (thumb_0,1,2 index_0,1 middle_0,1) {np.round(s.hand_q, 2).tolist()} rad")
+        want = np.array([R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER])
+        print(f"    reach cup (commanded in a run)             {np.round(want, 2).tolist()} rad  "
+              f"(thumb_0 is locked by the picker at 30 deg)")
+        if tact.finish_baseline():
+            ok_el = np.isfinite(tact.base) & (tact.base > TIO.PRESENT_ABOVE)
+            print(f"    pads: {int(ok_el.sum())} of {len(tact.base)} readings report, "
+                  f"{np.nanmedian(tact.base[ok_el]) if ok_el.any() else float('nan'):.0f} counts at rest; noise "
+                  f"{float(np.nanmax(tact.noise[ok_el])) / tact.gain if ok_el.any() else float('nan'):.2f} N max "
+                  f"({tact.gain:g} counts/N, {'calibrated places' if tact.calib is not None else 'entry means'})")
+        else:
+            print("    no pad data (press_sensor_state): the force input would be 0")
+        fr = self.frames(s)
+        taxels, pooled, _ = tact.taxels(s.pads)
+        feats = R.TactileFeatures()
+        slip, bal, lvl = feats.step(taxels)
+        hq = np.array(s.hand_q, float)
+        hq[0] = R.REACH_HAND_PRESHAPE["right_hand_thumb_0_joint"]
+        obs = R.build_grasp_obs(hq, np.zeros(7), slip, bal, lvl, a.grip_n, np.zeros(3) + R.GRASP_CENTER_LOCAL,
+                                np.zeros(7), R.gravity_in_palm(fr))
+        raw = self.gpol(obs)
+        L = R.make_grasp_limiters()
+        art = R.hand_dex3_to_art(hq)
+        L["hand"].prev, L["hand"].vel, L["hand"].k = art.copy(), np.zeros(7), L["hand"].ANCHOR_STEPS
+        tgt = R.hand_art_to_dex3(L["hand"].step(raw[7:14], None, a.grasp_speed or a.speed))
+        print(f"    grasp policy, fruit in the pocket, grip command {a.grip_n:g} N:")
+        print(f"      raw hand action (articulation order {R.HAND_ART_ORDER}): {np.round(raw[7:14], 2).tolist()}")
+        print(f"      first hand step toward (R.DEX3_ORDER): {np.round(tgt, 3).tolist()} rad; arm raw "
+              f"{np.round(raw[:7], 2).tolist()} (wrist x0.05, clamped {a.grasp_wrist_max} rad, shoulder/elbow frozen)")
 
     def finish(self, outcome, restore_mode=True):
         a = self.args
@@ -1679,6 +2154,10 @@ class Toy:
                                       capture_output=True, text=True).stdout.strip()}
         with open(os.path.join(self.log_dir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=1, default=str)
+        if self.grasp_rows:
+            keys = self.grasp_rows[0].keys()
+            np.savez_compressed(os.path.join(self.log_dir, "grasp.npz"),
+                                **{k: np.array([r[k] for r in self.grasp_rows]) for k in keys})
         if self.rows:
             keys = self.rows[0].keys()
             np.savez_compressed(os.path.join(self.log_dir, "run.npz"),

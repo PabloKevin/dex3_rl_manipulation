@@ -29,11 +29,14 @@ ap.add_argument("--friction", type=float, default=3.0, help="N m s/rad viscous f
 ap.add_argument("--log", default=None, help="CSV of t, right arm q, its kp, hand q, waist, kd/tau of joint 22 (10 Hz)")
 ap.add_argument("--blackout_at", type=float, default=None, help="s: stop publishing rt/lowstate here ...")
 ap.add_argument("--blackout_s", type=float, default=2.0, help="... for this long (commands are still played)")
+ap.add_argument("--press_file", default=None,
+                help="TEST: file holding a place index 0-6 (tactile_io.LOCATIONS) whose pad elements 0-3 are pressed")
+ap.add_argument("--start_arm", default=None, help="7 comma-separated rad: where the right arm starts")
 args = ap.parse_args()
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber  # noqa: E402
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandState_, unitree_hg_msg_dds__LowState_  # noqa: E402
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, LowCmd_, LowState_  # noqa: E402
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, LowCmd_, LowState_, PressSensorState_  # noqa: E402
 
 ChannelFactoryInitialize(0, args.net_if)
 N = 29
@@ -43,6 +46,8 @@ q = np.zeros(N)
 q[12:15] = [0.03, 0.0, 0.1]
 q[15:22] = [-0.5, 0.2, -0.1, 1.0, 0.0, 0.0, 0.0]          # left arm
 q[22:29] = [-0.5, -0.2, 0.1, 1.0, 0.0, 0.0, 0.0]          # right arm
+if args.start_arm:
+    q[22:29] = [float(v) for v in args.start_arm.split(",")]
 dq = np.zeros(N)
 cmd = {"q": q.copy(), "dq": np.zeros(N), "kp": np.zeros(N), "kd": np.zeros(N), "tau": np.zeros(N), "t": -1.0}
 hold_q = q.copy()
@@ -77,6 +82,8 @@ for p in pub_hs.values():
     p.Init()
 ls = unitree_hg_msg_dds__LowState_()
 hs = {s: unitree_hg_msg_dds__HandState_() for s in ("left", "right")}
+for _s in hs.values():          # nine pad entries of 12 readings, ~100000 counts at rest (as the real hand)
+    _s.press_sensor_state = [PressSensorState_([100000.0] * 12, [30.0] * 12, 0, 0) for _ in range(9)]
 logf = open(args.log, "w") if args.log else None
 if logf:
     logf.write("t," + ",".join(f"q{i}" for i in range(22, 29)) + "," + ",".join(f"kp{i}" for i in range(22, 29))
@@ -115,6 +122,20 @@ while time.monotonic() < t_end:
                 for i in range(7):
                     hs[s].motor_state[i].q = float(h["q"][i])
                     hs[s].motor_state[i].mode = 1
+                # a fruit in the closed fingers loads the pads: 3000 counts per 0.1 rad past contact
+                qh = h["q"]
+                rise = 30000.0 * (max(0.0, qh[4] - 1.45) + max(0.0, qh[6] - 1.45)) if s == "right" else 0.0
+                press = -1
+                if args.press_file and s == "right":
+                    try:
+                        press = int(open(args.press_file).read().strip() or -1)
+                    except (OSError, ValueError):
+                        press = -1
+                for e in range(9):
+                    vals = [100000.0 + (rise if e < 6 else 0.0)] * 12
+                    if e == press:
+                        vals[:4] = [100000.0 + 9000.0] * 4
+                    hs[s].press_sensor_state[e].pressure = vals
         if logf and k % 50 == 0:
             logf.write(f"{t0 - T0:.3f}," + ",".join(f"{v:.4f}" for v in q[22:29]) + ","
                        + ",".join(f"{v:.1f}" for v in (cmd["kp"][22:29] if live else np.full(7, -1.0))) + ","
