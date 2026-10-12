@@ -647,9 +647,10 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         self._prev_vel = torch.where(needs_reset, torch.zeros_like(self._prev_vel), self._prev_vel)
 
         dt = self._env.step_dt
+        vmax = self.cfg.max_velocity * self.speed_scale             # speed factor (see the parent class)
         v_desired = (target_desired - self._prev_target) / dt
-        v_cmd = torch.clamp(v_desired, -self.cfg.max_velocity, self.cfg.max_velocity)
-        max_dv = self.cfg.max_acceleration * dt
+        v_cmd = torch.maximum(torch.minimum(v_desired, vmax), -vmax)
+        max_dv = self.cfg.max_acceleration * self.speed_scale ** 2 * dt
         v_cmd = torch.clamp(v_cmd, self._prev_vel - max_dv, self._prev_vel + max_dv)
 
         target_cmd = self._prev_target + v_cmd * dt
@@ -674,9 +675,10 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         desired = torch.where(phase, self._waist_target, desired)
         ov = self.waist_override
         desired = torch.where(torch.isfinite(ov), ov.clamp(-lim, lim), desired)
-        a, vmax = self.cfg.reach_waist_max_acceleration, self.cfg.reach_waist_max_velocity
+        sp = self.speed_scale.squeeze(-1)
+        a, vmax = self.cfg.reach_waist_max_acceleration * sp ** 2, self.cfg.reach_waist_max_velocity * sp
         err = desired - self._waist_target
-        v = (err / dt).clamp(-vmax, vmax)
+        v = torch.maximum(torch.minimum(err / dt, vmax), -vmax)
         v_stop = -0.5 * a * dt + torch.sqrt((0.5 * a * dt) ** 2 + 2.0 * a * err.abs())
         v = torch.maximum(torch.minimum(v, v_stop), -v_stop)
         v = torch.clamp(v, self._waist_vel - a * dt, self._waist_vel + a * dt)

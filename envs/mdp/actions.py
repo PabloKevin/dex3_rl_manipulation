@@ -71,6 +71,10 @@ class RateLimitedJointPositionAction(JointPositionAction):
         super().__init__(cfg, env)
         self._prev_target = torch.zeros_like(self._processed_actions)
         self._prev_vel = torch.zeros_like(self._processed_actions)
+        # Per-env speed factor in (0, 1] (deployment / safety slow-down):
+        # velocity cap x s, acceleration cap x s^2 -- the same trajectory
+        # shape played 1/s times slower. 1 = as trained.
+        self.speed_scale = torch.ones(self.num_envs, 1, device=self.device)
 
     def process_actions(self, actions: torch.Tensor):
         self._raw_actions[:] = actions
@@ -86,16 +90,17 @@ class RateLimitedJointPositionAction(JointPositionAction):
         self._prev_vel = torch.where(needs_reset, torch.zeros_like(self._prev_vel), self._prev_vel)
 
         dt = self._env.step_dt
+        vmax = self.cfg.max_velocity * self.speed_scale
+        amax = self.cfg.max_acceleration * self.speed_scale ** 2
         v_desired = (target_desired - self._prev_target) / dt
-        v_cmd = torch.clamp(v_desired, -self.cfg.max_velocity, self.cfg.max_velocity)
+        v_cmd = torch.maximum(torch.minimum(v_desired, vmax), -vmax)
         if self.cfg.brake_to_target:
             # fastest speed that can still stop at the target under the
             # acceleration cap (discrete: v^2/2a + v*dt/2 <= |error|)
-            a = self.cfg.max_acceleration
             err = (target_desired - self._prev_target).abs()
-            v_stop = -0.5 * a * dt + torch.sqrt((0.5 * a * dt) ** 2 + 2.0 * a * err)
+            v_stop = -0.5 * amax * dt + torch.sqrt((0.5 * amax * dt) ** 2 + 2.0 * amax * err)
             v_cmd = torch.maximum(torch.minimum(v_cmd, v_stop), -v_stop)
-        max_dv = self.cfg.max_acceleration * dt
+        max_dv = amax * dt
         v_cmd = torch.clamp(v_cmd, self._prev_vel - max_dv, self._prev_vel + max_dv)
 
         target_cmd = self._prev_target + v_cmd * dt

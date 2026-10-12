@@ -138,6 +138,21 @@ p.add_argument("--max_attempts", type=int, default=3,
                help="attempts per apple: a grasp that fails with the fruit still on its stem is retried")
 p.add_argument("--release_s", type=float, default=1.5)
 p.add_argument("--leave_margin", type=float, default=0.06, help="fruit this far from the grasp pocket = dropped")
+p.add_argument("--speed_reach", type=float, default=1.0, help="speed factor (0-1] of the reach policy (and its waist)")
+p.add_argument("--speed_grasp", type=float, default=1.0, help="speed factor of the grasp policy (fingers)")
+p.add_argument("--speed_goal", type=float, default=1.0, help="speed factor of the arm-goal (harvest path) policy")
+p.add_argument("--speed_scripted", type=float, default=1.0,
+               help="speed factor of the scripted motions (twist, bend, pull, basket / home paths)")
+p.add_argument("--safety", type=str, default="on", choices=["off", "monitor", "on"],
+               help="arm watchdog (envs/safety/monitor.py): 'monitor' = measure and log only; 'on' = also react: "
+                    "slow down, and on a stop freeze, retreat along the way the arm came, abort the apple")
+p.add_argument("--safety_log", type=str, default=None, help="npz of the watchdog's per-step signals (calibration)")
+p.add_argument("--safety_slow", type=float, default=0.5, help="speed factor while the watchdog says SLOW")
+p.add_argument("--safety_scale", type=float, default=1.0,
+               help="x the watchdog's external-torque thresholds (<1 = more sensitive; for testing the reactions)")
+p.add_argument("--freeze_s", type=float, default=0.5, help="hold after a safety stop before retreating")
+p.add_argument("--retreat_window_s", type=float, default=1.5, help="retreat along this much of the arm's recent path")
+p.add_argument("--retreat_speed", type=float, default=0.5, help="peak joint speed of the retreat, rad/s")
 p.add_argument("--video", type=str, default=None, help="mp4 in SIMULATED time (works headless)")
 p.add_argument("--video_fps", type=int, default=25)
 p.add_argument("--video_res", type=int, nargs=2, default=[1280, 720])
@@ -167,6 +182,7 @@ from envs.mdp import harvest as hv
 from envs.mdp import self_collision as scm
 from envs.mdp.grasp_rewards import _max_link_apple_force
 from envs.mdp.self_collision import self_collision_depth
+from envs.mdp.observations import RIGHT_HAND_CONTACT_LINKS, link_sensor_name
 
 if args.apples is not None:
     tree_cfg_mod.APPLES_PER_TREE = args.apples           # read by the scene / event cfgs below
@@ -249,6 +265,25 @@ cfg.events.reset_reach_grasp_phase.params.update(
     stem_release_schedule=None, stem_release_time_range=None, release_on_latch=False, shaping_grace_s=None)
 if args.order:
     cfg.events.randomize_tree.params["order"] = args.order
+# speed factors: the scripted motions take 1/f longer, the timeouts follow
+for k in ("speed_reach", "speed_grasp", "speed_goal", "speed_scripted"):
+    if not 0.0 < getattr(args, k) <= 1.0:
+        sys.exit(f"--{k} must be in (0, 1]")
+args.twist_s /= args.speed_scripted
+args.bend_s /= args.speed_scripted
+args.pull_s /= args.speed_scripted
+args.home_speed *= args.speed_scripted
+args.move_speed *= args.speed_scripted
+args.drop_speed *= args.speed_scripted
+args.grasp_timeout /= args.speed_grasp
+args.goal_timeout /= args.speed_goal
+_ho = cfg.events.update_reach_grasp_phase.params
+_ho["handoff_time_s"] = _ho["handoff_time_s"] / args.speed_reach
+# contact labels for the watchdog's calibration: the arm links (any contact)
+from isaaclab.sensors import ContactSensorCfg
+cfg.scene.arm_contact = ContactSensorCfg(
+    prim_path="{ENV_REGEX_NS}/Robot/right_(shoulder_yaw|elbow|wrist_roll|wrist_pitch|wrist_yaw)_link",
+    update_period=0.0, history_length=1)
 if args.video:
     cfg.viewer.resolution = tuple(args.video_res)
 env = gym.make("AppleGrasp-v1", cfg=cfg, render_mode="rgb_array" if args.video else None).unwrapped
@@ -352,16 +387,114 @@ def scripted_grasp(a, st):
     sc_state["t_all"] = torch.where(first, since, sc_state["t_all"])
     return all_stop & (since - sc_state["t_all"] >= args.settle_s)
 ik = hv.DifferentialIK(robot, "right_hand_palm_link", arm_ids)
+
+# ── arm watchdog (envs/safety/monitor.py) ──
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("safety_monitor", os.path.join(REPO, "envs", "safety", "monitor.py"))
+sm = _ilu.module_from_spec(_spec); sys.modules["safety_monitor"] = sm; _spec.loader.exec_module(sm)
+_RATED = {"right_shoulder_pitch_joint": 25.0, "right_shoulder_roll_joint": 25.0, "right_shoulder_yaw_joint": 25.0,
+          "right_elbow_joint": 25.0, "right_wrist_roll_joint": 25.0, "right_wrist_pitch_joint": 5.0,
+          "right_wrist_yaw_joint": 5.0, "waist_yaw_joint": 88.0}
+safe_ids = list(arm_ids) + ([robot.joint_names.index("waist_yaw_joint")] if SPINDLE else [])
+_scfg = sm.SafetyCfg(dt=dt, rated=[_RATED[robot.joint_names[j]] for j in safe_ids])
+_scfg.resid_warn *= args.safety_scale
+_scfg.resid_slow *= args.safety_scale
+_scfg.resid_stop *= args.safety_scale
+mon = sm.SafetyMonitor(_scfg, N, device=dev)
+RING = max(2, int(round(args.retreat_window_s / dt)))
+_ring_q = torch.zeros(N, RING, len(arm_ids), device=dev)
+_ring_w = torch.zeros(N, RING, device=dev)
+_ring_k = torch.zeros(N, dtype=torch.long, device=dev)
+_safety_rows = []
+
+
+# External-torque residual at PHYSICS rate: tau applied in the substep - (M qdd + Coriolis + gravity),
+# qdd from that substep. At the 50 Hz control rate the PD transient inside the 4 substeps is missed
+# and the residual read up to ~1x rated torque with nothing touching (measured). Averaged per control
+# step for the watchdog. (On the robot: LowState tau_est at 500 Hz, pinocchio for the model.)
+_sub = {"sum": torch.zeros(N, len(safe_ids), device=dev), "n": 0, "dq_prev": None}
+_orig_scene_update = env.scene.update
+
+
+def _scene_update_with_residual(dt):
+    dt_ = dt
+    _orig_scene_update(dt=dt_)
+    if args.safety == "off":
+        return
+    dq = robot.data.joint_vel
+    if _sub["dq_prev"] is not None:
+        view = robot.root_physx_view
+        M = view.get_generalized_mass_matrices()
+        D = M.shape[-1]
+        c = view.get_coriolis_and_centrifugal_compensation_forces()[:, :D]
+        g = view.get_gravity_compensation_forces()[:, :D]
+        qdd = (dq[:, :D] - _sub["dq_prev"][:, :D]) / dt_
+        tau_m = torch.bmm(M, qdd.unsqueeze(-1)).squeeze(-1) + c + g
+        _sub["sum"] += robot.data.applied_torque[:, safe_ids] - tau_m[:, safe_ids]
+        _sub["n"] += 1
+    _sub["dq_prev"] = dq.clone()
+
+
+env.scene.update = _scene_update_with_residual
+
+
+_lim = robot.data.joint_pos_limits[:, safe_ids]
+
+
+def take_residual():
+    """[N, J] mean external-torque residual over the last control step. Joints within
+    0.05 rad of a joint limit are left out: the stop's reaction torque is not in the
+    model (calibration: the twist / goal moves pressing a wrist on its stop read as
+    ~2x rated 'external' torque with nothing touching)."""
+    r = _sub["sum"] / max(_sub["n"], 1)
+    _sub["sum"] = torch.zeros_like(_sub["sum"])
+    _sub["n"] = 0
+    q = robot.data.joint_pos[:, safe_ids]
+    at_lim = ((q - _lim[..., 0]) < 0.05) | ((_lim[..., 1] - q) < 0.05)
+    return torch.where(at_lim, torch.zeros_like(r), r)
+
+
+def safety_stop(i, why):
+    """Freeze where the arm is (it stops pushing); retreat after --freeze_s."""
+    ph = PHASE[int(S["state"][i])]
+    if S["state"][i] == GRASP and not bool(env._grasp_phase_active[i]):
+        # still in the reach: end the reach policy's control (the hand-off), as for a knocked-off target
+        env._grasp_handoff_joint_pos[i] = robot.data.joint_pos[i].clone()
+        env._grasp_handoff_step[i] = env.episode_length_buf[i]
+        env._grasp_phase_active[i] = True
+    env._stem_released[i] = True                      # unlocks the proximal arm
+    S["safe_q"][i] = robot.data.joint_pos[i, arm_ids].clone()
+    S["safe_w"][i] = float(robot.data.joint_pos[i, safe_ids[-1]]) if SPINDLE else 0.0
+    if S["hand_hold"][i].abs().sum() == 0 or S["state"][i] == GRASP:
+        S["hand_hold"][i] = hand._processed_actions[i]
+    S["safety_why"][i] += (("; " if S["safety_why"][i] else "") + f"{why} in {ph}")
+    S["safety_stops"][i] += 1
+    S["state"][i] = SAFE_FREEZE
+    S["t"][i] = 0.0
+    print(f"  [safety] env {i}: STOP ({why}) in {ph} -> freeze, then retreat", flush=True)
+
+
+def start_retreat(i):
+    """Back along the arm's own last --retreat_window_s of commands, slowly."""
+    k = int(_ring_k[i])
+    n_ = min(k, RING)
+    idx = [(k - 1 - j) % RING for j in range(n_)]             # newest -> oldest
+    path = torch.stack([S["safe_q"][i]] + [_ring_q[i, j] for j in idx]) if n_ else S["safe_q"][i].unsqueeze(0)
+    S["retreat"][i] = hv.retime_joint_path(hv.smooth_joint_path(path), dt, args.retreat_speed)
+    S["retreat_w"][i] = (S["safe_w"][i], float(_ring_w[i, idx[-1]]) if n_ else S["safe_w"][i])
+    S["home_k"][i] = 0
+    S["state"][i] = SAFE_RETREAT
+    S["t"][i] = 0.0
 c_local = torch.tensor(GRASP_CENTER_LOCAL, device=dev).expand(N, 3)
 _bp = np.load(os.path.join(REPO, "envs", "assets", "basket_drop_path.npz"))
 _order = [RIGHT_ARM_JOINTS.index(robot.joint_names[j]) for j in arm_ids]
 basket_wps = torch.tensor(_bp["waypoints"], device=dev, dtype=torch.float32)[:, _order]   # home, ..., drop
 hand_open = robot.data.default_joint_pos[:, hand._joint_ids]
 
-GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE, PULL, GOAL, BEND = range(11)
+GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE, PULL, GOAL, BEND, SAFE_FREEZE, SAFE_RETREAT = range(13)
 G_SAFE, G_DROP, G_HOME = 0, 1, 2
 PHASE = {GRASP: "grasp", TWIST: "twist", HOME: "home", BASKET: "basket", RELEASE: "release", PULL: "pull", GOAL: "goal",
-         BEND: "bend",
+         BEND: "bend", SAFE_FREEZE: "safety freeze", SAFE_RETREAT: "safety retreat",
          RETURN: "return", NEXT: "next", TREE_DONE: "done"}
 fmt = lambda x, s="{:.2f}": "-" if x != x else s.format(x)
 _cm = lambda x: "free" if x != x else f"{x * 100:4.1f}"
@@ -501,6 +634,9 @@ def new_apple(ids):
         S["twist_stop"][i], S["twist_stop_why"][i], S["twist_fruit"][i], S["twist_base"][i] = False, "", None, None
         S["goal_timeouts"][i] = 0
         S["bend_dir"][i] = ""
+        S["safety_why"][i] = ""
+        S["safety_stops"][i] = 0
+        S["safety_peak"][i] = 0.0
         S["hand_hold_open"][i] = False
         S["row_done"][i] = False
         S["home_tries"][i] = 0
@@ -517,6 +653,8 @@ def new_apple(ids):
             S["hanging0"][i] = hanging[i].clone()   # knock-offs count over every attempt
             S["spot"][i] = T().current_spot(i)
     ready_det.reset(torch.tensor(ids, device=dev))
+    mon.reset(torch.tensor(ids, device=dev))
+    _ring_k[ids] = 0
     sc_state["started"][ids] = False
     # The grip-force command (the grasp policy's target_grip_level input):
     # the reset just drew it at random, as in training; here it is set, and a
@@ -548,6 +686,8 @@ def new_trees():
         pull_p0=torch.zeros(N, 3, device=dev), pull_q0=torch.zeros(N, 4, device=dev), pull_dir=torch.zeros(N, 3, device=dev),
         bend_p=torch.zeros(N, 3, device=dev), bend_q=torch.zeros(N, 4, device=dev), bend_pivot=torch.zeros(N, 3, device=dev),
         bend_axis=torch.zeros(N, 3, device=dev), bend_sign=torch.ones(N, device=dev), bend_dir=[""] * N,
+        safe_q=torch.zeros(N, len(arm_ids), device=dev), safe_w=[0.0] * N, retreat=[None] * N, retreat_w=[(0.0, 0.0)] * N,
+        safety_why=[""] * N, safety_stops=[0] * N, safety_peak=torch.zeros(N, device=dev),
         rows=[[] for _ in range(N)], knocked={i: {} for i in range(N)}, reported=[False] * N,
     )
     if hasattr(env, "_tree"):                      # (created by the first reset, which grows new trees anyway)
@@ -804,6 +944,8 @@ def record_row(i):
         out = "FINISHED"
     else:
         out = "MISSED BASKET"
+    if S["safety_why"][i] and not out.startswith("FINISHED"):
+        out = "ABORTED (safety stop)" + ("" if out.startswith("LEFT") else f" / {out}")
     if out == "FINISHED" and float(S["max_f"][i]) > float(dmg):
         out += " but BRUISED"
     if S["not_ready"][i]:
@@ -825,7 +967,8 @@ def record_row(i):
         push=float(S["max_push"][i]), knocked=len(knocked), out=out, not_ready=S["not_ready"][i],
         tw=("+" if S["tw_sign"][i] > 0 else "-") if not math.isnan(S["tw_clear"][i][0]) else " ",
         tw_clear=S["tw_clear"][i], attempts=S["attempt"][i], goal_to=S["goal_timeouts"][i],
-        tw_stop=S["twist_stop_why"][i], bend=S["bend_dir"][i],
+        tw_stop=S["twist_stop_why"][i], bend=S["bend_dir"][i], safety=S["safety_why"][i],
+        safety_peak=float(S["safety_peak"][i]),
         grip=float(env._target_grip_level[i]) if hasattr(env, "_target_grip_level") else float("nan")))
 
 
@@ -848,14 +991,16 @@ def report_tree(i):
                  f"  [grip command {row['grip']:.0f} N]")
               + (f"  [goal timeouts {row['goal_to']}]" if row.get('goal_to') else "")
               + (f"  [twist stopped: {row['tw_stop']}]" if row.get('tw_stop') else "")
-              + (f"  [bend {row['bend']}]" if row.get('bend') else ""))
+              + (f"  [bend {row['bend']}]" if row.get('bend') else "")
+              + (f"  [SAFETY STOP: {row['safety']}]" if row.get('safety') else ""))
     for s, by in sorted(S["knocked"][i].items()):
         print(f"      spot {s:2d}: KNOCKED OFF while picking #{by}")
     rows = S["rows"][i]
     fin = sum(r_["out"].startswith("FINISHED") for r_ in rows)
     print(f"  tree env {i}: {fin}/{M} in the basket, {sum(r_['out'].startswith('DROPPED') for r_ in rows)} dropped, "
           f"{sum(r_['out'].startswith('LEFT') for r_ in rows)} left on the tree, {len(S['knocked'][i])} knocked off by the hand, "
-          f"{sum('BRUISED' in r_['out'] for r_ in rows)} bruised, {sum(bool(r_['not_ready']) for r_ in rows)} timeout-ready")
+          f"{sum('BRUISED' in r_['out'] for r_ in rows)} bruised, {sum(bool(r_['not_ready']) for r_ in rows)} timeout-ready, "
+          f"{sum(bool(r_.get('safety')) for r_ in rows)} with a safety stop")
     sys.stdout.flush()
 
 
@@ -968,7 +1113,8 @@ while app.is_running():
         if SPINDLE and getattr(arm, "_waist_id", None) is not None:
             # outside GOAL the waist holds; on the way back home (RETURN) it turns back to 0
             ret = st == RETURN
-            arm.waist_override[~gl & ~ret] = float("nan")
+            safe_st = (st == SAFE_FREEZE) | (st == SAFE_RETREAT)
+            arm.waist_override[~gl & ~ret & ~safe_st] = float("nan")
             arm.waist_override[ret] = 0.0
         mv = (st == BASKET) | (st == RETURN)
         if bool(mv.any()):
@@ -981,6 +1127,20 @@ while app.is_running():
             S["home_k"][i] = k + 1
         rl = st == RELEASE
         q_cmd = torch.where(rl.unsqueeze(-1), S["q_to"], q_cmd)
+        fz = st == SAFE_FREEZE
+        q_cmd = torch.where(fz.unsqueeze(-1), S["safe_q"], q_cmd)
+        for i in (st == SAFE_RETREAT).nonzero(as_tuple=True)[0].tolist():
+            k = S["home_k"][i]
+            q_cmd[i] = S["retreat"][i][min(k, len(S["retreat"][i]) - 1)]
+            S["home_k"][i] = k + 1
+        if SPINDLE and getattr(arm, "_waist_id", None) is not None:
+            for i in (fz | (st == SAFE_RETREAT)).nonzero(as_tuple=True)[0].tolist():
+                if st[i] == SAFE_FREEZE:
+                    arm.waist_override[i] = S["safe_w"][i]
+                else:
+                    w0, w1 = S["retreat_w"][i]
+                    f_ = min(1.0, S["home_k"][i] / max(len(S["retreat"][i]), 1))
+                    arm.waist_override[i] = w0 + (w1 - w0) * f_
         h = st != GRASP
         a[h, :arm_dim] = ((q_cmd - arm._anchor) / arm._scale)[h]
         if FINGERS_POLICY:                                    # the policy keeps the fingers while the fruit is carried
@@ -989,6 +1149,17 @@ while app.is_running():
         else:
             h_frozen = h
         a[h_frozen, arm_dim:] = ((S["hand_hold"] - hand._grasp_offset) / hand._scale)[h_frozen]
+
+        # speed factors per policy, x the watchdog's slow-down
+        reach_ph = (st == GRASP) & ~env._grasp_phase_active
+        f_arm = torch.full((N,), args.speed_scripted, device=dev)
+        f_arm = torch.where(reach_ph, torch.full_like(f_arm, args.speed_reach), f_arm)
+        f_arm = torch.where((st == GRASP) & env._grasp_phase_active, torch.full_like(f_arm, args.speed_grasp), f_arm)
+        f_arm = torch.where(st == GOAL, torch.full_like(f_arm, args.speed_goal), f_arm)
+        slow = (mon.level >= sm.SLOW) if args.safety == "on" else torch.zeros(N, dtype=torch.bool, device=dev)
+        arm.speed_scale[:, 0] = torch.where(slow, f_arm * args.safety_slow, f_arm)
+        hand.speed_scale[:, 0] = torch.where(slow, torch.full_like(f_arm, args.speed_grasp * args.safety_slow),
+                                             torch.full_like(f_arm, args.speed_grasp))
 
         pending = T().next_request.clone()
         env.step(a)
@@ -1000,6 +1171,39 @@ while app.is_running():
         reset_ids = pending.nonzero(as_tuple=True)[0].tolist()
         if reset_ids:
             new_apple(reset_ids)
+            st = S["state"]
+
+        # ── watchdog ──
+        if args.safety != "off":
+            kk = _ring_k % RING
+            _ring_q[torch.arange(N, device=dev), kk] = arm._processed_actions
+            if SPINDLE:
+                _ring_w[torch.arange(N, device=dev), kk] = robot.data.joint_pos[:, safe_ids[-1]]
+            _ring_k += 1
+            resid = take_residual()
+            intended = ((st == GRASP) & env._grasp_phase_active) | (st == TWIST) | (st == BEND) | (st == PULL)
+            ctx = torch.where(intended, torch.full((N,), 2.0, device=dev), torch.ones(N, device=dev))
+            supervised = (st != NEXT) & (st != TREE_DONE) & (st != SAFE_FREEZE) & (st != SAFE_RETREAT)
+            lvl = mon.update(robot.data.joint_pos[:, safe_ids], robot.data.joint_vel[:, safe_ids],
+                             robot.data.joint_pos_target[:, safe_ids], resid, torch.zeros_like(resid),
+                             contact_scale=ctx, active=supervised)
+            S["safety_peak"] = torch.maximum(S["safety_peak"], torch.where(supervised, mon.peak, torch.zeros_like(mon.peak)))
+            if args.safety_log:
+                arm_f = env.scene["arm_contact"].data.net_forces_w.norm(dim=-1).amax(-1)
+                # hand: force on the NEIGHBOUR apples (filters 1..), and on anything that is not an apple
+                h_nb = torch.zeros(N, device=dev); h_other = torch.zeros(N, device=dev)
+                for lk in RIGHT_HAND_CONTACT_LINKS:
+                    sen = env.scene.sensors.get(link_sensor_name("contact_forces", lk))
+                    if sen is None or sen.data.force_matrix_w is None:
+                        continue
+                    fm = sen.data.force_matrix_w[:, 0]                       # [N, M, 3] per apple
+                    h_nb = h_nb + fm[:, 1:].norm(dim=-1).sum(-1)
+                    h_other = h_other + (sen.data.net_forces_w[:, 0] - fm.sum(1)).norm(dim=-1)
+                _safety_rows.append(torch.stack([st.float(), lvl.float(), mon.peak, arm_f, ctx,
+                                                 ((mon.r_f.abs() / mon.rated).amax(-1)), h_nb, h_other], -1).cpu())
+            if args.safety == "on":
+                for i in ((lvl == sm.STOP) & supervised).nonzero(as_tuple=True)[0].tolist():
+                    safety_stop(i, sm.reasons(int(mon.reason[i])))
             st = S["state"]
 
         # ── bookkeeping ──
@@ -1078,6 +1282,17 @@ while app.is_running():
                     st[i] = RELEASE; S["t"][i] = 0.0
                 else:
                     finish_apple(i)
+            elif s_i == SAFE_FREEZE and t_i >= args.freeze_s:
+                if S["safety_stops"][i] > 1:               # second stop on this apple: give it up from here
+                    mon.reset(torch.tensor([i], device=dev))
+                    S["drop_phase"][i] = S["drop_phase"][i] or "safety stop"
+                    finish_apple(i)
+                else:
+                    start_retreat(i)
+            elif s_i == SAFE_RETREAT and S["home_k"][i] >= len(S["retreat"][i]) + int(0.2 / dt):
+                mon.reset(torch.tensor([i], device=dev))   # supervise again on the way home
+                S["drop_phase"][i] = S["drop_phase"][i] or "safety stop"
+                finish_apple(i)
             elif s_i == RELEASE and t_i >= args.release_s:
                 rad = env._apple_radius[i:i + 1]
                 S["in_basket"][i] = bool(bk.apple_in_basket(
@@ -1116,6 +1331,12 @@ while app.is_running():
             _wall0, _step0 = time.time(), 0
             print(f"\n>>> ROUND {rnd} <<<\n", flush=True)
 
+if args.safety_log and _safety_rows:
+    np.savez(args.safety_log, rows=torch.stack(_safety_rows).numpy(),
+             columns=np.array(["state", "level", "peak", "arm_contact_N", "context", "resid_now", "hand_neighbour_N",
+                               "hand_other_N"]),
+             phases=np.array([PHASE[k] for k in sorted(PHASE)]))
+    print(f"[tree bench] watchdog log: {args.safety_log}", flush=True)
 if video is not None:
     video.close()
     print(f"[tree bench] video written: {args.video} ({args.video_fps} fps, simulated time)", flush=True)
