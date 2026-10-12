@@ -387,3 +387,22 @@ def hold_default_joint_targets(
     """
     robot = env.scene[asset_cfg.name]
     robot.set_joint_position_target(robot.data.default_joint_pos[env_ids], env_ids=env_ids)
+
+
+def hold_joint_targets(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    joint_targets: dict[str, float],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Reset event: PD position targets of the named joints (not driven by
+    any action term) to fixed values -- e.g. the reach's hand pre-shape.
+    Run it after hold_default_joint_targets. The joints move there under
+    their own PD; the joint state is not teleported."""
+    robot = env.scene[asset_cfg.name]
+    if not hasattr(env, "_held_target_ids"):
+        env._held_target_ids = torch.tensor([robot.joint_names.index(j) for j in joint_targets], device=env.device)
+        env._held_target_vals = torch.tensor(list(joint_targets.values()), device=env.device)
+    tgt = robot.data.joint_pos_target[env_ids].clone()
+    tgt[:, env._held_target_ids] = env._held_target_vals
+    robot.set_joint_position_target(tgt, env_ids=env_ids)

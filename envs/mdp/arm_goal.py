@@ -128,8 +128,14 @@ def reset_arm_goal(
     mass_range: tuple[float, float] = (0.10, 0.35),
     drop_height: tuple[float, float] = (0.10, 0.16),
     home_noise: float = 0.15,
+    bank_file: str | None = None,
+    waist_range: float = 0.0,
 ) -> None:
-    """mode="reset": start pose (arm teleported), goal kind, basket, load."""
+    """mode="reset": start pose (arm teleported), goal kind, basket, load.
+    bank_file: reach end poses to start pick-like episodes from (default
+    reach_end_poses.npz next to the library); with a "waist" key the waist
+    yaw starts there too. waist_range: other starts get a waist yaw uniform
+    in +-waist_range (0 = untouched, the arm-only task)."""
     G = goal_state(env)
     robot = env.scene["robot"]
     dev = env.device
@@ -152,13 +158,16 @@ def reset_arm_goal(
         dist = (q - env._arm_goal_drop_q).norm(dim=-1)
         env._arm_goal_near_drop = dist.argsort()[:200]
         # real reach end poses (scripts/record_reach_starts.py), if recorded
-        bank = library.replace("harvest_pose_library.npz", "reach_end_poses.npz")
+        bank = bank_file or library.replace("harvest_pose_library.npz", "reach_end_poses.npz")
         import os
         env._arm_goal_bank = None
+        env._arm_goal_bank_waist = None
         if os.path.exists(bank):
             b = np.load(bank)
             border = [list(b["joint_names"]).index(n) for n in names]
             env._arm_goal_bank = torch.tensor(b["q"][:, border], device=dev, dtype=torch.float32)
+            if "waist" in b.files:
+                env._arm_goal_bank_waist = torch.tensor(b["waist"], device=dev, dtype=torch.float32)
     q_lib, pick_idx = env._arm_goal_lib
     n = len(env_ids)
     u = torch.rand(n, device=dev)
@@ -168,9 +177,13 @@ def reset_arm_goal(
     any_i = torch.randint(0, len(q_lib), (n,), device=dev)
     pick_i = pick_idx[torch.randint(0, len(pick_idx), (n,), device=dev)]
     q = q_lib[pick_i]
+    w = (torch.rand(n, device=dev) * 2 - 1) * waist_range
     if env._arm_goal_bank is not None:            # where the reach really leaves the arm (70%)
-        bank_q = env._arm_goal_bank[torch.randint(0, len(env._arm_goal_bank), (n,), device=dev)]
-        q = torch.where((torch.rand(n, device=dev) < 0.7).unsqueeze(-1), bank_q, q)
+        bi = torch.randint(0, len(env._arm_goal_bank), (n,), device=dev)
+        from_bank = torch.rand(n, device=dev) < 0.7
+        q = torch.where(from_bank.unsqueeze(-1), env._arm_goal_bank[bi], q)
+        if env._arm_goal_bank_waist is not None:
+            w = torch.where(from_bank, env._arm_goal_bank_waist[bi], w)
     use_any = (kind == DROP) & (torch.rand(n, device=dev) < 0.3)
     q = torch.where(use_any.unsqueeze(-1), q_lib[any_i], q)
     # HOME starts near the drop pose: library poses (validated collision-free),
@@ -185,10 +198,14 @@ def reset_arm_goal(
 
     jp = robot.data.joint_pos[env_ids].clone()
     jp[:, env._arm_goal_jids] = q
-    jv = torch.zeros_like(jp)
-    robot.write_joint_state_to_sim(jp, jv, env_ids=env_ids)
     tgt = robot.data.joint_pos_target[env_ids].clone()
     tgt[:, env._arm_goal_jids] = q
+    if waist_range > 0 or env._arm_goal_bank_waist is not None:
+        wid = robot.joint_names.index(WAIST)
+        jp[:, wid] = w
+        tgt[:, wid] = w
+    jv = torch.zeros_like(jp)
+    robot.write_joint_state_to_sim(jp, jv, env_ids=env_ids)
     robot.set_joint_position_target(tgt, env_ids=env_ids)
 
     G.kind[env_ids] = kind
@@ -332,17 +349,38 @@ def apply_payload(env: "ManagerBasedRLEnv", env_ids, pocket_local) -> None:
 #  Observations
 # ─────────────────────────────────────────────
 
-def _to_torso(env, v):
-    q = env.scene["robot"].data.body_quat_w[:, _ids(env, TORSO)]
+WAIST = "waist_yaw_joint"
+
+
+def waist_yaw(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[N] waist yaw joint position (rad)."""
+    cache = env.__dict__.setdefault("_arm_goal_ids", {})
+    if WAIST not in cache:
+        cache[WAIST] = env.scene["robot"].joint_names.index(WAIST)
+    return env.scene["robot"].data.joint_pos[:, cache[WAIST]]
+
+
+def _to_torso(env, v, unyaw: bool = False):
+    """v in the torso frame -- with unyaw, the torso frame with the waist yaw
+    taken out (waist_reach.palm_quat_torso_unyawed's reference: the same
+    frame at yaw 0, fixed when only the torso turns)."""
+    robot = env.scene["robot"]
+    q = robot.data.body_quat_w[:, _ids(env, TORSO)]
+    if unyaw:
+        from isaaclab.utils.math import quat_conjugate, quat_from_euler_xyz, quat_mul
+        qp = robot.data.body_quat_w[:, _ids(env, "pelvis")]
+        yaw = waist_yaw(env)
+        z = torch.zeros_like(yaw)
+        q = quat_mul(quat_mul(quat_mul(qp, quat_from_euler_xyz(z, z, -yaw)), quat_conjugate(qp)), q)
     return quat_apply_inverse(q, v)
 
 
-def obs_goal_pocket(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
-    """[N, 3] goal - pocket, torso frame."""
+def obs_goal_pocket(env: "ManagerBasedRLEnv", pocket_local, unyaw: bool = False) -> torch.Tensor:
+    """[N, 3] goal - pocket, torso frame (unyaw: without the waist yaw)."""
     G = goal_state(env)
     pocket, _ = pocket_and_normal(env, pocket_local)
     tgt = torch.where(G.pending.unsqueeze(-1), pocket, G.target)
-    return _to_torso(env, tgt - pocket)
+    return _to_torso(env, tgt - pocket, unyaw)
 
 
 def obs_goal_finger(env: "ManagerBasedRLEnv") -> torch.Tensor:
@@ -363,12 +401,12 @@ def obs_goal_normal(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
     return quat_apply_inverse(q, tgt)
 
 
-def obs_basket(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
-    """[N, 3] basket axis at rim height - pocket, torso frame."""
+def obs_basket(env: "ManagerBasedRLEnv", pocket_local, unyaw: bool = False) -> torch.Tensor:
+    """[N, 3] basket axis at rim height - pocket, torso frame (unyaw: without the waist yaw)."""
     G = goal_state(env)
     pocket, _ = pocket_and_normal(env, pocket_local)
     b = G.basket + env.scene.env_origins
-    return _to_torso(env, b - pocket)
+    return _to_torso(env, b - pocket, unyaw)
 
 
 def obs_carrying(env: "ManagerBasedRLEnv") -> torch.Tensor:
@@ -415,15 +453,19 @@ def reward_goal_finger(env: "ManagerBasedRLEnv", pocket_local, std_rad: float, g
 
 
 def goal_reached(env: "ManagerBasedRLEnv", pocket_local, pos_tol: float = 0.02, ang_tol_deg: float = 20.0,
-                 speed_tol: float = 0.15, hold_time: float = 0.3, finger_tol_deg: float = 30.0) -> torch.Tensor:
+                 speed_tol: float = 0.15, hold_time: float = 0.3, finger_tol_deg: float = 30.0,
+                 home_waist_tol_deg: float | None = None) -> torch.Tensor:
     """Termination (and cached for reward_success): pocket within pos_tol,
     normal within ang_tol, fingers within finger_tol, palm slower than
-    speed_tol, held hold_time."""
+    speed_tol, held hold_time; HOME goals also with the waist yaw within
+    home_waist_tol_deg of 0 when given (every reach starts there)."""
     G = goal_state(env)
     d, ang, live = _errors(env, pocket_local)
     v = env.scene["robot"].data.body_lin_vel_w[:, _ids(env, PALM)].norm(dim=-1)
     ok = live & (d < pos_tol) & (ang < math.radians(ang_tol_deg)) & (v < speed_tol) \
         & (finger_error(env) < math.radians(finger_tol_deg))
+    if home_waist_tol_deg is not None:
+        ok = ok & ((G.kind != HOME) | (waist_yaw(env).abs() < math.radians(home_waist_tol_deg)))
     G.hold = torch.where(ok, G.hold + env.step_dt, torch.zeros_like(G.hold))
     G.success = G.hold >= hold_time
     return G.success.clone()
@@ -460,6 +502,12 @@ def collision(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
 
 def reward_collision(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return getattr(env, "_arm_goal_hit", torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)).float()
+
+
+def reward_waist_home(env: "ManagerBasedRLEnv", std_rad: float = 0.15) -> torch.Tensor:
+    """[N] HOME goals: the waist back at yaw 0 (where every reach starts)."""
+    G = goal_state(env)
+    return torch.exp(-0.5 * (waist_yaw(env) / std_rad) ** 2) * ((G.kind == HOME) & ~G.pending).float()
 
 
 def reward_success(env: "ManagerBasedRLEnv") -> torch.Tensor:

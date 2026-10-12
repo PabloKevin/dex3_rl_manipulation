@@ -116,8 +116,16 @@ def _reach_obs(
     palm_local_offset: tuple[float, float, float],
     prev_raw_action: torch.Tensor,
     layout: str = "v1",
+    waist: dict | None = None,
 ) -> torch.Tensor:
-    """layout "tree": the AppleReachTree-v1 policy's 37-dim vector instead --
+    """layout "waist": the AppleReachSpindle (waist) policy's 40-dim vector --
+    the "tree" 37 with the palm orientation taken in the torso frame WITHOUT
+    the waist yaw (waist_reach.palm_quat_torso_unyawed), the clearance ring
+    at waist["ring_range"], then waist yaw position (vs default), velocity
+    and the policy's previous raw waist action (waist["joint_cfg"],
+    waist["prev_raw"] [N, 1]).
+
+    layout "tree": the AppleReachTree-v1 policy's 37-dim vector instead --
     the same 29 with palm_touch_force from ANY contact, then the 8-sector
     neighbour clearance ring (envs/apple_reach_tree_env_cfg.py).
 
@@ -154,6 +162,27 @@ def _reach_obs(
         sensor_cfg = SceneEntityCfg("contact_forces")
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
+
+    if layout == "waist":
+        from .tree_reach import neighbour_clearance_ring, palm_contact_force_any
+        from .waist_reach import palm_quat_torso_unyawed
+
+        if not hasattr(env, "_autoplay_pelvis_cfg"):
+            env._autoplay_pelvis_cfg = SceneEntityCfg("robot", body_names=["pelvis"])
+            env._autoplay_pelvis_cfg.resolve(env.scene)
+        wcfg = waist["joint_cfg"]
+        return torch.cat([
+            joint_pos_selected(env, arm_cfg),
+            joint_vel_selected(env, arm_cfg),
+            object_pos_relative_to_body(env, object_cfg, robot_body_cfg, local_offset=palm_local_offset),
+            palm_quat_torso_unyawed(env, robot_body_cfg, env._autoplay_torso_cfg, env._autoplay_pelvis_cfg, wcfg),
+            prev_raw_action,
+            palm_contact_force_any(env, env._autoplay_sensor_cfg),
+            neighbour_clearance_ring(env, max_range=waist["ring_range"]),
+            joint_pos_selected(env, wcfg),
+            joint_vel_selected(env, wcfg),
+            waist["prev_raw"],
+        ], dim=-1)
 
     parts = [
         joint_pos_selected(env, arm_cfg),
@@ -497,6 +526,28 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
             else torch.full((n, j), float(self._offset), device=self.device)
         for name, value in (cfg.grasp_offset or {}).items():
             self._grasp_offset[:, self._joint_names.index(name)] = value
+        # reach-phase target when no reach policy drives this term (the hand):
+        # the default pose, or cfg.reach_offset (e.g. the reach's pre-shape)
+        self._reach_hold = self._offset.clone() if isinstance(self._offset, torch.Tensor) \
+            else torch.full((n, j), float(self._offset), device=self.device)
+        for name, value in (cfg.reach_offset or {}).items():
+            self._reach_hold[:, self._joint_names.index(name)] = value
+
+        # Waist yaw driven by the reach policy's extra (8th) output during
+        # the reach, then held where the reach left it (braking to a stop);
+        # not part of this term's actions (the trainee never drives it).
+        self._waist_id = None
+        if cfg.reach_waist_joint is not None:
+            robot = env.scene[cfg.asset_name]
+            self._waist_id = robot.joint_names.index(cfg.reach_waist_joint)
+            self._waist_cfg = SceneEntityCfg(cfg.asset_name, joint_names=[cfg.reach_waist_joint], preserve_order=True)
+            self._waist_cfg.resolve(env.scene)
+            self._waist_prev_raw = torch.zeros(n, 1, device=self.device)
+            self._waist_target = torch.zeros(n, device=self.device)
+            self._waist_vel = torch.zeros(n, device=self.device)
+            # external waist command (rad) for the harvest bench after the
+            # grasp (the arm-goal policy's waist); NaN = hold / reach policy
+            self.waist_override = torch.full((n,), float("nan"), device=self.device)
 
         if cfg.drive_with_reach_policy:
             # Resolved WITHOUT preserve_order, matching the reach task's own
@@ -562,20 +613,26 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         trainee_target = self._raw_actions * scale + offset
 
         # -- reach-phase target --
+        waist_raw = None
         if self.cfg.drive_with_reach_policy and not bool(phase.all()):
             policy = _load_reach_policy(self.cfg.reach_policy_path, self.device)
+            waist = None if self._waist_id is None else \
+                {"joint_cfg": self._waist_cfg, "prev_raw": self._waist_prev_raw, "ring_range": self.cfg.reach_ring_range}
             obs = _reach_obs(
                 self._env, self._reach_arm_cfg, self._palm_cfg, self._apple_cfg,
-                self.cfg.palm_local_offset, self._reach_prev_raw, layout=self.cfg.reach_obs_layout,
+                self.cfg.palm_local_offset, self._reach_prev_raw, layout=self.cfg.reach_obs_layout, waist=waist,
             )
             with torch.inference_mode():
                 reach_raw = policy(obs)
             # In-place: rollouts run under inference_mode, and a reassigned
             # inference tensor could not be reset in place outside it later.
-            self._reach_prev_raw.copy_(reach_raw)
+            self._reach_prev_raw.copy_(reach_raw[:, : self._reach_prev_raw.shape[1]])
+            if self._waist_id is not None:
+                waist_raw = reach_raw[:, self._reach_prev_raw.shape[1]:]
+                self._waist_prev_raw.copy_(torch.where(phase, self._waist_prev_raw, waist_raw))
             reach_target = self._reach_prev_raw * self.cfg.reach_scale + self._offset
         else:
-            reach_target = self._offset
+            reach_target = self._reach_hold
 
         target_desired = torch.where(phase, trainee_target, reach_target)
         if self.cfg.clip is not None:
@@ -601,8 +658,35 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         self._prev_vel = v_cmd
         self._processed_actions = target_cmd
 
+        if self._waist_id is not None:
+            self._process_waist(phase.squeeze(-1), needs_reset.squeeze(-1), dt)
+
+    def _process_waist(self, phase: torch.Tensor, needs_reset: torch.Tensor, dt: float) -> None:
+        """Waist target: the reach policy's raw waist output * reach_scale
+        (default 0), clipped to +-reach_waist_limit, in the reach phase; in
+        the grasp phase the current target (stop). Rate-limited with braking
+        toward the target, as the reach task's waist term (brake_to_target)."""
+        cur = self._asset.data.joint_pos[:, self._waist_id]
+        self._waist_target = torch.where(needs_reset, cur, self._waist_target)
+        self._waist_vel = torch.where(needs_reset, torch.zeros_like(self._waist_vel), self._waist_vel)
+        lim = self.cfg.reach_waist_limit
+        desired = (self._waist_prev_raw.squeeze(-1) * self.cfg.reach_scale).clamp(-lim, lim)
+        desired = torch.where(phase, self._waist_target, desired)
+        ov = self.waist_override
+        desired = torch.where(torch.isfinite(ov), ov.clamp(-lim, lim), desired)
+        a, vmax = self.cfg.reach_waist_max_acceleration, self.cfg.reach_waist_max_velocity
+        err = desired - self._waist_target
+        v = (err / dt).clamp(-vmax, vmax)
+        v_stop = -0.5 * a * dt + torch.sqrt((0.5 * a * dt) ** 2 + 2.0 * a * err.abs())
+        v = torch.maximum(torch.minimum(v, v_stop), -v_stop)
+        v = torch.clamp(v, self._waist_vel - a * dt, self._waist_vel + a * dt)
+        self._waist_target = self._waist_target + v * dt
+        self._waist_vel = v
+
     def apply_actions(self):
         super().apply_actions()
+        if self._waist_id is not None:
+            self._asset.set_joint_position_target(self._waist_target.unsqueeze(-1), joint_ids=[self._waist_id])
         if self.cfg.pin_object is None or not hasattr(self._env, "_grasp_ever_closed"):
             return
         obj: RigidObject = self._env.scene[self.cfg.pin_object]
@@ -653,6 +737,9 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         # Zero on the first tick, mirroring mdp.last_action's zero-at-
         # episode-start convention in the reach task.
         self._reach_prev_raw[env_ids] = 0.0
+        if self._waist_id is not None:
+            self._waist_prev_raw[env_ids] = 0.0
+            self._waist_vel[env_ids] = 0.0
 
 
 @configclass
@@ -676,6 +763,17 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     AppleReachTree-v1 one (any-contact palm force + clearance ring) -- must
     match the policy at reach_policy_path."""
     reach_scale: float = 0.5
+    reach_waist_joint: str | None = None
+    """Waist yaw joint driven by the reach policy's extra output (layout
+    "waist"), held after the hand-off; None: the waist is not touched."""
+    reach_waist_limit: float = 0.785
+    reach_waist_max_velocity: float = 1.0
+    reach_waist_max_acceleration: float = 4.0
+    reach_ring_range: float = 0.10
+    """Clearance-ring range of the reach policy's input (layout "waist")."""
+    reach_offset: dict[str, float] | None = None
+    """Joint name -> target held during the REACH phase when no reach policy
+    drives this term (the hand: the reach's pre-shape); default pose otherwise."""
     # With unlock_with_grip, the LAST pre_grip_free_dims joints (in
     # cfg.joint_names order) keep their normal scale even before the first
     # grip; the rest are held at exactly the hand-off pose until then. For

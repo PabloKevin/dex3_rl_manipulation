@@ -18,6 +18,11 @@ joint_names, palm_local, palm_normal). envs/mdp/arm_goal.reset_arm_goal
 starts 70% of its pick-like episodes from it when the file exists.
 
     ~/miniconda3/envs/env_isaaclab/bin/python scripts/record_reach_starts.py --headless --count 3000
+
+--spindle: the v3 waist reach (AppleReachSpindle-v3, pinned best_weights/
+grasp_handoff_reach_spindle.pt) on the spindle tree; also records the waist
+yaw ("waist"); default output envs/assets/reach_end_poses_waist.npz (the
+AppleArmGoalWaist-v1 start bank).
 """
 import argparse
 import os
@@ -33,6 +38,7 @@ p.add_argument("--max_miss", type=float, default=0.05, help="grasp pocket at mos
 p.add_argument("--policy", type=str, default=None, help="exported reach policy (default best_weights/grasp_handoff_reach_tree.pt)")
 p.add_argument("--apple_radius", type=float, default=0.048)
 p.add_argument("--out", type=str, default=None)
+p.add_argument("--spindle", action="store_true", help="v3 waist reach on the spindle tree; records the waist yaw too")
 AppLauncher.add_app_launcher_args(p)
 args = p.parse_args()
 app = AppLauncher(args).app
@@ -52,17 +58,26 @@ from envs.mdp import basket as bk
 from envs.mdp import self_collision as scm
 from isaaclab.utils.math import quat_apply
 
-cfg = AppleReachTreeEnvCfg()
+if args.spindle:
+    from envs.apple_reach_spindle_env_cfg import AppleReachSpindleV3EnvCfg
+    cfg = AppleReachSpindleV3EnvCfg()
+    cfg.events.reset_arm_jitter = None             # the robot starts every reach from home
+    cfg.events.reset_waist_jitter = None
+else:
+    cfg = AppleReachTreeEnvCfg()
 cfg.scene.num_envs = args.num_envs
 cfg.episode_length_s = args.at_s + 0.1            # one pose per episode
 for name in list(vars(cfg.terminations)):
     if not name.startswith("_") and name != "time_out":
         setattr(cfg.terminations, name, None)
-env = gym.make("AppleReachTree-v1", cfg=cfg).unwrapped
-pol = torch.jit.load(args.policy or os.path.join(REPO, "envs/agents/best_weights/grasp_handoff_reach_tree.pt"),
+env = gym.make("AppleReachSpindle-v3" if args.spindle else "AppleReachTree-v1", cfg=cfg).unwrapped
+default_pol = "grasp_handoff_reach_spindle.pt" if args.spindle else "grasp_handoff_reach_tree.pt"
+pol = torch.jit.load(args.policy or os.path.join(REPO, "envs/agents/best_weights", default_pol),
                      map_location=env.device).eval()
+waist_id = robot_waist = None
 robot, apple = env.scene["robot"], env.scene["apple"]
 arm_ids = [robot.joint_names.index(n) for n in RIGHT_ARM_JOINTS]
+waist_id = robot.joint_names.index("waist_yaw_joint")
 palm = robot.data.body_names.index("right_hand_palm_link")
 at_step = int(round(args.at_s / env.step_dt))
 c_local = torch.tensor(GRASP_CENTER_LOCAL, device=env.device)
@@ -95,13 +110,15 @@ while len(kept) < args.count:
                                  margin)[:, 0] <= 0.0)
         good = arrived & arm_ok & apple_ok & basket_ok
         for j in good.nonzero(as_tuple=True)[0].tolist():
-            kept.append((q[j].cpu().numpy(), (pp[j] - o[j]).cpu().numpy(), normal[j].cpu().numpy()))
+            kept.append((q[j].cpu().numpy(), (pp[j] - o[j]).cpu().numpy(), normal[j].cpu().numpy(),
+                         float(robot.data.joint_pos[now[j], waist_id])))
         print(f"[record] {len(kept)}/{args.count} kept of {seen} reach ends "
               f"(arrived {int(arrived.sum())}/{len(now)}, clear {int((arm_ok & apple_ok & basket_ok).sum())}/{len(now)})",
               flush=True)
 kept = kept[:args.count]
-out = args.out or os.path.join(REPO, "envs", "assets", "reach_end_poses.npz")
+out = args.out or os.path.join(REPO, "envs", "assets", "reach_end_poses_waist.npz" if args.spindle else "reach_end_poses.npz")
+extra = {"waist": np.array([k[3] for k in kept], dtype=np.float32)} if args.spindle else {}
 np.savez(out, q=np.stack([k[0] for k in kept]), palm_local=np.stack([k[1] for k in kept]),
-         palm_normal=np.stack([k[2] for k in kept]), joint_names=np.array(RIGHT_ARM_JOINTS))
+         palm_normal=np.stack([k[2] for k in kept]), joint_names=np.array(RIGHT_ARM_JOINTS), **extra)
 print(f"[record] {len(kept)} poses ({100 * len(kept) / max(seen, 1):.0f}% of reach ends) -> {out}", flush=True)
 os._exit(0)

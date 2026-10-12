@@ -216,10 +216,38 @@ class AppleReachSpindlePPORunnerCfg(AppleGraspPPORunnerCfg):
 
 
 @configclass
+class AppleReachSpindleV2PPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachSpindle-v2: the spindle reach that keeps off the neighbours.
+    Own log folder (logs/rsl_rl/apple_reach_spindle_v2)."""
+    experiment_name = "apple_reach_spindle_v2"
+
+
+@configclass
+class AppleReachSpindleV3PPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachSpindle-v3: v2 + motor load (energy). Own log folder
+    (logs/rsl_rl/apple_reach_spindle_v3)."""
+    experiment_name = "apple_reach_spindle_v3"
+
+
+@configclass
 class AppleGraspTreePPORunnerCfg(AppleGraspGraspPPORunnerCfg):
     """AppleGraspTree-v1: the grasp recipe on the multi-apple tree with the
     hold-under-load stage. Own log folder (logs/rsl_rl/apple_grasp_tree)."""
     experiment_name = "apple_grasp_tree"
+
+
+@configclass
+class AppleGraspSpindlePPORunnerCfg(AppleGraspTreePPORunnerCfg):
+    """AppleGraspSpindle-v1: the tree grasp after the waist reach, on the
+    spindle tree. Own log folder (logs/rsl_rl/apple_grasp_spindle)."""
+    experiment_name = "apple_grasp_spindle"
+
+
+@configclass
+class AppleGraspSpindleV2PPORunnerCfg(AppleGraspTreePPORunnerCfg):
+    """AppleGraspSpindle-v2: stem-like twist load + harvest grip command.
+    Own log folder (logs/rsl_rl/apple_grasp_spindle_v2)."""
+    experiment_name = "apple_grasp_spindle_v2"
 
 
 @configclass
@@ -228,3 +256,17 @@ class AppleArmGoalPPORunnerCfg(AppleGraspPPORunnerCfg):
     512 envs x 32 steps per iteration. Own log folder (logs/rsl_rl/apple_arm_goal)."""
     experiment_name = "apple_arm_goal"
     num_steps_per_env = 32
+
+
+@configclass
+class AppleArmGoalWaistPPORunnerCfg(AppleArmGoalPPORunnerCfg):
+    """AppleArmGoalWaist-v1: the harvest-path goal policy with the waist yaw.
+    Own log folder (logs/rsl_rl/apple_arm_goal_waist)."""
+    experiment_name = "apple_arm_goal_waist"
+
+
+@configclass
+class AppleGraspSpindleV3PPORunnerCfg(AppleGraspTreePPORunnerCfg):
+    """AppleGraspSpindle-v3: v2 + the pull after an unbroken twist.
+    Own log folder (logs/rsl_rl/apple_grasp_spindle_v3)."""
+    experiment_name = "apple_grasp_spindle_v3"

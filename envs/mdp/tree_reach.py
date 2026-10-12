@@ -207,3 +207,145 @@ def target_knocked_off(env: "ManagerBasedRLEnv") -> torch.Tensor:
     if not hasattr(env, "_tree"):
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     return env._tree.target_stem.broken.clone()
+
+
+# ─────────────────────────────────────────────
+#  Rewards against pushing neighbours on the way in (AppleReachSpindle-v2)
+# ─────────────────────────────────────────────
+# Measured on the first spindle reach (2026-10-11_02-03-47, 256 trees): 83%
+# of episodes pushed a neighbour > 5 mm; the thumb tip was the nearest link
+# in 53% of first pushes; 69% of the pushed fruit hung above/below the
+# target (82% below: the hand rises from home through the fruit under it).
+
+def penalty_hand_neighbour_clearance(env: "ManagerBasedRLEnv", margin: float = 0.01,
+                                     ref: float = 0.02) -> torch.Tensor:
+    """[N] Dex3 hand spheres (self_collision.HAND_SPHERES: palm, fingers,
+    thumb) coming within `margin` of a hanging NEIGHBOUR: sum over sphere and
+    fruit of (depth / ref)^2. Felt before the push (neighbour_push only
+    charges a fruit already moved), so it shapes the path and the finger
+    direction. The target is excluded."""
+    from .self_collision import _build, _world_spheres
+
+    if not hasattr(env, "_tree"):
+        return torch.zeros(env.num_envs, device=env.device)
+    if not hasattr(env, "_self_collision_spheres"):
+        env._self_collision_spheres = _build(env)
+    sets = env._self_collision_spheres
+    if "hand" not in sets:
+        names = env.scene["robot"].data.body_names
+        arm = sets["arm"]
+        keep = torch.tensor([names[i].startswith("right_hand") for i in arm["ids"].tolist()], device=env.device)
+        sets["hand"] = {k: v[keep] for k, v in arm.items()}
+    hand = sets["hand"]
+    p = _world_spheres(env, hand)                                            # [N, H, 3]
+    q, hanging = _neighbour_state(env)                                       # [N, K, 3]
+    dist = torch.cdist(p, q)                                                 # [N, H, K]
+    need = hand["r"].view(1, -1, 1) + env._apple_radius.view(-1, 1, 1) + margin
+    depth = (need - dist).clamp(min=0.0) * hanging.unsqueeze(1).float()
+    return ((depth / ref) ** 2).sum(dim=(1, 2))
+
+
+def penalty_fingers_toward_neighbours(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    standoff: float,
+    palm_local_offset: tuple[float, float, float],
+    palm_normal_axis: tuple[float, float, float],
+    near: float = 0.15,
+    gate_near: float = 0.05,
+    gate_far: float = 0.20,
+    finger_axis: tuple[float, float, float] = (1.0, 0.0, 0.0),
+) -> torch.Tensor:
+    """[N] the hand's long axis (fingers one way, wrist and forearm the
+    other) lined up with a close neighbour, seen along the approach: per
+    hanging neighbour within `near` (surface gap) of the target and not
+    behind it, (1 - gap/near) * (finger axis . direction to it)^2, both in
+    the plane across the approach direction. Fingers up/down are free when
+    nothing hangs above/below (it reads 0 then); in a vertical cluster they
+    sweep the fruit above and below, and sideways is better. Gated in by the
+    palm's distance to the target (full within gate_near, 0 beyond gate_far)."""
+    from isaaclab.utils.math import quat_apply
+
+    from . import reach_rewards as rr
+
+    if not hasattr(env, "_tree"):
+        return torch.zeros(env.num_envs, device=env.device)
+    N = env.num_envs
+    robot = env.scene[robot_cfg.name]
+    qp = robot.data.body_quat_w[:, robot_cfg.body_ids[0]]
+    f = quat_apply(qp, torch.tensor(finger_axis, device=env.device).expand(N, 3))
+    a = rr._approach_dir(env, object_cfg)                                    # [N, 3] horizontal
+    f_perp = f - (f * a).sum(-1, keepdim=True) * a
+    c = env.scene[object_cfg.name].data.root_pos_w
+    q, hanging = _neighbour_state(env)
+    r = env._apple_radius.view(N, 1)
+    v = q - c.unsqueeze(1)                                                   # [N, K, 3]
+    depth = (v * a.unsqueeze(1)).sum(-1)
+    gap = v.norm(dim=-1) - 2 * r
+    v_perp = v - depth.unsqueeze(-1) * a.unsqueeze(1)
+    u = v_perp / v_perp.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    w = (1.0 - gap / near).clamp(0.0, 1.0) * (hanging & (depth < 2 * r)).float()
+    align = ((u * f_perp.unsqueeze(1)).sum(-1)) ** 2
+    d = rr._palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis)
+    g = ((gate_far - d) / (gate_far - gate_near)).clamp(0.0, 1.0)
+    return (w * align).sum(-1) * g
+
+
+def penalty_height_first(
+    env: "ManagerBasedRLEnv",
+    robot_cfg: SceneEntityCfg,
+    object_cfg: SceneEntityCfg,
+    standoff: float,
+    palm_local_offset: tuple[float, float, float],
+    tol: float = 0.02,
+    ref: float = 0.05,
+    near: float = 0.05,
+    far: float = 0.20,
+) -> torch.Tensor:
+    """[N] reach the apple's HEIGHT before closing in: the palm reference
+    point's height error beyond `tol`, ((|dz| - tol) / ref)^2, weighted by
+    how close it already is horizontally to the grasp target (1 within
+    `near`, 0 beyond `far`). Coming in level with the fruit instead of
+    rising through the cluster under it."""
+    from . import reach_rewards as rr
+
+    t = rr._grasp_target_pos(env, object_cfg, standoff)
+    p = rr._palm_ref_pos(env, robot_cfg, palm_local_offset)
+    dh = (p[:, :2] - t[:, :2]).norm(dim=-1)
+    dz = (p[:, 2] - t[:, 2]).abs()
+    w = ((far - dh) / (far - near)).clamp(0.0, 1.0)
+    return w * (((dz - tol).clamp(min=0.0) / ref) ** 2)
+
+
+def penalty_arm_fruit_clearance(env: "ManagerBasedRLEnv", margin: float = 0.015,
+                                ref: float = 0.02) -> torch.Tensor:
+    """[N] the ARM (upper arm, elbow / forearm, wrist links: the self-
+    collision model's right-arm spheres, hand excluded) within `margin` of
+    any fruit still on the tree, the target included -- seen pushing fruit
+    with the elbow or the wrist on the way in, which the hand-only terms
+    miss: sum over sphere and fruit of (depth / ref)^2."""
+    from .self_collision import _build, _world_spheres
+
+    if not hasattr(env, "_tree"):
+        return torch.zeros(env.num_envs, device=env.device)
+    if not hasattr(env, "_self_collision_spheres"):
+        env._self_collision_spheres = _build(env)
+    sets = env._self_collision_spheres
+    if "arm_only" not in sets:
+        names = env.scene["robot"].data.body_names
+        arm = sets["arm"]
+        keep = torch.tensor([not names[i].startswith("right_hand") for i in arm["ids"].tolist()], device=env.device)
+        sets["arm_only"] = {k: v[keep] for k, v in arm.items()}
+    arm = sets["arm_only"]
+    p = _world_spheres(env, arm)                                             # [N, A, 3]
+    q, hanging = _neighbour_state(env)
+    T = env._tree
+    tgt = env.scene["apple"].data.root_pos_w.unsqueeze(1)
+    tgt_on = (T.target_stem.active & ~T.target_stem.broken).unsqueeze(1)
+    q = torch.cat([tgt, q], dim=1)                                           # [N, 1+K, 3]
+    on = torch.cat([tgt_on, hanging], dim=1)
+    dist = torch.cdist(p, q)
+    need = arm["r"].view(1, -1, 1) + env._apple_radius.view(-1, 1, 1) + margin
+    depth = (need - dist).clamp(min=0.0) * on.unsqueeze(1).float()
+    return ((depth / ref) ** 2).sum(dim=(1, 2))

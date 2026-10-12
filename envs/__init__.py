@@ -35,14 +35,30 @@ from .apple_reach_tree_waist_env_cfg import (
 from .apple_reach_spindle_env_cfg import (
     AppleReachSpindleEnvCfg,
     AppleReachSpindleEnvCfg_PLAY,
+    AppleReachSpindleV2EnvCfg,
+    AppleReachSpindleV2EnvCfg_PLAY,
+    AppleReachSpindleV3EnvCfg,
+    AppleReachSpindleV3EnvCfg_PLAY,
 )
 from .apple_grasp_tree_train_env_cfg import (
     AppleGraspTreeTrainEnvCfg,
     AppleGraspTreeTrainEnvCfg_PLAY,
 )
+from .apple_grasp_spindle_env_cfg import (
+    AppleGraspSpindleEnvCfg,
+    AppleGraspSpindleEnvCfg_PLAY,
+    AppleGraspSpindleV2EnvCfg,
+    AppleGraspSpindleV2EnvCfg_PLAY,
+    AppleGraspSpindleV3EnvCfg,
+    AppleGraspSpindleV3EnvCfg_PLAY,
+)
 from .apple_arm_goal_env_cfg import (
     AppleArmGoalEnvCfg,
     AppleArmGoalEnvCfg_PLAY,
+)
+from .apple_arm_goal_waist_env_cfg import (
+    AppleArmGoalWaistEnvCfg,
+    AppleArmGoalWaistEnvCfg_PLAY,
 )
 from .agents.rsl_rl_ppo_cfg import (
     AppleGraspPPORunnerCfg,
@@ -52,8 +68,14 @@ from .agents.rsl_rl_ppo_cfg import (
     AppleReachTreeWaistPPORunnerCfg,
     AppleReachTreeWaistFacePPORunnerCfg,
     AppleReachSpindlePPORunnerCfg,
+    AppleReachSpindleV2PPORunnerCfg,
+    AppleReachSpindleV3PPORunnerCfg,
     AppleGraspTreePPORunnerCfg,
+    AppleGraspSpindlePPORunnerCfg,
+    AppleGraspSpindleV2PPORunnerCfg,
+    AppleGraspSpindleV3PPORunnerCfg,
     AppleArmGoalPPORunnerCfg,
+    AppleArmGoalWaistPPORunnerCfg,
 )
 
 gym.register(
@@ -207,6 +229,48 @@ gym.register(
     disable_env_checker=True,
 )
 
+# Spindle reach v2: keeps off the neighbours (clearance, fingers sideways in clusters, height first).
+gym.register(
+    id="AppleReachSpindle-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSpindleV2EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachSpindleV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachSpindle-Play-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSpindleV2EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachSpindleV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Spindle reach v3: v2 + motor load (energy) penalty.
+gym.register(
+    id="AppleReachSpindle-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSpindleV3EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachSpindleV3PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachSpindle-Play-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSpindleV3EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachSpindleV3PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
 # Grasp on the multi-apple tree (neighbours, fruit on its stem, hold-under-load).
 gym.register(
     id="AppleGraspTree-v1",
@@ -228,6 +292,48 @@ gym.register(
     disable_env_checker=True,
 )
 
+# Grasp after the waist reach (v3), on the spindle tree.
+gym.register(
+    id="AppleGraspSpindle-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSpindleEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspSpindlePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspSpindle-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSpindleEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspSpindlePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Grasp v2: stem-like twist load (breaks at the stem's torque), harvest grip command.
+gym.register(
+    id="AppleGraspSpindle-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSpindleV2EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspSpindleV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspSpindle-Play-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSpindleV2EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspSpindleV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
 # Goal-reaching arm policy for the harvest path (safe zone -> basket -> home).
 gym.register(
     id="AppleArmGoal-v1",
@@ -245,6 +351,48 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleArmGoalEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleArmGoalPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Harvest-path goal policy with the waist yaw (after the waist reach).
+gym.register(
+    id="AppleArmGoalWaist-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleArmGoalWaistEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleArmGoalWaistPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleArmGoalWaist-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleArmGoalWaistEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleArmGoalWaistPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Grasp v3: + the bench's pull after an unbroken twist.
+gym.register(
+    id="AppleGraspSpindle-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSpindleV3EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspSpindleV3PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspSpindle-Play-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSpindleV3EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspSpindleV3PPORunnerCfg,
     },
     disable_env_checker=True,
 )

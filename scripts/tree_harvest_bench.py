@@ -40,7 +40,14 @@ the peak during reach + grasp (on the pinned fruit), in the basket, worst self-c
 how far the hand pushed the neighbours still on the tree, and how many it
 knocked off. FINISHED = held through everything and in the basket.
 
-Reach: --reach_policy last (default) = the newest AppleReachTree-v1 checkpoint,
+Setup: --setup spindle (default) = the robot as trained last: the v3 waist
+reach (pinned best_weights/grasp_handoff_reach_spindle.pt; the torso turns,
+the hand is pre-shaped), the tall-spindle tree, the AppleGraspSpindle grasp
+and the AppleArmGoalWaist path policy (it drives the waist after the grasp
+and brings it back to 0 at home); --setup wall = the earlier fruiting-wall
+tree with the arm-only policies.
+
+Reach (wall setup): --reach_policy last (default) = the newest AppleReachTree-v1 checkpoint,
 exported on the fly (scripts/export_policy_jit.py); v1 = the single-apple
 reach the grasp task pins. Grasp: the trained policy, or --grasp scripted
 (plan B for sim2real): each finger closes until it feels --close_force, then
@@ -62,6 +69,9 @@ from isaaclab.app import AppLauncher
 
 p = argparse.ArgumentParser(description="Harvest every apple of a tree, one at a time",
                             formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("--setup", type=str, default="spindle", choices=["spindle", "wall"],
+               help="spindle: v3 waist reach + spindle tree + AppleGraspSpindle grasp + AppleArmGoalWaist path; "
+                    "wall: the earlier fruiting-wall setup")
 p.add_argument("--policy", type=str, default="last",
                help="grasp policy: 'last' = newest AppleGraspTree-v1 checkpoint (exported on the fly), else the newest "
                     "logs/rsl_rl/apple_grasp_grasp/*/exported/policy.pt; or a model_*.pt / exported .pt")
@@ -90,6 +100,13 @@ p.add_argument("--grasp_timeout", type=float, default=5.0,
                help="seconds after the hand-off; a grasp not READY by then is harvested anyway ('timeout-ready')")
 p.add_argument("--twist_deg", type=float, default=90.0)
 p.add_argument("--twist_s", type=float, default=1.5)
+p.add_argument("--bend_deg", type=float, default=40.0,
+               help="after a twist that leaves the stem on: swing the grasped fruit sideways about its stem "
+                    "attachment by up to this much (0 = off, straight to the pull). The stems break by bending at "
+                    "0.25-0.45 N*m (15-43 deg) -- ~4-6 N at the fruit -- while a pull-off needs 15-25 N, more than "
+                    "the Dex3 grip holds without bruising (~17 N measured)")
+p.add_argument("--bend_s", type=float, default=1.0, help="seconds for the bend swing")
+p.add_argument("--stem_guess", type=float, default=0.03, help="assumed stem length for the bend pivot, m")
 p.add_argument("--twist_arm_weight", type=float, default=0.1,
                help="share of the twist's IK motion for shoulder/elbow (wrist = 1): wrist-first twisting")
 p.add_argument("--twist_body_margin", type=float, default=0.04,
@@ -154,6 +171,10 @@ from envs.mdp.self_collision import self_collision_depth
 if args.apples is not None:
     tree_cfg_mod.APPLES_PER_TREE = args.apples           # read by the scene / event cfgs below
 cfg = tree_cfg_mod.AppleGraspTreeEnvCfg()
+SPINDLE = args.setup == "spindle"
+if SPINDLE:
+    from envs.apple_grasp_spindle_env_cfg import SPINDLE_REACH_POLICY, apply_spindle_setup
+    apply_spindle_setup(cfg)
 
 
 def _resolve_reach_policy(spec):
@@ -172,10 +193,13 @@ def _resolve_reach_policy(spec):
                 sys.exit("no AppleReachTree-v1 checkpoint found -- pass --reach_policy v1 or a path")
             spec = max(ckpts, key=lambda c: (os.path.getmtime(os.path.dirname(c)), int(c.rsplit("_", 1)[1][:-3])))
         path = ex.export(spec) if os.path.basename(spec).startswith("model_") else spec
-    return path, ("tree" if ex.input_dim(path) == 37 else "v1")
+    return path, {37: "tree", 40: "waist"}.get(ex.input_dim(path), "v1")
 
 
-reach_path, reach_layout = _resolve_reach_policy(args.reach_policy)
+if SPINDLE and args.reach_policy == "last":
+    reach_path, reach_layout = SPINDLE_REACH_POLICY, "waist"
+else:
+    reach_path, reach_layout = _resolve_reach_policy(args.reach_policy)
 
 
 def _resolve_grasp_policy(spec):
@@ -184,8 +208,14 @@ def _resolve_grasp_policy(spec):
     _sp = importlib.util.spec_from_file_location("export_policy_jit", os.path.join(REPO, "scripts", "export_policy_jit.py"))
     ex = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(ex)
     if spec == "last":
-        runs = [d for d in glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_grasp_tree/20*/"))
-                if not any(w in d for w in ("validate", "smoke"))]
+        # v2 first: v3 (trained against a 15-25 N pull) held worse -- the pull is beyond the grip
+        exps = ["apple_grasp_spindle_v2", "apple_grasp_spindle"] if SPINDLE else ["apple_grasp_tree"]
+        runs = []
+        for e in exps:
+            runs = [d for d in glob.glob(os.path.join(REPO, f"logs/rsl_rl/{e}/20*/"))
+                    if not any(w in d for w in ("validate", "smoke"))]
+            if runs:
+                break
         ckpts = [c for d in runs for c in glob.glob(os.path.join(d, "model_*.pt"))]
         if ckpts:
             spec = max(ckpts, key=lambda c: (os.path.getmtime(os.path.dirname(c)), int(c.rsplit("_", 1)[1][:-3])))
@@ -328,9 +358,10 @@ _order = [RIGHT_ARM_JOINTS.index(robot.joint_names[j]) for j in arm_ids]
 basket_wps = torch.tensor(_bp["waypoints"], device=dev, dtype=torch.float32)[:, _order]   # home, ..., drop
 hand_open = robot.data.default_joint_pos[:, hand._joint_ids]
 
-GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE, PULL, GOAL = range(10)
+GRASP, TWIST, HOME, BASKET, RELEASE, RETURN, NEXT, TREE_DONE, PULL, GOAL, BEND = range(11)
 G_SAFE, G_DROP, G_HOME = 0, 1, 2
 PHASE = {GRASP: "grasp", TWIST: "twist", HOME: "home", BASKET: "basket", RELEASE: "release", PULL: "pull", GOAL: "goal",
+         BEND: "bend",
          RETURN: "return", NEXT: "next", TREE_DONE: "done"}
 fmt = lambda x, s="{:.2f}": "-" if x != x else s.format(x)
 _cm = lambda x: "free" if x != x else f"{x * 100:4.1f}"
@@ -363,6 +394,7 @@ def neighbours_on_tree():
 
 # ── goal-reaching arm policy for the harvest path (AppleArmGoal-v1) ──
 PATH_POLICY = False
+GOAL_WAIST = False
 if args.path == "policy":
     import importlib.util
     from envs.mdp import arm_goal as ag
@@ -371,7 +403,7 @@ if args.path == "policy":
     _ex = importlib.util.module_from_spec(_sp); _sp.loader.exec_module(_ex)
     spec = args.goal_policy
     if spec == "last":
-        runs = [d for d in glob.glob(os.path.join(REPO, "logs/rsl_rl/apple_arm_goal/20*/"))
+        runs = [d for d in glob.glob(os.path.join(REPO, f"logs/rsl_rl/{'apple_arm_goal_waist' if SPINDLE else 'apple_arm_goal'}/20*/"))
                 if not any(w in d for w in ("validate", "smoke"))]
         ckpts = [c for d in runs for c in glob.glob(os.path.join(d, "model_*.pt"))]
         spec = max(ckpts, key=lambda c: (os.path.getmtime(os.path.dirname(c)), int(c.rsplit("_", 1)[1][:-3]))) \
@@ -381,7 +413,7 @@ if args.path == "policy":
     else:
         goal_path = _ex.export(spec) if os.path.basename(spec).startswith("model_") else spec
         _goal_jit = torch.jit.load(goal_path, map_location=dev).eval()
-        _goal_dim = _ex.input_dim(goal_path)                   # 31: palm normal only; 34: + finger direction
+        _goal_dim = _ex.input_dim(goal_path)                   # 31: palm normal only; 34: + finger direction; 37: + waist
         PATH_POLICY = True
         G = ag.goal_state(env)
         G.basket[:] = torch.tensor(ag.BASKET_NOMINAL, device=dev)       # the bench's basket (basket.py)
@@ -390,14 +422,21 @@ if args.path == "policy":
         _goal_arm_cfg = SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS, preserve_order=True)
         _goal_arm_cfg.resolve(env.scene)
         _goal_prev = torch.zeros(N, arm_dim, device=dev)
+        _goal_prev_waist = torch.zeros(N, 1, device=dev)
+        GOAL_WAIST = _goal_dim == 37
+        if GOAL_WAIST:
+            _goal_waist_cfg = SceneEntityCfg("robot", joint_names=["waist_yaw_joint"], preserve_order=True)
+            _goal_waist_cfg.resolve(env.scene)
         _arm_default = robot.data.default_joint_pos[:, arm_ids]
         _POCKET = tuple(GRASP_CENTER_LOCAL)
 
         def goal_obs():
             return torch.cat([joint_pos_selected(env, _goal_arm_cfg), joint_vel_selected(env, _goal_arm_cfg),
-                              ag.obs_goal_pocket(env, _POCKET), ag.obs_goal_normal(env, _POCKET),
-                              ag.obs_basket(env, _POCKET), ag.obs_carrying(env), _goal_prev]
-                             + ([ag.obs_goal_finger(env)] if _goal_dim == 34 else []), dim=-1)
+                              ag.obs_goal_pocket(env, _POCKET, unyaw=GOAL_WAIST), ag.obs_goal_normal(env, _POCKET),
+                              ag.obs_basket(env, _POCKET, unyaw=GOAL_WAIST), ag.obs_carrying(env), _goal_prev]
+                             + ([ag.obs_goal_finger(env)] if _goal_dim >= 34 else [])
+                             + ([joint_pos_selected(env, _goal_waist_cfg), joint_vel_selected(env, _goal_waist_cfg),
+                                 _goal_prev_waist] if GOAL_WAIST else []), dim=-1)
 
 # Wrist-first twist: shoulder and elbow get a small share of the IK motion.
 # Rotating the palm about its normal is often not a pure wrist motion, and
@@ -461,6 +500,7 @@ def new_apple(ids):
         S["pending_home"][i] = False
         S["twist_stop"][i], S["twist_stop_why"][i], S["twist_fruit"][i], S["twist_base"][i] = False, "", None, None
         S["goal_timeouts"][i] = 0
+        S["bend_dir"][i] = ""
         S["hand_hold_open"][i] = False
         S["row_done"][i] = False
         S["home_tries"][i] = 0
@@ -506,6 +546,8 @@ def new_trees():
         twist_stop=[False] * N, twist_stop_why=[""] * N, twist_fruit=[None] * N, twist_base=[None] * N,
         goal_k=torch.zeros(N, dtype=torch.long, device=dev), goal_timeouts=[0] * N, hand_hold_open=[False] * N,
         pull_p0=torch.zeros(N, 3, device=dev), pull_q0=torch.zeros(N, 4, device=dev), pull_dir=torch.zeros(N, 3, device=dev),
+        bend_p=torch.zeros(N, 3, device=dev), bend_q=torch.zeros(N, 4, device=dev), bend_pivot=torch.zeros(N, 3, device=dev),
+        bend_axis=torch.zeros(N, 3, device=dev), bend_sign=torch.ones(N, device=dev), bend_dir=[""] * N,
         rows=[[] for _ in range(N)], knocked={i: {} for i in range(N)}, reported=[False] * N,
     )
     if hasattr(env, "_tree"):                      # (created by the first reset, which grows new trees anyway)
@@ -605,6 +647,67 @@ def twist_danger(i, worse=0.005):
     return False
 
 
+def _sweep_cost(i, pivot, axis, max_rad, margin=0.03, n_samples=8):
+    """Mean intrusion (m) of the hand/wrist spheres into a margin around the
+    fruit still hanging and into the body, rotating them rigidly about axis
+    through pivot, each way: {+1: cost, -1: cost}."""
+    c = scm._world_spheres(env, _sph)[i][_sph_keep]
+    rad = _sph["r"][_sph_keep]
+    hanging, _ = neighbours_on_tree()
+    tr = T()
+    ent = tr.occupant[i][hanging[i]]
+    q = torch.stack([tr.objs[int(e)].data.root_pos_w[i] for e in ent]) if len(ent) else torch.zeros(0, 3, device=dev)
+    body = scm._world_spheres(env, env._self_collision_spheres["body"])[i]
+    br = env._self_collision_spheres["body"]["r"]
+    r_a = float(env._apple_radius[i])
+    v = c - pivot
+    out = {}
+    for sgn in (1.0, -1.0):
+        cost = 0.0
+        for th in torch.linspace(0.0, max_rad, n_samples, device=dev)[1:]:
+            a_ = sgn * th
+            vr = v * torch.cos(a_) + torch.cross(axis.expand_as(v), v, dim=-1) * torch.sin(a_) \
+                + axis * (v @ axis).unsqueeze(-1) * (1 - torch.cos(a_))
+            pts = pivot + vr
+            if len(q):
+                d = (pts.unsqueeze(1) - q.unsqueeze(0)).norm(dim=-1) - rad.unsqueeze(1) - r_a
+                cost += float((margin - d).clamp(min=0.0).sum())
+            db = (pts.unsqueeze(1) - body.unsqueeze(0)).norm(dim=-1) - rad.unsqueeze(1) - br.unsqueeze(0)
+            cost += 3.0 * float((args.twist_body_margin - db).clamp(min=0.0).sum())
+        out[sgn] = cost / (n_samples - 1)
+    return out
+
+
+def start_bend(i):
+    """The twist left the stem on: swing the grasped fruit sideways (about
+    the vertical through its stem attachment, estimated as the pocket +
+    the palm normal x (apple radius + --stem_guess)), the side that sweeps
+    the hand least into the hanging fruit and the body."""
+    pq = robot.data.body_quat_w[i:i + 1, palm_id]
+    n = quat_apply(pq, torch.tensor([[0.0, 1.0, 0.0]], device=dev))[0]
+    pocket = robot.data.body_pos_w[i, palm_id] + quat_apply(pq, c_local[:1])[0]
+    pivot = pocket + n * (float(env._apple_radius[i]) + args.stem_guess)
+    axis = torch.tensor([0.0, 0.0, 1.0], device=dev)
+    cost = _sweep_cost(i, pivot, axis, math.radians(args.bend_deg))
+    S["bend_sign"][i] = 1.0 if cost[1.0] <= cost[-1.0] + 1e-4 else -1.0
+    S["bend_dir"][i] = f"{'+' if S['bend_sign'][i] > 0 else '-'} ({cost[1.0]*100:.1f}/{cost[-1.0]*100:.1f})"
+    S["bend_p"][i] = robot.data.body_pos_w[i, palm_id]
+    S["bend_q"][i] = pq[0]
+    S["bend_pivot"][i], S["bend_axis"][i] = pivot, axis
+    S["twist_fruit"][i], S["twist_base"][i] = None, None        # danger checks relative to the bend's start
+    S["state"][i] = BEND
+    S["t"][i] = 0.0
+
+
+def after_twist(i):
+    """Stem still on after the twist -> bend it (if enabled), else straight to the pull."""
+    stem = T().target_stem
+    if args.bend_deg > 0 and not bool(stem.broken[i]) and not S["drop_phase"][i]:
+        start_bend(i)
+    else:
+        start_pull(i) if PATH_POLICY else start_home(i)
+
+
 def start_pull(i):
     """Straight back along the way the hand came in, orientation kept."""
     pq = robot.data.body_quat_w[i:i + 1, palm_id]
@@ -641,6 +744,8 @@ def start_goal(i, k):
         G.finger[i] = torch.tensor(ag.HOME_FINGER, device=dev)
     G.carry[i] = holding and k != G_HOME
     G.start[i] = pocket[i]
+    if GOAL_WAIST:
+        G.kind[i] = {G_SAFE: ag.SAFE, G_DROP: ag.DROP, G_HOME: ag.HOME}[k]
     S["goal_k"][i] = k
     S["state"][i] = GOAL
     S["t"][i] = 0.0
@@ -668,7 +773,8 @@ def finish_apple(i):
         S["row_done"][i] = True
     q = arm._processed_actions[i]
     S["home_tries"][i] += 1
-    if float((q - basket_wps[0]).norm()) > 0.05 and S["home_tries"][i] <= 2:
+    waist_off = SPINDLE and getattr(arm, "_waist_id", None) is not None and abs(float(arm._waist_target[i])) > 0.05
+    if (float((q - basket_wps[0]).norm()) > 0.05 or waist_off) and S["home_tries"][i] <= 2:
         S["state"][i] = RETURN
         start_chain(i, [q.clone(), basket_wps[0]])
         return
@@ -719,7 +825,7 @@ def record_row(i):
         push=float(S["max_push"][i]), knocked=len(knocked), out=out, not_ready=S["not_ready"][i],
         tw=("+" if S["tw_sign"][i] > 0 else "-") if not math.isnan(S["tw_clear"][i][0]) else " ",
         tw_clear=S["tw_clear"][i], attempts=S["attempt"][i], goal_to=S["goal_timeouts"][i],
-        tw_stop=S["twist_stop_why"][i],
+        tw_stop=S["twist_stop_why"][i], bend=S["bend_dir"][i],
         grip=float(env._target_grip_level[i]) if hasattr(env, "_target_grip_level") else float("nan")))
 
 
@@ -741,7 +847,8 @@ def report_tree(i):
               + (f"  [attempt {row['attempts']}, grip command {row['grip']:.0f} N]" if row['attempts'] > 1 else
                  f"  [grip command {row['grip']:.0f} N]")
               + (f"  [goal timeouts {row['goal_to']}]" if row.get('goal_to') else "")
-              + (f"  [twist stopped: {row['tw_stop']}]" if row.get('tw_stop') else ""))
+              + (f"  [twist stopped: {row['tw_stop']}]" if row.get('tw_stop') else "")
+              + (f"  [bend {row['bend']}]" if row.get('bend') else ""))
     for s, by in sorted(S["knocked"][i].items()):
         print(f"      spot {s:2d}: KNOCKED OFF while picking #{by}")
     rows = S["rows"][i]
@@ -833,6 +940,15 @@ while app.is_running():
             q_ik = ik.step(pose_p, pose_q, base=arm._processed_actions, max_dq=0.05, null_target=q_ready, null_gain=0.2,
                            weights=_twist_w)
             q_cmd = torch.where(tw.unsqueeze(-1), q_ik, q_cmd)
+        bd = st == BEND
+        if bool(bd.any()):
+            frac = hv.smoothstep(S["t"] / args.bend_s)
+            zero = torch.zeros(N, device=dev)
+            pose_p, pose_q = hv.harvest_palm_pose(S["bend_p"], S["bend_q"], S["bend_pivot"], S["bend_axis"],
+                                                  S["bend_axis"], math.radians(args.bend_deg) * frac * S["bend_sign"], zero)
+            q_ik = ik.step(pose_p, pose_q, base=arm._processed_actions, max_dq=0.05,
+                           null_target=arm._processed_actions, null_gain=0.0)
+            q_cmd = torch.where(bd.unsqueeze(-1), q_ik, q_cmd)
         pl = st == PULL
         if bool(pl.any()):
             frac = hv.smoothstep(S["t"] / args.pull_s).unsqueeze(-1)
@@ -843,9 +959,17 @@ while app.is_running():
         gl = st == GOAL
         if PATH_POLICY and bool(gl.any()):
             raw = _goal_jit(goal_obs())
-            q_goal = torch.clamp(_arm_default + 0.5 * raw, -3.0, 3.0)        # the reach action's scale and clip
+            q_goal = torch.clamp(_arm_default + 0.5 * raw[:, :arm_dim], -3.0, 3.0)   # the reach action's scale and clip
             q_cmd = torch.where(gl.unsqueeze(-1), q_goal, q_cmd)
-            _goal_prev[gl] = raw[gl]
+            _goal_prev[gl] = raw[gl, :arm_dim]
+            if GOAL_WAIST:                                   # the goal policy drives the waist too
+                _goal_prev_waist[gl] = raw[gl, arm_dim:]
+                arm.waist_override[gl] = 0.5 * raw[gl, arm_dim]
+        if SPINDLE and getattr(arm, "_waist_id", None) is not None:
+            # outside GOAL the waist holds; on the way back home (RETURN) it turns back to 0
+            ret = st == RETURN
+            arm.waist_override[~gl & ~ret] = float("nan")
+            arm.waist_override[ret] = 0.0
         mv = (st == BASKET) | (st == RETURN)
         if bool(mv.any()):
             f = hv.smoothstep(S["t"] / S["seg_T"]).unsqueeze(-1)
@@ -860,7 +984,7 @@ while app.is_running():
         h = st != GRASP
         a[h, :arm_dim] = ((q_cmd - arm._anchor) / arm._scale)[h]
         if FINGERS_POLICY:                                    # the policy keeps the fingers while the fruit is carried
-            carried = (st == TWIST) | (st == PULL) | (st == HOME) | (st == BASKET) | ((st == GOAL) & (S["goal_k"] != G_HOME))
+            carried = (st == TWIST) | (st == BEND) | (st == PULL) | (st == HOME) | (st == BASKET) | ((st == GOAL) & (S["goal_k"] != G_HOME))
             h_frozen = h & ~carried
         else:
             h_frozen = h
@@ -880,7 +1004,7 @@ while app.is_running():
 
         # ── bookkeeping ──
         S["t"] = S["t"] + dt * (st != GRASP).float()
-        carrying = (st == TWIST) | (st == PULL) | (st == HOME) | (st == BASKET) | ((st == GOAL) & (S["goal_k"] != G_HOME))
+        carrying = (st == TWIST) | (st == BEND) | (st == PULL) | (st == HOME) | (st == BASKET) | ((st == GOAL) & (S["goal_k"] != G_HOME))
         live = carrying & torch.tensor([not d for d in S["drop_phase"]], device=dev)
         slip = (fruit_in_palm() - S["fruit0"]).norm(dim=-1)
         S["max_slip"] = torch.where(live, torch.maximum(S["max_slip"], slip), S["max_slip"])
@@ -901,7 +1025,7 @@ while app.is_running():
         for i in (live & (fruit_to_hand() > args.leave_margin)).nonzero(as_tuple=True)[0].tolist():
             S["drop_phase"][i] = PHASE[int(st[i])] if st[i] != GOAL else ("to safe zone" if S["goal_k"][i] == G_SAFE else "to basket")
             if PATH_POLICY:
-                if st[i] in (TWIST, PULL):
+                if st[i] in (TWIST, BEND, PULL):
                     start_goal(i, G_SAFE)         # empty hand: still out of the wall first, then home
                 elif st[i] == GOAL and S["goal_k"][i] == G_DROP:
                     start_goal(i, G_HOME)
@@ -918,8 +1042,12 @@ while app.is_running():
             if s_i == TWIST and not S["twist_stop"][i] and twist_danger(i):
                 S["twist_stop"][i] = True                 # into the body's danger zone / onto a neighbour
                 S["twist_stop_why"][i] = _last_danger
-                start_pull(i) if PATH_POLICY else start_home(i)
+                after_twist(i)
             elif s_i == TWIST and (t_i >= args.twist_s or (bool(stem.broken[i]) and t_i >= 0.1)):
+                after_twist(i)
+            elif s_i == BEND and (t_i >= args.bend_s + 0.1 or (bool(stem.broken[i]) and t_i >= 0.1) or twist_danger(i)):
+                if t_i < args.bend_s and not bool(stem.broken[i]):
+                    S["twist_stop_why"][i] += f" bend stopped: {_last_danger}"
                 start_pull(i) if PATH_POLICY else start_home(i)
             elif s_i == PULL and t_i >= args.pull_s + 0.1:
                 start_goal(i, G_SAFE)

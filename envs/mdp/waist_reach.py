@@ -227,3 +227,27 @@ def reward_gentle_touch_heading(
     theta = rr._palm_normal_angle(env, robot_cfg, palm_normal_axis, object_cfg)
     fade = ((heading_zero_rad - theta) / (heading_zero_rad - heading_full_rad)).clamp(0.0, 1.0)
     return touch * (floor + (1.0 - floor) * fade)
+
+
+def penalty_motor_load(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg,
+    rated_torque: list[float],
+) -> torch.Tensor:
+    """[N] energy proxy: sum over the joints of (torque / rated torque)^2.
+
+    A motor's winding loss is R * I^2 with I proportional to torque, so it
+    grows with torque squared; dividing by each motor's rated torque (URDF
+    effort: arm 25 N*m, wrist pitch / yaw 5, waist yaw 88) makes it the
+    load relative to what that motor is built for, comparable between the
+    small wrist motors, the shoulder and the waist. Holding torque against
+    gravity counts as much as accelerating, as it does on the robot (the
+    shoulder holding an outstretched arm is the main cost; the waist yaw
+    turns about the vertical and carries no gravity load). Mechanical power
+    (torque x speed) is left out: small at these speeds.
+    Torque: the actuator model's applied torque (implicit PD estimate).
+    Needs preserve_order=True on asset_cfg."""
+    robot = env.scene[asset_cfg.name]
+    tau = robot.data.applied_torque[:, asset_cfg.joint_ids]
+    rated = torch.tensor(rated_torque, device=env.device, dtype=tau.dtype)
+    return ((tau / rated) ** 2).sum(-1)
