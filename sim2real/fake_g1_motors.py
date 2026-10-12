@@ -25,7 +25,10 @@ ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDe
 ap.add_argument("--net-if", default="lo")
 ap.add_argument("--duration", type=float, default=600.0)
 ap.add_argument("--inertia", type=float, default=0.5, help="kg m^2 per arm / waist joint")
-ap.add_argument("--log", default=None, help="CSV of t, right arm q, its kp, hand q (10 Hz)")
+ap.add_argument("--friction", type=float, default=3.0, help="N m s/rad viscous friction per joint")
+ap.add_argument("--log", default=None, help="CSV of t, right arm q, its kp, hand q, waist, kd/tau of joint 22 (10 Hz)")
+ap.add_argument("--blackout_at", type=float, default=None, help="s: stop publishing rt/lowstate here ...")
+ap.add_argument("--blackout_s", type=float, default=2.0, help="... for this long (commands are still played)")
 args = ap.parse_args()
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber  # noqa: E402
@@ -77,7 +80,7 @@ hs = {s: unitree_hg_msg_dds__HandState_() for s in ("left", "right")}
 logf = open(args.log, "w") if args.log else None
 if logf:
     logf.write("t," + ",".join(f"q{i}" for i in range(22, 29)) + "," + ",".join(f"kp{i}" for i in range(22, 29))
-               + "," + ",".join(f"hand{i}" for i in range(7)) + "\n")
+               + "," + ",".join(f"hand{i}" for i in range(7)) + ",waist,kd22,tau22,blackout\n")
 
 dt, k = 0.002, 0
 T0 = time.monotonic()
@@ -85,6 +88,7 @@ t_end = T0 + args.duration
 print(f"[motors] G1 motors on '{args.net_if}': playing rt/arm_sdk + rt/dex3/*/cmd", flush=True)
 while time.monotonic() < t_end:
     t0 = time.monotonic()
+    blackout = (args.blackout_at is not None and args.blackout_at <= t0 - T0 < args.blackout_at + args.blackout_s)
     with lock:
         live = t0 - cmd["t"] < 0.1
         if live:
@@ -93,6 +97,7 @@ while time.monotonic() < t_end:
         else:                                # no arm_sdk: the robot's controller holds the arms
             tau = 400.0 * (hold_q - q) - 12.0 * dq
         acc = np.zeros(N)
+        tau = tau - args.friction * dq                  # viscous joint friction
         acc[DRIVEN] = np.clip(tau[DRIVEN] / args.inertia, -200, 200)
         dq += acc * dt
         q += dq * dt
@@ -113,9 +118,13 @@ while time.monotonic() < t_end:
         if logf and k % 50 == 0:
             logf.write(f"{t0 - T0:.3f}," + ",".join(f"{v:.4f}" for v in q[22:29]) + ","
                        + ",".join(f"{v:.1f}" for v in (cmd["kp"][22:29] if live else np.full(7, -1.0))) + ","
-                       + ",".join(f"{v:.3f}" for v in hand["right"]["q"]) + "\n")
+                       + ",".join(f"{v:.3f}" for v in hand["right"]["q"])
+                       + f",{q[12]:.4f},{cmd['kd'][22] if live else -1:.1f},{cmd['tau'][22] if live else 0:.2f},"
+                       f"{int(blackout)}\n")
             logf.flush()
-    pub_ls.Write(ls)
+    blackout = (args.blackout_at is not None and args.blackout_at <= t0 - T0 < args.blackout_at + args.blackout_s)
+    if not blackout:
+        pub_ls.Write(ls)
     if k % 5 == 0:
         for s in ("left", "right"):
             pub_hs[s].Write(hs[s])

@@ -26,6 +26,10 @@ if a.net_if != "lo":
 os.environ["ARM_MPC_PUB_PROC"] = "0"           # publish from this process (no child, no sudo)
 od = os.path.join(a.picker_dir, "onboard")
 sys.path[:0] = [od, a.picker_dir, os.path.join(os.path.dirname(a.picker_dir), "common")]
+import arm_gravity  # noqa: E402
+# the robot keeps the URDF beside onboard/'s parent; on the laptop it is one level up
+_urdf = os.path.join(os.path.dirname(a.picker_dir), "robot_model_urdf", "g1_29dof_with_hand.urdf")
+arm_gravity._find_urdf = lambda: _urdf
 import arm_mpc_server as A  # noqa: E402
 
 srv = A.ArmMpcServer(0, a.net_if, publish=True)
@@ -40,6 +44,8 @@ def _on_shutdown(signum, _frame):
 for sig in (signal.SIGTERM, signal.SIGINT):
     signal.signal(sig, _on_shutdown)
 srv.hw.wait_for_state(timeout=10.0)
+for side in ("left", "right"):                 # as run(): the E-STOP's gravity models
+    srv._estop_grav[side] = arm_gravity.ArmGravity(side)
 srv.estop.start()
 threading.Thread(target=srv._state_loop, daemon=True).start()
 print("[daemon-loopback] arm_mpc_server (no solvers) up: cmd / qref / estop / state / pub loop", flush=True)

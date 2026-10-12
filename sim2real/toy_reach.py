@@ -119,9 +119,10 @@ def parse_args():
     m = p.add_mutually_exclusive_group()
     m.add_argument("--mock", action="store_true", help="no robot: a kinematic stand-in (offline test of the script)")
     m.add_argument("--shadow", action="store_true", help="robot connected, read only: nothing is commanded")
-    p.add_argument("--waist", choices=["hold", "follow"], default="hold",
-                   help="hold: waist stays at 0, the policy's waist output is ignored (default); "
-                        "follow: the policy's waist target is sent as daemon waist ramps")
+    p.add_argument("--waist", choices=["hold", "follow"], default="follow",
+                   help="follow (default): the policy turns the torso as trained -- its rate-limited waist "
+                        "target is streamed with the arm (daemon v22: qref slot 12; an older daemon gets "
+                        "waist ramps); hold: the waist stays at 0, the policy's waist output is ignored")
     p.add_argument("--waist_limit_deg", type=float, default=45.0)
     p.add_argument("--hand", choices=["cup", "open", "keep"], default="cup",
                    help="cup: the reach pre-shape the policy was trained with (default)")
@@ -141,8 +142,19 @@ def parse_args():
     p.add_argument("--retreat_window_s", type=float, default=1.5,
                    help="s of the arm's own path retraced first on the way back (then straight home)")
     p.add_argument("--return_to", choices=["start", "none"], default="start")
+    p.add_argument("--open_roll", type=float, default=-0.40,
+                   help="first move of the run: abduct the right shoulder roll to this angle [rad] (negative = "
+                        "outward) so the arm leaves the leg, then go home; 0 = straight home")
     p.add_argument("--move_speed", type=float, default=0.35,
                    help="rad/s peak joint speed of the scripted moves (home, back)")
+    p.add_argument("--detect_s", type=float, default=3.0,
+                   help="--target detection: seconds of detections sampled at home before choosing")
+    p.add_argument("--detect_spread", type=float, default=0.015,
+                   help="m: a fruit whose sampled positions spread more than this is not offered")
+    p.add_argument("--pick", type=int, default=None,
+                   help="--target detection: the fruit # to reach (default: the nearest reachable one)")
+    p.add_argument("--mock_apples", default=None,
+                   help="--mock: fruit the stand-in camera 'sees', torso frame, 'x,y,z;x,y,z' (3 mm noise)")
     p.add_argument("--home_only", action="store_true",
                    help="only move the arm HOME (waist to 0), hold it there and exit -- e.g. at the start of a "
                         "session or after an E-STOP reset")
@@ -173,9 +185,19 @@ def parse_args():
                    help="m: palm this much FURTHER from the apple than at the start -> STOP")
     s.add_argument("--palm_speed_stop", type=float, default=None, help="m/s (default 2.0 x speed + 0.35)")
     s.add_argument("--joint_speed_stop", type=float, default=None, help="rad/s (default 1.8 x 2.0 x speed + 0.5)")
+    # ACCELERATION (3-step mean of the measured joint / palm velocity change). The policy's
+    # own sim maximum, 124 episodes: joint 10.6 / 14.0 / 21.5 rad/s^2 and palm 8.4 / 8.9 /
+    # 12.6 m/s^2 at speed 0.3 / 0.5 / 1; a free-falling arm is ~30 rad/s^2 at the shoulder.
+    s.add_argument("--joint_acc_stop", type=float, default=None, help="rad/s^2 (default 1.6 x (8 + 14 x speed))")
+    s.add_argument("--palm_acc_stop", type=float, default=None, help="m/s^2 (default 1.8 x (7 + 6 x speed))")
+    s.add_argument("--move_acc_stop", type=float, default=12.0,
+                   help="rad/s^2: joint acceleration that stops a SCRIPTED move (home, back)")
     s.add_argument("--temp_warn", type=float, default=80.0)
     s.add_argument("--temp_stop", type=float, default=95.0)
     s.add_argument("--freeze_s", type=float, default=0.5)
+    p.add_argument("--app_hz", type=float, default=100.0,
+                   help="loop rate of the picker's robot app in THIS process (hand commands; the picker "
+                        "itself runs 250): every Python thread here competes with the 50 Hz control loop")
     p.add_argument("--picker_dir", default=PICKER_DIR)
     p.add_argument("--config", default=None, help="apple_picker_config.json (default: the picker's)")
     p.add_argument("--urdf", default=R.URDF_DEFAULT)
@@ -191,13 +213,15 @@ def parse_args():
     if a.target != ["detection"] and len(a.target) != 3:
         p.error("--target takes X Y Z or 'detection'")
     if a.target == ["detection"]:
-        if a.mock:
-            p.error("--target detection needs the robot (perception)")
+        if a.mock and not a.mock_apples:
+            p.error("--target detection with --mock needs --mock_apples")
         a.target_is = "apple"
     a.real = not (a.mock or a.shadow)
     a.time_limit = a.time_limit or 8.0 / a.speed
     a.palm_speed_stop = a.palm_speed_stop or (2.0 * a.speed + 0.35)
     a.joint_speed_stop = a.joint_speed_stop or (1.8 * R.ARM_MAX_VELOCITY * a.speed + 0.5)
+    a.joint_acc_stop = a.joint_acc_stop or (1.6 * (8.0 + 14.0 * a.speed))
+    a.palm_acc_stop = a.palm_acc_stop or (1.8 * (7.0 + 6.0 * a.speed))
     return a
 
 
@@ -220,6 +244,7 @@ class Snap:
     mode: str | None = None                  # daemon exec_mode, right arm
     frozen: bool | None = None
     daemon_age: float | None = None
+    t: float = 0.0                           # when it was read (the io's clock)
 
 
 def hand_named(s: Snap) -> dict:
@@ -263,7 +288,7 @@ class MockIO:
         tau = self.kin.gravity_torque(self.w, self.q)
         return Snap(arm_q=self.q.copy(), arm_dq=self.dq.copy(), arm_tau=tau, waist_q=self.w.copy(),
                     waist_dq=self.wd.copy(), arm_temp=np.full(7, 40.0), hand_q=self.hand.copy(),
-                    tactile=0.0, age=0.002, mode=self.mode, frozen=self.frozen, daemon_age=0.05)
+                    tactile=0.0, age=0.002, mode=self.mode, frozen=self.frozen, daemon_age=0.05, t=self.t)
 
     def _physics(self, dt):
         if self.mode == "qref" and self.q_ref is not None and not self.frozen:
@@ -300,8 +325,16 @@ class MockIO:
         self.mode = mode
         self.frozen = False
 
-    def send_arm(self, q, dq=None):
+    qref_waist = True
+
+    def send_arm(self, q, dq=None, waist=None, waist_dq=0.0):
         self.q_ref = np.asarray(q, float).copy()
+        if waist is not None:                       # as the v22 daemon: rate-limited toward it
+            self.ramp = None
+            step = 1.5 * R.DT
+            new = self.w[0] + float(np.clip(waist - self.w[0], -step, step))
+            self.wd[0] = (new - self.w[0]) / R.DT
+            self.w[0] = new
 
     def waist_to(self, yaw, duration):
         self.ramp = (float(self.w[0]), float(yaw), self.t, max(0.5, float(duration)))
@@ -314,8 +347,22 @@ class MockIO:
         elif kind == "open":
             self.hand[1:] = 0.0
 
+    def detection_info(self) -> str:
+        return "mock"
+
     def detection_targets(self):
-        return []
+        """--mock_apples, seen from the torso at the current waist, 3 mm noise."""
+        if not self.args.mock_apples:
+            return []
+        out = []
+        fr0 = self.kin.frames([0.0, self.w[1], self.w[2]], self.q)          # waist-0 torso
+        fr = self.kin.frames(self.w, self.q)
+        for txt in self.args.mock_apples.split(";"):
+            p0 = np.array([float(v) for v in txt.split(",")])
+            p_pel = fr0.torso_R @ p0 + fr0.torso_pos                        # fixed to the world
+            p_now = fr.torso_R.T @ (p_pel - fr.torso_pos) + np.random.normal(0, 0.003, 3)
+            out.append((p_now, 0.04))
+        return out
 
     def publish(self, doc, target_torso):
         pass
@@ -351,6 +398,11 @@ class PickerIO:
         raw = SM.load_json(cfg_path)
         raw["__cfg_dir"] = os.path.dirname(os.path.abspath(cfg_path))
         cfg = SM.AppConfig.from_dict(raw)
+        cfg.arm_rate_hz = float(args.app_hz)        # this process only (see --app_hz)
+        # The control loop shares the GIL with the robot app's threads (500 Hz lowstate, both
+        # Dex3 states, its own loop): measured on the robot 2026-10-12, 16-19 ms of each 20 ms
+        # step and 4-15% late steps. A short switch interval hands the GIL back sooner.
+        sys.setswitchinterval(0.001)
         if str(cfg.mpc.arm_backend).lower() != "onboard":
             sys.exit(f"{cfg_path}: mpc.arm_backend is '{cfg.mpc.arm_backend}' -- this test needs the onboard "
                      "daemon (the laptop must never write rt/arm_sdk itself)")
@@ -372,6 +424,19 @@ class PickerIO:
                 self._init_fullmove_config()
                 self._init_diagnostics()
                 self._init_ros()                      # DetectionManager (/fruits_detected_torso)
+                # the picker's wait_for_target_fruit waits for a voice / dashboard label
+                # choice before accepting ANY fruit; this test takes the configured labels
+                labels = tuple(cfg.filter.accepted_labels)
+                if labels:
+                    self.detection.set_accepted_labels(labels)
+                # The picker's detection box (torso frame, x 0.04-0.46 m ...) is sized for its
+                # table; a tree fruit further out is dropped before it is tracked. This test
+                # judges reachability itself (the policy's envelope + map), so the box here
+                # is only "in front of the robot".
+                import dataclasses
+                self.detection.workspace = dataclasses.replace(
+                    self.detection.workspace, x_min=0.0, x_max=1.5, y_min=-1.0, y_max=1.0,
+                    z_min_det=-0.8, z_max=1.2)
                 self._init_hardware()                 # full_move2 robot app + HandController
                 self.app.set_arm_output_enabled(False)   # never a second rt/arm_sdk writer
                 if shadow:
@@ -446,6 +511,7 @@ class PickerIO:
         try:
             d = json.loads(msg.data)
             self._dstate, self._dstate_t = d.get("right") or {}, time.monotonic()
+            self._dfull = d
         except Exception:
             pass
 
@@ -471,6 +537,11 @@ class PickerIO:
         while self._dstate_t is None and time.monotonic() - t0 < 2.0:      # our own state listener too
             time.sleep(0.05)
         es = self.estop.daemon_estop or {}
+        d = getattr(self, "_dfull", {}) or {}
+        print(f"  [{self.name}] daemon: right arm mode '{(d.get('right') or {}).get('exec_mode')}', "
+              f"qref waist {'yes' if d.get('qref_waist') else 'NO (old build)'}, E-STOP "
+              f"{'ACTIVE: ' + str(es.get('why')) if es.get('active') else ('off' if es else 'n/a (old build)')}",
+              flush=True)
         if es.get("active") and not self.shadow:
             sys.exit(f"the robot is in E-STOP ({es.get('why')} [{es.get('src')}]): fix the cause, "
                      f"`python3 estop_cli.py reset` in apple_picker/, rerun")
@@ -506,13 +577,19 @@ class PickerIO:
                     hand_q=None if hq is None else np.asarray(hq, float), tactile=tac,
                     age=(time.monotonic() - rx) if rx else 0.0,
                     mode=d.get("exec_mode"), frozen=d.get("frozen"),
-                    daemon_age=None if self._dstate_t is None else time.monotonic() - self._dstate_t)
+                    daemon_age=None if self._dstate_t is None else time.monotonic() - self._dstate_t,
+                    t=time.monotonic())
 
     def exec_mode(self, mode):
         if self.commands and self.estop_why is None:
             self.arm.set_exec_mode("right", mode)
 
-    def send_arm(self, q, dq=None):
+    @property
+    def qref_waist(self) -> bool:
+        """The daemon takes the waist yaw in the qref stream (v22-estop and later)."""
+        return bool(getattr(self, "_dfull", {}).get("qref_waist"))
+
+    def send_arm(self, q, dq=None, waist=None, waist_dq=0.0):
         if not self.commands or self.estop_why is not None:
             return                                  # never a command after an E-STOP
         dq = np.zeros(7) if dq is None else dq
@@ -521,6 +598,11 @@ class PickerIO:
             m.mode = 1
             m.q, m.dq, m.tau = float(q[j]), float(dq[j]), 0.0
             m.kp, m.kd = float(self.args.kp), float(self.args.kd)
+        w = self._cmd.motor_cmd[R.MOTOR_IDX["waist_yaw_joint"]]
+        if waist is not None and self.qref_waist:
+            w.mode, w.q, w.dq, w.tau, w.kp, w.kd = 1, float(waist), float(waist_dq), 0.0, 1.0, 0.0   # kp > 0 = commanded
+        else:
+            w.mode, w.kp = 0, 0.0                   # not commanded: the daemon holds the waist
         self._qpub.Write(self._cmd)
         self.streaming = True
 
@@ -539,6 +621,13 @@ class PickerIO:
             if i == 0:
                 continue
             self.app.set_hand_joint_deg("right", i, math.degrees(R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"]))
+
+    def detection_info(self) -> str:
+        """The tracker's own account of the last message (what it kept, what it dropped, why)."""
+        try:
+            return str(self.node.detection.last_det_info)
+        except Exception:
+            return "?"
 
     def detection_targets(self):
         snap = self.node.detection.get_snapshot()
@@ -605,6 +694,7 @@ class Watch:
         sys.modules["safety_monitor"] = sm
         spec.loader.exec_module(sm)
         import torch
+        torch.set_num_threads(1)             # tiny tensors: a thread pool only adds waits (see reach_io)
         self.torch, self.sm = torch, sm
         # external-torque thresholds; without --resid_act they are moved out of reach
         # so the monitor's levels come from the command stream and the stuck test, and
@@ -620,8 +710,13 @@ class Watch:
         import body_collision as BC
         self.BC = BC
         self.dq_prev = None
+        self.t_prev = None
         self.palm_v = 0.0
         self.palm_prev = None
+        self.acc_hist = []                   # last measured joint accelerations
+        self.palm_v_hist = []                # last palm velocity vectors
+        self.peak_acc = 0.0
+        self.peak_palm_acc = 0.0
         self.last_print = {}
         self.peak_resid = np.zeros(7)
         self.min_clear = float("inf")
@@ -629,8 +724,10 @@ class Watch:
     def reset(self):
         self.mon.reset()
         self.dq_prev = None
+        self.t_prev = None
         self.palm_prev = None
         self.palm_v = 0.0
+        self.acc_hist, self.palm_v_hist = [], []
 
     def clearance(self, q, waist, hand_q):
         return float(self.BC.self_clearance("right", np.asarray(q, float), waist=float(waist),
@@ -657,10 +754,40 @@ class Watch:
             out.append((sm.STOP, f"joint speed {jv:.2f} rad/s > {a.joint_speed_stop:.2f}"))
         elif jv > jv_warn:
             out.append((sm.WARN, f"joint speed {jv:.2f} rad/s (> {jv_warn:.2f})"))
+        # rates from the MEASURED time between two readings: a late step divided by the
+        # nominal 20 ms reads as a spike (a 39 ms step doubled the palm speed estimate)
+        dt = R.DT if self.t_prev is None else max(0.005, s.t - self.t_prev)
+        self.t_prev = s.t
+        ctx["dt"] = dt
+        if dt > 2.0 * R.DT:
+            out.append((sm.WARN, f"control step {dt * 1000:.0f} ms late (50 Hz = 20 ms)"))
         if self.palm_prev is not None:
-            v = float(np.linalg.norm(fr.palm_ref - self.palm_prev)) / R.DT
+            pv = (fr.palm_ref - self.palm_prev) / dt
+            v = float(np.linalg.norm(pv))
             self.palm_v = 0.5 * self.palm_v + 0.5 * v
+            self.palm_v_hist = (self.palm_v_hist + [pv])[-4:]
         self.palm_prev = fr.palm_ref.copy()
+        # ACCELERATION: 3-step mean of the measured change (as calibrated in sim)
+        if self.dq_prev is not None:
+            self.acc_hist = (self.acc_hist + [(s.arm_dq - self.dq_prev) / dt])[-3:]
+        if len(self.acc_hist) == 3:
+            ja = np.abs(np.mean(self.acc_hist, axis=0))
+            j = int(np.argmax(ja))
+            self.peak_acc = max(self.peak_acc, float(ja[j]))
+            ctx["joint_acc"] = round(float(ja[j]), 1)
+            if ja[j] > a.joint_acc_stop:
+                out.append((sm.STOP, f"joint ACCELERATION {ja[j]:.1f} rad/s^2 at {R.RIGHT_ARM_JOINTS[j][6:-6]} "
+                                     f"> {a.joint_acc_stop:.1f}"))
+            elif ja[j] > 0.75 * a.joint_acc_stop:
+                out.append((sm.WARN, f"joint acceleration {ja[j]:.1f} rad/s^2 at {R.RIGHT_ARM_JOINTS[j][6:-6]}"))
+        if len(self.palm_v_hist) == 4:
+            pa = float(np.linalg.norm(np.mean(np.diff(self.palm_v_hist, axis=0), axis=0))) / dt
+            self.peak_palm_acc = max(self.peak_palm_acc, pa)
+            ctx["palm_acc"] = round(pa, 1)
+            if pa > a.palm_acc_stop:
+                out.append((sm.STOP, f"palm ACCELERATION {pa:.1f} m/s^2 > {a.palm_acc_stop:.1f}"))
+            elif pa > 0.75 * a.palm_acc_stop:
+                out.append((sm.WARN, f"palm acceleration {pa:.1f} m/s^2"))
         pv_warn = 1.5 * a.speed + 0.1
         if self.palm_v > a.palm_speed_stop:
             out.append((sm.STOP, f"palm speed {self.palm_v:.2f} m/s > {a.palm_speed_stop:.2f}"))
@@ -673,8 +800,10 @@ class Watch:
         w = float(s.waist_q[0])
         c_meas = self.clearance(s.arm_q, w, s.hand_q)
         if ctx.get("commanding"):
+            # the 0.25 s look-ahead of the commanded target (the command itself lies between
+            # the measured pose and it: two checks, not three -- each costs GIL time)
             q_la = np.clip(q_cmd + v_cmd * LOOKAHEAD_S, ctx["lo"], ctx["hi"])
-            c_cmd = min(self.clearance(q_cmd, w, s.hand_q), self.clearance(q_la, w, s.hand_q))
+            c_cmd = self.clearance(q_la, w, s.hand_q)
         else:                                   # shadow: the arm does not follow, judge where it is
             c_cmd = float("inf")
         ctx["clear"] = min(c_meas, c_cmd)
@@ -717,7 +846,7 @@ class Watch:
             elif tmax > a.temp_warn:
                 out.append((sm.WARN, f"motor temperature {tmax:.0f} C"))
         # envs/safety/monitor.py: command stream, external torque, stuck
-        ddq = np.zeros(7) if self.dq_prev is None else (s.arm_dq - self.dq_prev) / R.DT
+        ddq = np.zeros(7) if self.dq_prev is None else (s.arm_dq - self.dq_prev) / dt
         self.dq_prev = s.arm_dq.copy()
         tau_model = self.kin.gravity_torque(s.waist_q, s.arm_q, s.arm_dq, ddq, hand_named(s))
         T = lambda x: self.torch.as_tensor(np.asarray(x, np.float32)).view(1, -1)
@@ -893,33 +1022,94 @@ class Toy:
         self.io.publish(doc, target)
 
     # ---------- plan ----------
-    def plan(self, s):
+    def shoulder0(self, s):
+        """The right shoulder at waist yaw 0 (the envelopes and maps are relative to it)."""
+        return self.kin.frames([0.0, s.waist_q[1], s.waist_q[2]], R.ARM_DEFAULT).shoulder_pos
+
+    def plan_from_detections(self):
+        """The camera's fruit (g1_fruits_picker: live_locator -> fruits_to_torso -> the
+        picker's DetectionManager, which keeps tracks across waist turns), sampled for
+        --detect_s while the arm holds at home; a fruit is offered only if it was seen in
+        most samples and its position held still (--detect_spread). Positions are taken
+        to the PELVIS frame per sample (fixed to the world while the robot stands)."""
+        a, io = self.args, self.io
+        print(f"  sampling the camera's fruit for {a.detect_s:.1f} s (arm held at home) ...", flush=True)
+        tracks, n = [], 0
+        t_end = io.now() + a.detect_s
+        t_info = -1.0
+        while io.now() < t_end:
+            err = self.hold(R.HOME_Q, 0.2, label="hold home" if io.commands else "")
+            if err:
+                return err
+            s = io.read()
+            fr = self.frames(s)
+            n += 1
+            if io.now() - t_info >= 1.0:
+                t_info = io.now()
+                print(f"    tracker: {io.detection_info()}", flush=True)
+            for p_t, rad in io.detection_targets():
+                p = fr.torso_R @ np.asarray(p_t, float) + fr.torso_pos
+                tr = next((t for t in tracks if np.linalg.norm(np.mean(t["p"], 0) - p) < 0.03), None)
+                if tr is None:
+                    tracks.append({"p": [p], "r": [rad]})
+                else:
+                    tr["p"].append(p)
+                    tr["r"].append(rad)
+        if n == 0 or not tracks:
+            return ("no fruit tracked. The tracker's last word: " + io.detection_info()
+                    + "  (no_msg = nothing on /fruits_detected_torso: live_locator + fruits_to_torso running? "
+                    "no_pts = messages with no accepted fruit: see the reasons)")
+        s = io.read()
+        sh = self.shoulder0(s)
+        rows = []
+        print(f"  {len(tracks)} fruit seen in {n} samples (pelvis frame; torso frame at waist 0):")
+        for i, t in enumerate(tracks):
+            P = np.array(t["p"])
+            mean = P.mean(0)
+            spread = float(np.max(np.linalg.norm(P - mean, axis=1)))
+            radii = [r for r in t["r"] if r]
+            r = float(np.median(radii)) if radii else a.apple_radius
+            yaw = math.radians(a.approach_deg) if a.approach_deg is not None else R.approach_yaw_default(mean, sh)
+            chk = self.check(R.grasp_target_from_apple(mean, r, yaw), sh, quiet=True)
+            seen = len(P) / n
+            ok = chk["ok"] and seen >= 0.6 and spread <= a.detect_spread
+            why = ("REACHABLE" if ok else "no: " + "; ".join(
+                (chk["why"] if not chk["ok"] else []) + ([f"seen in {seen * 100:.0f}% of samples"] if seen < 0.6 else [])
+                + ([f"position spread {spread * 100:.1f} cm"] if spread > a.detect_spread else [])))
+            print(f"    #{i}: {np.round(mean, 3).tolist()}  r {r * 1000:.0f} mm  seen {seen * 100:3.0f}%  spread "
+                  f"{spread * 1000:.0f} mm  {chk['r']:.2f} m / {chk['az_deg']:+.0f} deg from the shoulder  -> {why}")
+            rows.append((i, mean, r, ok, chk["r"]))
+        if a.pick is not None:
+            pick = next((row for row in rows if row[0] == a.pick), None)
+            if pick is None or not pick[3]:
+                return f"fruit #{a.pick} is not reachable / not stable (see the list)"
+        else:
+            okr = [row for row in rows if row[3]]
+            if not okr:
+                return "no detected fruit is reachable and stable for this policy (see the list)"
+            pick = min(okr, key=lambda row: row[4])
+        a.apple_radius = pick[2]
+        print(f"  -> fruit #{pick[0]}: centre {np.round(pick[1], 3).tolist()} (pelvis), r {pick[2] * 1000:.0f} mm")
+        self.plan(s, apple_pelvis=pick[1])
+        return None
+
+    def plan(self, s, apple_pelvis=None):
         a = self.args
         fr = self.frames(s)
-        # the shoulder at waist yaw 0 (the envelopes and maps are relative to it)
-        sh = self.kin.frames([0.0, s.waist_q[1], s.waist_q[2]], R.ARM_DEFAULT).shoulder_pos
-        if a.target == ["detection"]:
+        sh = self.shoulder0(s)
+        if apple_pelvis is not None:
+            p, a.target_is = np.asarray(apple_pelvis, float), "apple"
+        elif a.target == ["detection"]:               # shadow: whatever the tracker has right now
             cands = self.io.detection_targets()
             if not cands:
                 sys.exit("no fruit detected (/fruits_detected_torso: are live_locator + fruits_to_torso running?)")
-            best = None
-            print("  detected fruit (torso frame):")
-            for i, (p, rad) in enumerate(cands):
-                apple = fr.torso_R @ p + fr.torso_pos
-                r = rad or a.apple_radius
-                yaw = math.radians(a.approach_deg) if a.approach_deg is not None else R.approach_yaw_default(apple, sh)
-                chk = self.check(R.grasp_target_from_apple(apple, r, yaw), sh, quiet=True)
-                print(f"    #{i}: {np.round(p, 3).tolist()}  r {r * 1000:.0f} mm  -> "
-                      f"{'REACHABLE' if chk['ok'] else 'no: ' + '; '.join(chk['why'])}")
-                if chk["ok"] and (best is None or chk["r"] < best[2]):
-                    best = (p, r, chk["r"])
-            if best is None:
-                sys.exit("no detected fruit inside this policy's envelope")
-            p_in, a.apple_radius = best[0], best[1]
-            print(f"  -> chosen {np.round(p_in, 3).tolist()}")
+            p_t, rad = cands[0]
+            a.apple_radius = rad or a.apple_radius
+            p = fr.torso_R @ np.asarray(p_t, float) + fr.torso_pos
+            print(f"  (shadow) first detected fruit: {np.round(p_t, 3).tolist()} (torso)")
         else:
             p_in = np.array([float(v) for v in a.target])
-        p = fr.torso_R @ p_in + fr.torso_pos if (a.frame == "torso" or a.target == ["detection"]) else p_in
+            p = fr.torso_R @ p_in + fr.torso_pos if a.frame == "torso" else p_in
         r = a.apple_radius
         if a.target_is == "apple":
             apple = p
@@ -931,7 +1121,8 @@ class Toy:
             apple = R.apple_from_grasp_target(target, r, yaw)
         self.apple, self.target, self.approach_yaw, self.shoulder = apple, target, yaw, sh
         print(f"  palm grasp point target (pelvis): {np.round(target, 3).tolist()}   "
-              f"virtual apple centre: {np.round(apple, 3).tolist()} (r {r * 1000:.0f} mm), "
+              f"{'apple centre (detected)' if apple_pelvis is not None else 'virtual apple centre'}: "
+              f"{np.round(apple, 3).tolist()} (r {r * 1000:.0f} mm), "
               f"approach {math.degrees(yaw):+.0f} deg")
         chk = self.check(target, sh)
         if not chk["ok"]:
@@ -955,11 +1146,16 @@ class Toy:
         return chk
 
     # ---------- scripted moves ----------
-    def stream(self, traj, waist_to=None, label=""):
-        """Play per-tick joint targets with the light checks (collision, plumbing)."""
-        io = self.io
+    def stream(self, traj, waist_to=None, label="", check=True):
+        """Play per-tick joint targets with the light checks: plumbing, and (check) the
+        measured joint SPEED and ACCELERATION against what a scripted move at
+        --move_speed can produce -- an arm that speeds up beyond that is falling or
+        being pushed: the move stops and the arm is held where it is."""
+        io, a = self.io, self.args
         if waist_to is not None:
             io.waist_to(waist_to, len(traj) * R.DT)
+        v_stop = 2.0 * a.move_speed + 0.6
+        dq_prev, t_prev, acc_hist = None, None, []
         t_next = io.now()
         for q in traj:
             if io.estop_why is not None:
@@ -967,6 +1163,21 @@ class Toy:
             s = io.read()
             if s.age > 0.1 or (s.frozen and io.commands):
                 return f"{label}: {'lowstate stale' if s.age > 0.1 else 'daemon froze the arm'}"
+            if io.commands and label and s.mode is not None and s.mode != "qref":
+                return f"{label}: the daemon is in exec_mode '{s.mode}', not qref -- it is not following"
+            if check and label:
+                if dq_prev is not None:
+                    acc_hist = (acc_hist + [(s.arm_dq - dq_prev) / max(0.005, s.t - t_prev)])[-3:]
+                dq_prev, t_prev = s.arm_dq.copy(), s.t
+                jv = float(np.max(np.abs(s.arm_dq)))
+                ja = float(np.max(np.abs(np.mean(acc_hist, axis=0)))) if len(acc_hist) == 3 else 0.0
+                if jv > v_stop or ja > a.move_acc_stop:
+                    why = (f"joint speed {jv:.2f} rad/s > {v_stop:.2f}" if jv > v_stop else
+                           f"joint ACCELERATION {ja:.1f} rad/s^2 > {a.move_acc_stop:.1f}")
+                    print(f"{C_RED}  STOP in '{label}': {why} -- holding the arm where it is{C_OFF}", flush=True)
+                    self.halted = f"{label}: {why}"
+                    self.stream([self.gravity_hold(s)] * int(0.5 / R.DT), check=False)
+                    return f"{label}: SAFETY STOP ({why})"
             io.send_arm(q)
             self.q_sent = np.asarray(q, float).copy()
             self.status(s)
@@ -974,8 +1185,8 @@ class Toy:
             io.sleep_until(t_next)
         return None
 
-    def hold(self, q, seconds):
-        return self.stream([q] * max(1, int(seconds / R.DT)))
+    def hold(self, q, seconds, label=""):
+        return self.stream([q] * max(1, int(seconds / R.DT)), label=label)
 
     #: a path may start inside the conservative body cover where the arm already IS; it
     #: may not go deeper than that start by more than this, and must end clear
@@ -1009,9 +1220,9 @@ class Toy:
         return bad is None and end_ok, c[0], min(c), c[-1], (bad if bad is not None else
                                                           (None if end_ok else len(c) - 1)), note
 
-    def move_to(self, q_from, q_goal, label, waist_to=None):
+    def move_to(self, q_from, q_goal, label, waist_to=None, via=()):
         s = self.io.read()
-        traj = joint_path_traj([q_from, q_goal], self.args.move_speed)
+        traj = joint_path_traj([q_from, *via, q_goal], self.args.move_speed)
         ok, c0, worst, c_end, bad, note = self.path_check(traj, s)
         print(f"  {label}: {len(traj) * R.DT:.1f} s, max joint travel "
               f"{np.max(np.abs(q_goal - q_from)):.2f} rad, body clearance start {c0 * 100:+.1f} / worst "
@@ -1042,14 +1253,21 @@ class Toy:
         s = io.read()
         print(f"  arm q {np.round(s.arm_q, 3).tolist()}  waist (yaw, roll, pitch) "
               f"{np.round(np.degrees(s.waist_q), 1).tolist()} deg  daemon mode {s.mode}")
+        if a.waist == "follow" and self.layout == "waist" and not a.shadow:
+            if getattr(io, "qref_waist", False):
+                print("  waist: FOLLOW -- the policy's waist target streamed with the arm (daemon qref waist)")
+            else:
+                self.say("waist: FOLLOW through set_waist ramps (the daemon has no qref waist: deploy v22) -- "
+                         "approximate", C_YEL)
         if abs(s.waist_q[2] - R.WAIST_DEFAULT[2]) > 0.08:
             self.say(f"waist pitch {math.degrees(s.waist_q[2]):+.1f} deg (training: "
                      f"{math.degrees(R.WAIST_DEFAULT[2]):+.1f}) -- the palm ends tilted by the difference", C_YEL)
         fr = self.frames(s)
         print(f"  palm grasp point now (pelvis) {np.round(fr.palm_ref, 3).tolist()}, "
               f"(torso) {np.round(self.to_torso(fr.palm_ref, s), 3).tolist()}")
-        if not a.home_only:
-            self.plan(s)
+        detect = a.target == ["detection"]
+        if not a.home_only and not (detect and not a.shadow):
+            self.plan(s)             # (a detection is planned at home, once the arm is out of view)
         outcome = None
         try:
             if a.shadow:
@@ -1058,12 +1276,19 @@ class Toy:
             # the daemon's hold is stiffer (kp 400) than the sim's 100 we stream: hold the
             # measured pose PLUS the sag kp 100 needs, so the hand does not drop at the switch
             q0 = self.gravity_hold(s)
-            io.exec_mode("qref")
-            t_mode = io.now()
-            err = self.hold(q0, 0.3)
+            err = self.enter_qref(q0)
             if err:
                 return self.finish(err)
-            err = self.move_to(q0, R.HOME_Q, "move home")
+            t_mode = io.now()
+            # the arm often rests wedged against the leg: first ABDUCT it (shoulder roll
+            # outward) until it is clear of the legs, then go home
+            via = ()
+            if a.open_roll < 0.0 and q0[1] > a.open_roll:
+                q_open = q0.copy()
+                q_open[1] = float(np.clip(a.open_roll, self.lo[1], self.hi[1]))
+                via = (q_open,)
+                print(f"  first OPEN the arm outward (shoulder roll {q0[1]:+.2f} -> {q_open[1]:+.2f}), then home")
+            err = self.move_to(q0, R.HOME_Q, "open + move home" if via else "move home", via=via)
             if err:
                 return self.finish(err)
             # the policy starts at waist ~0 (training: +-0.1 rad); turned with the arm at the
@@ -1079,13 +1304,13 @@ class Toy:
                 if not self.confirm("  -> turn the waist to 0 now?"):
                     return self.finish("waist not at 0 (operator)")
                 io.waist_to(0.0, dur)
-                err = self.hold(R.HOME_Q, dur + 0.3)
+                err = self.hold(R.HOME_Q, dur + 0.3, label="hold home (waist turn)")
                 if err:
                     return self.finish(err)
             if a.home_only:
                 self.set_phase("HOME")
                 self.ctx["doing"] = "holding the arm at home"
-                err = self.hold(R.HOME_Q, max(1.0, DAEMON_ENABLE_RAMP_S + 0.3 - (io.now() - t_mode)))
+                err = self.hold(R.HOME_Q, max(1.0, DAEMON_ENABLE_RAMP_S + 0.3 - (io.now() - t_mode)), label="hold home")
                 if a.hand == "open":
                     io.hand_set("open")
                 s = io.read()
@@ -1098,12 +1323,22 @@ class Toy:
                     print("  hand: the reach cup (index/middle tips curled 80 deg, thumb in a little); thumb_0 "
                           "stays at the picker's runtime lock (30 deg; the sim's cup has 0)")
             settle = max(1.0, DAEMON_ENABLE_RAMP_S + 0.3 - (io.now() - t_mode))
-            err = self.hold(R.HOME_Q, settle)
+            err = self.hold(R.HOME_Q, settle, label="hold home")
             if err:
                 return self.finish(err)
             s = io.read()
-            print(f"  at home: q err {np.round(s.arm_q - R.HOME_Q, 3).tolist()} "
+            e_home = s.arm_q - R.HOME_Q
+            print(f"  at home: q err {np.round(e_home, 3).tolist()} "
                   f"(gravity sag under kp {a.kp:g} is expected; the sim sags too)")
+            if io.commands and float(np.max(np.abs(e_home))) > 0.25:
+                j = int(np.argmax(np.abs(e_home)))
+                return self.finish(f"the arm did NOT reach home ({R.RIGHT_ARM_JOINTS[j][6:-6]} "
+                                   f"{e_home[j]:+.2f} rad off; daemon mode '{s.mode}'): it is not following "
+                                   "the stream -- stopping")
+            if detect:
+                err = self.plan_from_detections()
+                if err:
+                    return self.finish(err)
             if not self.confirm(f"  -> RUN THE POLICY (speed {a.speed}, up to {a.time_limit:.0f} s)?"):
                 return self.finish("aborted by the operator before the policy")
             # 3. the policy
@@ -1167,6 +1402,29 @@ class Toy:
               f"whole path{C_OFF}")
         return simplify_path([self.q_sent] + self.path_cmd[::-1] + [R.HOME_Q], tol=0.08)
 
+    def enter_qref(self, q_hold, timeout_s=15.0):
+        """Switch the right arm to the daemon's exec_mode "qref" and WAIT until its state
+        says so, re-sending (a command sent before the daemon has discovered this process
+        is lost; it then ignores the whole stream and the arm does not move)."""
+        io = self.io
+        if not io.commands:
+            return None
+        t0 = io.now()
+        t_send = -9.0
+        while io.now() - t0 < timeout_s:
+            if io.now() - t_send > 0.5:
+                io.exec_mode("qref")
+                t_send = io.now()
+            err = self.stream([q_hold] * 5, check=False)        # keep a fresh reference flowing
+            if err:
+                return err
+            if io.read().mode == "qref":
+                print(f"  daemon in exec_mode qref after {io.now() - t0:.1f} s")
+                self.hold(q_hold, 0.3)
+                return None
+        return (f"the arm daemon did not switch to exec_mode qref in {timeout_s:.0f} s (it reports "
+                f"'{io.read().mode}'): nothing would move. Is it running / discovered? estop_cli.py status")
+
     def gravity_hold(self, s):
         """Hold where the arm IS: the measured q plus the gravity sag the PD needs
         (so it neither drops nor keeps pushing into whatever stopped it)."""
@@ -1184,7 +1442,7 @@ class Toy:
         s = self.io.read()
         q = self.gravity_hold(s)
         while True:          # keep the hold stream alive while waiting for the answer
-            self.hold(q, 0.2)
+            self.stream([q] * int(0.2 / R.DT), check=False)
             r, _, _ = select.select([sys.stdin], [], [], 0.0)
             if r:
                 return sys.stdin.readline().strip().lower() != "h"
@@ -1208,14 +1466,20 @@ class Toy:
         t_start = io.now()
         t_next = t_start
         t_print = -1.0
+        prof = {k: 0.0 for k in ("read", "obs+policy", "watch", "send", "status+log")}
+        self.prof = prof
+        tw = time.perf_counter
         try:
             while True:
                 t_tick = io.now()
+                p0 = tw()
                 if io.estop_why is not None:
                     stopped, outcome = True, f"E-STOP: {io.estop_why}"
                     self.halted = outcome
                     break
                 s = io.read()
+                p1 = tw()
+                prof["read"] += p1 - p0
                 t = t_tick - t_start
                 fr = self.frames(s)
                 gap = float(np.linalg.norm(self.apple - fr.palm_ref)) - a.apple_radius
@@ -1233,18 +1497,23 @@ class Toy:
                     L["arm"].prev = q_cmd.copy()
                     L["arm"].vel[hit] = 0.0
                 clipped = [R.RIGHT_ARM_JOINTS[j][6:-6] for j in np.flatnonzero(hit)]
-                w_des = float("nan")
+                w_des = w_cmd = float("nan")
                 if self.layout == "waist":
-                    L["waist"].step(raw[7:8], s.waist_q[:1], speed)
+                    w_cmd = float(np.clip(L["waist"].step(raw[7:8], s.waist_q[:1], speed)[0],
+                                          -self.waist_lim, self.waist_lim))
                     w_des = float(np.clip(L["waist"].desired[0], -self.waist_lim, self.waist_lim))
                     now = io.now()
-                    if (a.waist == "follow" and abs(w_des - waist_sent) > math.radians(2.0)
+                    if (a.waist == "follow" and not io.qref_waist and abs(w_des - waist_sent) > math.radians(2.0)
                             and now - waist_sent_t > 0.3):
                         dur = max(0.5, 1.875 * abs(w_des - float(s.waist_q[0])) / (R.WAIST_MAX_VELOCITY * speed))
                         io.waist_to(w_des, dur)
                         waist_sent, waist_sent_t = w_des, now
                 self.ctx.update(gap=gap, touch=round(touch, 2), clipped=clipped, speed_now=speed)
+                p2 = tw()
+                prof["obs+policy"] += p2 - p1
                 level, out = W.step(s, fr, q_cmd, L["arm"].vel, a.speed, self.ctx)
+                p3 = tw()
+                prof["watch"] += p3 - p2
                 self.ctx["level_name"] = sm.LEVEL_NAMES[level]
                 self.ctx["warnings"] = [w for _, w in out][:4]
                 W.print_new(out, t)
@@ -1260,7 +1529,12 @@ class Toy:
                         stopped, outcome = True, "STOP: " + "; ".join(hard)
                         self.halted = outcome
                         break
-                io.send_arm(q_cmd)
+                stream_waist = a.waist == "follow" and self.layout == "waist" and io.qref_waist
+                p4 = tw()
+                io.send_arm(q_cmd, waist=w_cmd if stream_waist else None,
+                            waist_dq=float(L["waist"].vel[0]) if stream_waist else 0.0)
+                prof["send"] += tw() - p4
+                p5 = tw()
                 self.q_sent = q_cmd.copy()
                 prev_raw = raw
                 self.path_cmd.append(q_cmd.copy())
@@ -1292,7 +1566,8 @@ class Toy:
                     self.ctx["doing"] = "policy holding the touch"
                 self.rows.append(dict(
                     t=t, obs=obs, raw=raw, q_cmd=q_cmd, q=s.arm_q, dq=s.arm_dq, tau=s.arm_tau,
-                    waist=s.waist_q, waist_dq=s.waist_dq, waist_des=w_des, palm=fr.palm_ref, normal=fr.palm_normal,
+                    waist=s.waist_q, waist_dq=s.waist_dq, waist_des=w_des, waist_cmd=w_cmd, palm=fr.palm_ref,
+                    normal=fr.palm_normal,
                     gap=gap, touch=touch, speed=speed, level=level, clear=self.ctx.get("clear", np.nan),
                     resid=self.ctx.get("resid", np.nan), off_path=self.ctx.get("off_path", np.nan),
                     tactile=np.nan if s.tactile is None else s.tactile, age=s.age,
@@ -1304,9 +1579,10 @@ class Toy:
                     print(f"  t={t:5.2f}s gap {err * 1000:+6.1f} mm  touch {touch:4.1f} N  palm v "
                           f"{W.palm_v:.2f} m/s  clear {self.ctx.get('clear', np.nan) * 100:+5.1f} cm  "
                           f"tilt {tilt:+4.0f} heading {head:+4.0f} deg  waist "
-                          f"{math.degrees(s.waist_q[0]):+5.1f} (policy {math.degrees(w_des):+5.1f})  "
+                          f"{math.degrees(s.waist_q[0]):+5.1f} (cmd {math.degrees(w_cmd):+5.1f})  "
                           f"[{sm.LEVEL_NAMES[level]}{' SLOW' if slow else ''}]", flush=True)
                 self.status(s)
+                prof["status+log"] += tw() - p5
                 if reached_t is not None and t - reached_t >= a.hold_s:
                     outcome = f"REACHED in {reached_t:.2f} s, held by the policy {a.hold_s:.1f} s " \
                               f"(gap error {err * 1000:+.1f} mm)"
@@ -1396,6 +1672,7 @@ class Toy:
                 "apple_pelvis": None if getattr(self, "apple", None) is None else self.apple.tolist(),
                 "approach_yaw_deg": math.degrees(getattr(self, "approach_yaw", 0.0)),
                 "events": self.events, "reach": self.reach_info, "min_clearance_m": self.watch.min_clear,
+                "peak_joint_acc": self.watch.peak_acc, "peak_palm_acc": self.watch.peak_palm_acc,
                 "peak_external_torque_Nm": self.watch.peak_resid.tolist(),
                 "joint_limits": [self.lo.tolist(), self.hi.tolist()],
                 "git": subprocess.run(["git", "-C", REPO, "rev-parse", "--short", "HEAD"],
@@ -1410,10 +1687,16 @@ class Toy:
         if self.rows:
             per = np.diff([r["t"] for r in self.rows]) if len(self.rows) > 1 else np.array([R.DT])
             comp = np.array([r["compute"] for r in self.rows])
-            print(f"   {len(self.rows)} policy steps; period {np.median(per) * 1000:.1f} ms median / "
+            late = int(np.sum(per > 1.5 * R.DT))
+            print(f"   {len(self.rows)} policy steps ({late} late > 30 ms); period {np.median(per) * 1000:.1f} ms median / "
                   f"{per.max() * 1000:.1f} ms max; compute {np.median(comp) * 1000:.1f} ms median / "
                   f"{comp.max() * 1000:.1f} ms max; min body clearance {self.watch.min_clear * 100:+.1f} cm; "
-                  f"peak external torque {np.round(self.watch.peak_resid, 1).tolist()} N*m")
+                  f"peak external torque {np.round(self.watch.peak_resid, 1).tolist()} N*m; peak joint acc "
+                  f"{self.watch.peak_acc:.1f} rad/s^2 (stop {self.args.joint_acc_stop:.1f}), palm acc "
+                  f"{self.watch.peak_palm_acc:.1f} m/s^2 (stop {self.args.palm_acc_stop:.1f})")
+        if getattr(self, "prof", None) and self.rows:
+            n = len(self.rows)
+            print("   step time per part (ms, mean): " + ", ".join(f"{k} {v / n * 1000:.1f}" for k, v in self.prof.items()))
         print(f"   log: {self.log_dir}")
         return outcome
 

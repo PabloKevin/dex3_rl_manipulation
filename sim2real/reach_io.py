@@ -362,6 +362,10 @@ class ReachPolicy:
 
     def __init__(self, path: str = POLICY_DEFAULT):
         import torch
+        # ONE thread: batch-1 inference on tiny tensors gains nothing from a 20-thread pool,
+        # and the pool's spinning workers cost ~30 ms a step when other processes are busy
+        # (measured 2026-10-12 next to the arm daemon and the dashboard)
+        torch.set_num_threads(1)
         self.torch = torch
         self.path = path
         self.net = torch.jit.load(path, map_location="cpu").eval()
