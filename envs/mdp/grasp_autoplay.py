@@ -55,7 +55,8 @@ _reach_policy_cache: dict[str, torch.jit.ScriptModule] = {}
 
 # Same hardcoded-with-env-override convention as scripts/run_env.py's
 # BASE_DIR / G1_DEX3_USD_PATH.
-_BASE_DIR = os.environ.get("DEX3_RL_BASE_DIR", "/home/pablo_kevin/dex3_rl_manipulation")
+_BASE_DIR = os.environ.get("DEX3_RL_BASE_DIR",
+                           os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # The reach policy the grasp task hands off from, PINNED to a frozen copy
 # rather than "latest apple_grasp_reach run" -- so training the reach task

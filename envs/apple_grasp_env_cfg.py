@@ -61,9 +61,13 @@ from .mdp import reach_rewards as rr
 # TODO(A): Set this to your preferred G1+Dex3 USD path.
 # Example: "/path/to/unitree_sim_isaaclab/usd/g1_29dof_dex3/g1.usd"
 # Use the URDF that has NO hand cameras but full body + Dex3.
+# Default: the stub in this repo (envs/assets/robots), wherever the repo is cloned.
+# It references ../../../../IsaacLab/configuration/ {_base,_physics,_robot,_sensor}.usd,
+# i.e. <home>/IsaacLab/configuration/ -- see envs/assets/robots/README.md.
 G1_DEX3_USD_PATH = os.environ.get(
     "G1_DEX3_USD_PATH",
-    "/home/pablo_kevin/dex3_rl_manipulation/envs/assets/robots/g1_29dof_with_hand_rev_1_0.usd",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "robots",
+                 "g1_29dof_with_hand_rev_1_0.usd"),
 )
 
 # TODO: Set the head camera link name as it appears in YOUR urdf/usd.
