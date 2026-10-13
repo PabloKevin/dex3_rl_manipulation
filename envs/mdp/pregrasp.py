@@ -166,6 +166,35 @@ def _library(env: "ManagerBasedRLEnv", path: str) -> dict:
     return lib
 
 
+def sample_target_in_front(p, n, pts, rad, r, gap_range=FINAL_START_GAP, lateral=FINAL_START_LATERAL,
+                           clear=FINAL_START_TARGET_CLEAR, rng=random, gap_max=0.12, step=0.005):
+    """Target apple centre in front of a start pose, or None. p / n: palm
+    reference point and normal; pts / rad: the hand's keep-out spheres; r:
+    apple radius. Surface gap uniform in gap_range, centre off the normal by
+    up to `lateral` each way -- but never inside the hand: the cupped fingers
+    stand out in front of the palm, so for a big apple the short gaps are
+    in them. Those are moved OUT along the normal to the first clear gap
+    (then uniform up to gap_range's top), instead of rejected: rejecting
+    them failed 25% of the 48 mm apples' tries and, after enough resets,
+    a whole run. None only when nothing clear exists up to gap_max."""
+    u = np.cross(n, [0.0, 0.0, 1.0])
+    u = u / max(np.linalg.norm(u), 1e-6)
+    v = np.cross(u, n)
+    base = p + u * rng.uniform(-lateral, lateral) + v * rng.uniform(-lateral, lateral)
+    need = r + rad + clear
+
+    def free(t):
+        return bool(np.all(np.linalg.norm(pts - (base + n * (r + t)), axis=1) >= need))
+
+    t = gap_range[0]
+    while not free(t):
+        t += step
+        if t > gap_max:
+            return None
+    hi = max(gap_range[1], t)
+    return base + n * (r + rng.uniform(t, hi) if hi > t else r + t)
+
+
 def place_tree_at_pregrasp(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
@@ -175,7 +204,7 @@ def place_tree_at_pregrasp(
     lateral: float = FINAL_START_LATERAL,
     heading_noise_deg: float = FINAL_START_HEADING_DEG,
     target_clear: float = FINAL_START_TARGET_CLEAR,
-    attempts: int = 20,
+    attempts: int = 100,
 ) -> None:
     """mode="reset", in place of apple_tree.place_apple_tree (`tree`: its
     parameters; spindle tree, new tree every reset). Per env: a library
@@ -199,13 +228,9 @@ def place_tree_at_pregrasp(
         for _ in range(attempts):
             k = random.randrange(M)
             p, n = lib["palm_ref"][k].astype(float), lib["palm_normal"][k].astype(float)
-            u = np.cross(n, [0.0, 0.0, 1.0])
-            u = u / max(np.linalg.norm(u), 1e-6)
-            v = np.cross(u, n)
-            apple = p + n * (r + random.uniform(*gap_range)) \
-                + u * random.uniform(-lateral, lateral) + v * random.uniform(-lateral, lateral)
             pts = lib["keep_pts"][k].astype(float)
-            if np.any(np.linalg.norm(pts - apple, axis=1) < r + lib["keep_rad"] + target_clear):
+            apple = sample_target_in_front(p, n, pts, lib["keep_rad"], r, gap_range, lateral, target_clear)
+            if apple is None:
                 continue
             h_palm = math.atan2(n[1], n[0])
             heading = max(-lim, min(lim, h_palm + math.radians(random.uniform(-heading_noise_deg, heading_noise_deg))))
