@@ -384,7 +384,10 @@ class MockIO:
 
     def exec_mode(self, mode):
         self.mode = mode
+
+    def clear_freeze(self, q_here, timeout_s=6.0):
         self.frozen = False
+        return True
 
     qref_waist = True
     waist_src = "qref"
@@ -654,6 +657,26 @@ class PickerIO:
     def exec_mode(self, mode):
         if self.commands and self.estop_why is None:
             self.arm.set_exec_mode("right", mode)
+
+    def clear_freeze(self, q_here, timeout_s=6.0) -> bool:
+        """The daemon latches `frozen` when a reference was > 1.2 rad from the measured arm and
+        keeps it across mode switches (only zero / grasp_q / enable / the E-STOP reset clear it).
+        grasp_q is the clean one: the arm is ramped from where it IS to one waypoint -- the same
+        pose -- and held, in qref. Returns True once the daemon reports frozen = False."""
+        if not self.commands or self.estop_why is not None:
+            return False
+        t0 = time.monotonic()
+        t_send = -9.0
+        while time.monotonic() - t0 < timeout_s:
+            if time.monotonic() - t_send > 0.6:
+                self.arm._send({"cmd": "grasp_q", "side": "right", "waypoints": [[float(v) for v in q_here]],
+                                "ramp_s": 0.5, "seg_s": 0.5, "hold_s": 0.5, "seq": int(time.time() * 1000) % 10**9})
+                t_send = time.monotonic()
+            time.sleep(0.05)
+            if self._dstate.get("frozen") is False and time.monotonic() - t0 > 0.4:
+                time.sleep(1.8)          # let the daemon's own hold trajectory run out before we stream
+                return True
+        return False
 
     @property
     def qref_waist(self) -> bool:
@@ -1487,6 +1510,14 @@ class Toy:
         s = io.read()
         print(f"  arm q {np.round(s.arm_q, 3).tolist()}  waist (yaw, roll, pitch) "
               f"{np.round(np.degrees(s.waist_q), 1).tolist()} deg  daemon mode {s.mode}")
+        if io.commands and s.frozen:
+            self.say("the daemon is FROZEN from an earlier run (|q_ref - q_meas| went over 1.2 rad there: the arm was "
+                     "blocked, or not following) -- clearing it: the arm is held where it is", C_YEL)
+            if not io.clear_freeze(self.gravity_hold(s)):
+                return self.finish("the daemon stayed frozen: use the dashboard STOP then Reset (that clears it), "
+                                   "and look at WHY it froze (/tmp/arm_daemon.log 'freeze' event)")
+            s = io.read()
+            print(f"  freeze cleared (arm q {np.round(s.arm_q, 3).tolist()})")
         if a.waist == "follow" and self.layout == "waist" and not a.shadow:
             if getattr(io, "qref_waist", False):
                 print("  waist: FOLLOW -- the policy's waist target streamed with the arm (daemon qref waist)")

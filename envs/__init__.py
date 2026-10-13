@@ -60,6 +60,12 @@ from .apple_arm_goal_waist_env_cfg import (
     AppleArmGoalWaistEnvCfg,
     AppleArmGoalWaistEnvCfg_PLAY,
 )
+from .apple_reach_twostage_env_cfg import (
+    AppleReachPregraspEnvCfg,
+    AppleReachPregraspEnvCfg_PLAY,
+    AppleReachFinalEnvCfg,
+    AppleReachFinalEnvCfg_PLAY,
+)
 from .agents.rsl_rl_ppo_cfg import (
     AppleGraspPPORunnerCfg,
     AppleGraspGraspPPORunnerCfg,
@@ -76,6 +82,8 @@ from .agents.rsl_rl_ppo_cfg import (
     AppleGraspSpindleV3PPORunnerCfg,
     AppleArmGoalPPORunnerCfg,
     AppleArmGoalWaistPPORunnerCfg,
+    AppleReachPregraspPPORunnerCfg,
+    AppleReachFinalPPORunnerCfg,
 )
 
 gym.register(
@@ -393,6 +401,49 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleGraspSpindleV3EnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleGraspSpindleV3PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Two-stage reach (apple_reach_twostage_env_cfg.py): part 1 to the pregrasp point, fingers open;
+# part 2 from there to the palm touch, cupped hand. Magnet-like stems on every fruit.
+
+gym.register(
+    id="AppleReachPregrasp-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachPregraspEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachPregraspPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachPregrasp-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachPregraspEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachPregraspPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachFinal-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachFinalEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachFinalPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachFinal-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachFinalEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachFinalPPORunnerCfg,
     },
     disable_env_checker=True,
 )

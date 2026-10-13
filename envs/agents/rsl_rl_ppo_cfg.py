@@ -270,3 +270,17 @@ class AppleGraspSpindleV3PPORunnerCfg(AppleGraspTreePPORunnerCfg):
     """AppleGraspSpindle-v3: v2 + the pull after an unbroken twist.
     Own log folder (logs/rsl_rl/apple_grasp_spindle_v3)."""
     experiment_name = "apple_grasp_spindle_v3"
+
+
+@configclass
+class AppleReachPregraspPPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachPregrasp-v1: two-stage reach, part 1 (home -> in front of the
+    apple, fingers open). Own log folder (logs/rsl_rl/apple_reach_pregrasp)."""
+    experiment_name = "apple_reach_pregrasp"
+
+
+@configclass
+class AppleReachFinalPPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachFinal-v1: two-stage reach, part 2 (pregrasp -> gentle palm
+    touch, cupped hand). Own log folder (logs/rsl_rl/apple_reach_final)."""
+    experiment_name = "apple_reach_final"

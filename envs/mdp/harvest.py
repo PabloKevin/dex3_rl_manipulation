@@ -67,6 +67,19 @@ class StemParams:
     break_bend: tuple[float, float] = (0.25, 0.45)           # N*m
     break_twist: tuple[float, float] = (0.08, 0.15)          # N*m
     damping_ratio: float = 0.5                               # of critical, for all 3 springs
+    #: break_pull counts only the force BEYOND the rest load (the fruit's own
+    #: weight, engage(preload=...)): |f_spring - preload| > break_pull. For a
+    #: weak attachment (the lab's magnet-mounted replica apples) whose release
+    #: force is below the weight of the 0.15 kg sim apple -- with the plain
+    #: |f_spring| test such a stem would break under gravity alone. Pull
+    #: readouts (pull, peak_pull) stay the plain spring force.
+    pull_over_rest: bool = False
+    #: With pull_over_rest: split that extra load along the rest stem axis.
+    #: Pressing the fruit TOWARD the branch (compression) never breaks it;
+    #: pulling it away (tension) breaks above break_pull, pushing it
+    #: sideways (shear) above break_shear -- a magnet's two failure modes,
+    #: shear being the weak one. None: |extra load| > break_pull.
+    break_shear: tuple[float, float] | None = None
 
 
 class BreakableStem:
@@ -94,8 +107,10 @@ class BreakableStem:
         self.k_pull, self.k_lat, self.k_bend, self.k_twist = z(), z(), z(), z()
         self.c_pull, self.c_bend, self.c_twist = z(), z(), z()
         self.f_break, self.m_bend_break, self.m_twist_break = z(), z(), z()
+        self.f_shear_break = z()
         # live readouts (last substep)
         self.pull, self.bend, self.twist = z(), z(), z()
+        self.rest_force = torch.zeros(n, 3, device=d)     # preload at engage (StemParams.pull_over_rest)
         self.bend_deg, self.twist_deg = z(), z()
         self.peak_pull, self.peak_bend, self.peak_twist = z(), z(), z()
 
@@ -142,6 +157,9 @@ class BreakableStem:
         self.f_break[ids] = self._u(self.p.break_pull, ids)
         self.m_bend_break[ids] = self._u(self.p.break_bend, ids)
         self.m_twist_break[ids] = self._u(self.p.break_twist, ids)
+        if self.p.break_shear is not None:
+            self.f_shear_break[ids] = self._u(self.p.break_shear, ids)
+        self.rest_force[ids] = 0.0 if preload is None else preload
         if preload is not None:
             # Start already applying `preload` (world N): shift the pivot so
             # the springs are stretched by K^-1 * preload at this pose.
@@ -212,7 +230,17 @@ class BreakableStem:
         cause = torch.zeros_like(self.break_cause)
         cause = torch.where(self.twist > self.m_twist_break, torch.full_like(cause, 3), cause)
         cause = torch.where(self.bend > self.m_bend_break, torch.full_like(cause, 2), cause)
-        cause = torch.where(self.pull > self.f_break, torch.full_like(cause, 1), cause)
+        if not self.p.pull_over_rest:
+            pulled = self.pull > self.f_break
+        elif self.p.break_shear is None:
+            pulled = (f_spring - self.rest_force).norm(dim=-1) > self.f_break
+        else:
+            # f_spring acts ON the fruit; + along the axis (toward the pivot) = tension
+            extra = f_spring - self.rest_force
+            axial = (extra * self.axis).sum(-1)
+            shear = (extra - axial.unsqueeze(-1) * self.axis).norm(dim=-1)
+            pulled = (axial > self.f_break) | (shear > self.f_shear_break)
+        cause = torch.where(pulled, torch.full_like(cause, 1), cause)
         newly = on & (cause > 0)
         self.break_cause = torch.where(newly, cause, self.break_cause)
         self.broken |= newly
@@ -220,7 +248,8 @@ class BreakableStem:
 
         # Cap just above the break limits: a stem breaks there, it never
         # pushes harder -- and it bounds any residual numerical kick.
-        f = f * ((1.2 * self.f_break).unsqueeze(-1) / f.norm(dim=-1, keepdim=True).clamp(min=1e-9)).clamp(max=1.0)
+        f_cap = 1.2 * self.f_break + (self.rest_force.norm(dim=-1) if self.p.pull_over_rest else 0.0)
+        f = f * (f_cap.unsqueeze(-1) / f.norm(dim=-1, keepdim=True).clamp(min=1e-9)).clamp(max=1.0)
         tau_bend = tau_bend * ((1.2 * self.m_bend_break).unsqueeze(-1)
                                / tau_bend.norm(dim=-1, keepdim=True).clamp(min=1e-9)).clamp(max=1.0)
         tau_twist = tau_twist * ((1.2 * self.m_twist_break).unsqueeze(-1)

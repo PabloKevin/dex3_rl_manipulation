@@ -206,7 +206,8 @@ def trunk_axis(tree: dict, z: float) -> np.ndarray:
 def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Envelope, member_env: Envelope,
                         standoff: float, heading_max_deg: float, stem_len_range: tuple[float, float],
                         cluster_sizes, cluster_weights, cluster_gap: tuple[float, float], sep_min: float,
-                        spindle: dict, tries: int = 300) -> dict:
+                        spindle: dict, tries: int = 300, seed: tuple | None = None,
+                        keep_out: tuple | None = None) -> dict:
     """Tall-spindle tree: ONE thin trunk, vertical up to a kink (spindle
     ["kink_range"], m), then straight, leaning spindle["lean_deg"] in a
     random direction. Every apple hangs off it on a short branch
@@ -216,9 +217,21 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
     sample_tree) stack along the trunk. Every apple's grasp target lies in
     the envelope, as in sample_tree.
 
+    seed: (apple centre [3], stem heading [rad]) -- apple 0 hangs exactly
+    there instead of being sampled from seed_env (the final-approach task
+    builds the tree around a fruit placed in front of a given hand pose).
+    keep_out: (points [P, 3], radii [P]) -- no OTHER apple within its radius
+    + radii of these points (the hand and forearm at that start pose).
+
     Same dict as sample_tree, plus "kink" (z) and "lean" (dx/dz, dy/dz)."""
     lim = math.radians(heading_max_deg)
     tr = spindle["trunk_radius"]
+
+    def clear(a):
+        if keep_out is None:
+            return True
+        pts, rad = keep_out
+        return bool(np.all(np.linalg.norm(pts - a, axis=1) >= radius + rad))
 
     def hang(axis_pt, h, stem_len, branch):
         """apple centre, stem direction, tip for an apple on the trunk."""
@@ -227,11 +240,14 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
         return a, d
 
     for _ in range(tries):
-        t0 = seed_env.sample_target(rng)
-        h0 = rng.uniform(-lim, lim)
+        if seed is None:
+            t0 = seed_env.sample_target(rng)
+            h0 = rng.uniform(-lim, lim)
+        else:
+            h0 = float(seed[1])
         L0, b0 = rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
         d0 = np.array([math.cos(h0), math.sin(h0), 0.0])
-        a0 = t0 + d0 * (radius + standoff)
+        a0 = t0 + d0 * (radius + standoff) if seed is None else np.asarray(seed[0], float)
         p0 = a0 + d0 * (radius + L0 + b0 + tr)                 # trunk axis at the seed's height
         kink = rng.uniform(*spindle["kink_range"])
         alpha, psi = math.radians(rng.uniform(*spindle["lean_deg"])), rng.uniform(0.0, 2 * math.pi)
@@ -249,7 +265,7 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
                 for _ in range(80):
                     h, L, b = rng.uniform(-lim, lim), rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
                     a, d = hang(trunk_axis(tree, rng.uniform(z_lo, z_hi)), h, L, b)
-                    if seed_env.contains(a - d * (radius + standoff)) and \
+                    if seed_env.contains(a - d * (radius + standoff)) and clear(a) and \
                             all(np.linalg.norm(a - q) >= 2 * radius + sep_min for q in apples):
                         apples.append(a); dirs.append(d); stems.append(L); cluster.append(c)
                         break
@@ -269,7 +285,7 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
                     if any(np.linalg.norm(a - q) < 2 * radius + sep_min
                            for j, q in enumerate(apples) if cluster[j] != c):
                         continue
-                    if not member_env.contains(a - d * (radius + standoff), slack=0.01):
+                    if not member_env.contains(a - d * (radius + standoff), slack=0.01) or not clear(a):
                         continue
                     apples.append(a); dirs.append(d); stems.append(L); cluster.append(c); members.append(len(apples) - 1)
                     break
@@ -598,10 +614,16 @@ def place_apple_tree(
             # nothing moves, the bookkeeping below is refreshed
             T.retry_request[i] = False
         elif new_tree_each_reset or bool(T.new_tree[i]) or T.trees[i] is None:
+            # a target forced in front of a given hand pose (pregrasp.place_tree_at_pregrasp)
+            forced = getattr(env, "_forced_seed", {}).pop(i, None)
             if spindle is not None:
                 tree = sample_spindle_tree(rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg,
                                            stem_length_range, cluster_sizes, cluster_weights, cluster_gap,
-                                           sep_min, spindle)
+                                           sep_min, spindle,
+                                           seed=None if forced is None else (forced["apple"], forced["heading"]),
+                                           keep_out=None if forced is None else (forced["pts"], forced["rad"]))
+            elif forced is not None:
+                raise ValueError("place_apple_tree: a forced target needs the spindle tree")
             else:
                 tree = sample_tree(rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter,
                                    stem_heading_max_deg, stem_length_range, cluster_sizes, cluster_weights,
@@ -615,7 +637,10 @@ def place_apple_tree(
             T.spot_tip[i] = torch.tensor(tree["tip"], device=dev, dtype=torch.float32)
             T.cluster[i] = torch.tensor(tree["cluster"], device=dev)
             T.trunk[i] = torch.tensor(tree["trunk"], device=dev, dtype=torch.float32)
-            T.order[i] = torch.tensor(harvest_order(tree, order, rng), device=dev)
+            o = harvest_order(tree, order, rng)
+            if forced is not None:                       # the forced apple (spot 0) is the target
+                o = np.concatenate([[0], o[o != 0]])
+            T.order[i] = torch.tensor(o, device=dev)
             T.cursor[i] = 0
             T.status[i] = WAITING
             T.knocked_by[i] = -1
