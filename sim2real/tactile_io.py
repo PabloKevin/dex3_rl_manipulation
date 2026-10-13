@@ -101,20 +101,29 @@ def responders(rise: np.ndarray, base: np.ndarray, noise: np.ndarray, k_sigma: f
 
 class TactileCalib:
     """locations: {name: [element index, ...]}; gain: counts per newton (of the SUM of a
-    location's element rises); base/noise: the resting values when it was made."""
+    location's element rises); gains: {name: counts per newton} for the places calibrated
+    against a scale (tactile_force_calibrate.py), which override `gain`; base/noise: the
+    resting values when it was made."""
 
-    def __init__(self, locations=None, gain=DEFAULT_GAIN, base=None, noise=None, n_elements=None, notes=""):
+    def __init__(self, locations=None, gain=DEFAULT_GAIN, base=None, noise=None, n_elements=None, notes="",
+                 gains=None):
         self.locations = {k: list(v) for k, v in (locations or {}).items()}
         self.gain = float(gain)
+        self.gains = {k: float(v) for k, v in (gains or {}).items()}
         self.base = None if base is None else np.asarray(base, float)
         self.noise = None if noise is None else np.asarray(noise, float)
         self.n_elements = n_elements
         self.notes = notes
 
+    def gain_of(self, loc: str) -> float:
+        g = self.gains.get(loc)
+        return g if g and g > 0 else self.gain
+
     def save(self, path: str):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w") as f:
             json.dump({"locations": self.locations, "gain_counts_per_N": self.gain,
+                       "gains_counts_per_N": self.gains,
                        "base": None if self.base is None else np.nan_to_num(self.base, nan=-1).tolist(),
                        "noise": None if self.noise is None else np.nan_to_num(self.noise, nan=-1).tolist(),
                        "n_elements": self.n_elements, "notes": self.notes,
@@ -125,7 +134,7 @@ class TactileCalib:
         with open(path) as f:
             d = json.load(f)
         return cls(d["locations"], d.get("gain_counts_per_N", DEFAULT_GAIN), d.get("base"), d.get("noise"),
-                   d.get("n_elements"), d.get("notes", ""))
+                   d.get("n_elements"), d.get("notes", ""), d.get("gains_counts_per_N"))
 
     def force(self, flat: np.ndarray, base: np.ndarray) -> dict[str, float]:
         """Newtons per named location from one reading against `base`."""
@@ -134,7 +143,7 @@ class TactileCalib:
         out = {}
         for k, idx in self.locations.items():
             idx = [i for i in idx if i < len(d)]
-            out[k] = float(d[idx].sum() / self.gain) if idx else 0.0
+            out[k] = float(d[idx].sum() / self.gain_of(k)) if idx else 0.0
         return out
 
     def taxels(self, flat: np.ndarray, base: np.ndarray) -> np.ndarray:

@@ -1126,7 +1126,8 @@ class Toy:
                 self.tcal = TIO.TactileCalib.load(path)
                 print(f"  tactile calibration {path}: " + ", ".join(
                     f"{k} {len(v)}" for k, v in self.tcal.locations.items()) + f" elements, "
-                    f"{self.tcal.gain:g} counts/N")
+                    f"{self.tcal.gain:g} counts/N" + "".join(
+                        f", {k} {g:g}" for k, g in self.tcal.gains.items()))
             else:
                 print(f"{C_YEL}  no tactile calibration (python3 sim2real/tactile_calibrate.py): the pads are "
                       f"read as nine entry means at {args.tactile_gain:g} counts/N{C_OFF}")

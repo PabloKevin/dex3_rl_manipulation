@@ -16,8 +16,9 @@ What it does
                 An element that answers in two places goes to the stronger one.
   3. FORCE      (optional) press a place onto a kitchen / postal scale and type the reading:
                 counts per newton = the summed rise of that place's elements / force. Without
-                it the sim's 3000 counts per N is kept.
-  4. SAVE       logs/sim2real/tactile_calib.json -- toy_grasp.py loads it by itself.
+                it the sim's 3000 counts per N is kept. For a gain per phalanx against a
+                hanging (luggage) scale use tactile_force_calibrate.py after this one.
+  4. SAVE      logs/sim2real/tactile_calib.json -- toy_grasp.py loads it by itself.
 
   python3 sim2real/tactile_calibrate.py --check      # live view of the named places in N, Ctrl-C ends
   python3 sim2real/tactile_calibrate.py --only palm index_dist   # redo some places, keep the rest
@@ -134,8 +135,10 @@ def main():
         print("zeroing: do not touch the hand ...")
         base, noise = zero()
         dead = a.dead_sigma * np.nan_to_num(noise)
-        print(f"checking with {a.out} (gain {cal.gain:g} counts/N), zeroed now like the grasp does at its start; "
-              f"ENTER re-zeroes, Ctrl-C ends.")
+        per_place = ", ".join(f"{k} {v:g}" for k, v in cal.gains.items())
+        print(f"checking with {a.out} (gain {cal.gain:g} counts/N"
+              + (f"; per place: {per_place}" if per_place else "") + f"), zeroed now like the grasp does at "
+              f"its start; ENTER re-zeroes, Ctrl-C ends.")
         try:
             while True:
                 f, _ = hand.read()
@@ -259,7 +262,9 @@ def main():
         else:
             print("   skipped: the sim's 3000 counts per N is kept")
 
-    cal = T.TactileCalib(locs, gain, base, noise, n, notes="tactile_calibrate.py")
+    # per-place gains from tactile_force_calibrate.py survive for the places that were not redone
+    gains = {k: v for k, v in old.gains.items() if k in keep} if old is not None else {}
+    cal = T.TactileCalib(locs, gain, base, noise, n, notes="tactile_calibrate.py", gains=gains)
     cal.save(a.out)
     print(f"\n4. saved {a.out}\n   toy_grasp.py loads it by itself (--tactile_calib to point elsewhere); "
           f"--check shows the places live.")
