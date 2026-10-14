@@ -290,6 +290,21 @@ def next_apple_requested(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return env._tree.next_request.clone()
 
 
+def _draw(fn, tries: int = 25):
+    """fn() until it returns: sample_spindle_tree / sample_tree raise
+    RuntimeError when none of their 300 candidate trees fits, which for an
+    unconstrained tree happens about once in several thousand draws -- rare
+    enough to be invisible in a short run and fatal in a 512-env one (a
+    reset every few seconds). Each draw is independent: just draw again."""
+    err = None
+    for _ in range(tries):
+        try:
+            return fn()
+        except RuntimeError as e:
+            err = e
+    raise err
+
+
 def get_sampler_pool(env: "ManagerBasedRLEnv", workers: int, seed_envelope: dict, member_envelope: dict,
                      workspace_map: str | None, shoulder_body_name: str = "right_shoulder_pitch_link") -> SamplerPool:
     """The environment's tree-sampling worker pool (tree_sampler.SamplerPool),
@@ -418,23 +433,26 @@ def place_apple_tree(
                 fut = env._tree_prefetch.pop(i, None) or pool.submit(_job())
                 try:
                     tree = fut.result()
-                except RuntimeError:             # no tree fits, or the pool is gone: here, as before
-                    tree = sample_spindle_tree(rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg,
-                                               stem_length_range, cluster_sizes, cluster_weights, cluster_gap,
-                                               sep_min, spindle)
+                except RuntimeError:             # no tree fits, or the pool is gone: here, again
+                    tree = _draw(lambda: sample_spindle_tree(
+                        rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg, stem_length_range,
+                        cluster_sizes, cluster_weights, cluster_gap, sep_min, spindle))
                 env._tree_prefetch[i] = pool.submit(_job())      # the NEXT reset's tree, meanwhile
             elif spindle is not None:
-                tree = sample_spindle_tree(rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg,
-                                           stem_length_range, cluster_sizes, cluster_weights, cluster_gap,
-                                           sep_min, spindle,
-                                           seed=None if forced is None else (forced["apple"], forced["heading"]),
-                                           keep_out=None if forced is None else (forced["pts"], forced["rad"]))
+                # a forced target that fits no tree is the CALLER's to re-pick (pregrasp.place_tree_at_pregrasp);
+                # an unconstrained draw that fails is just drawn again
+                tree = _draw(lambda: sample_spindle_tree(
+                    rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg, stem_length_range,
+                    cluster_sizes, cluster_weights, cluster_gap, sep_min, spindle,
+                    seed=None if forced is None else (forced["apple"], forced["heading"]),
+                    keep_out=None if forced is None else (forced["pts"], forced["rad"])),
+                    tries=25 if forced is None else 1)
             elif forced is not None:
                 raise ValueError("place_apple_tree: a forced target needs the spindle tree")
             else:
-                tree = sample_tree(rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter,
-                                   stem_heading_max_deg, stem_length_range, cluster_sizes, cluster_weights,
-                                   cluster_gap, sep_min)
+                tree = _draw(lambda: sample_tree(
+                    rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter, stem_heading_max_deg,
+                    stem_length_range, cluster_sizes, cluster_weights, cluster_gap, sep_min))
             T.trees[i] = tree
             T.trunk_kink[i] = float(tree.get("kink", 1.0e3))
             T.trunk_lean[i] = torch.tensor(tree.get("lean", np.zeros(2)), device=dev, dtype=torch.float32)
