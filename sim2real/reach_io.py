@@ -14,6 +14,9 @@ Two policy layouts (picked from the policy's input size):
   "waist" (40 in / 8 out): AppleReachSpindle-v3 / AppleReachTreeWaist*-v1 --
       right arm (7) + waist yaw (1), envs/apple_reach_tree_waist_env_cfg.py
   "tree"  (37 in / 7 out): AppleReachTree-v1 -- right arm only
+  "single" (40 in / 8 out): AppleReachSingle-v1 -- the "waist" layout WITHOUT the palm
+      touch input, + the hand phase LAST. Same size as "waist", so it is never picked
+      by size: ReachPolicy(path, layout="single") (sim2real/toy_reach_single.py)
 
 Observation, in the order the policy was trained on
 (apple_grasp_env_cfg.ObservationsCfg.PolicyObs + the tree / waist terms):
@@ -117,6 +120,29 @@ URDF_DEFAULT = os.path.expanduser("~/g1_fruits_picker/robot_model_urdf/g1_29dof_
 POLICY_DEFAULT = os.path.join(REPO, "envs", "agents", "best_weights", "grasp_handoff_reach_spindle.pt")
 
 LAYOUTS = {40: "waist", 37: "tree"}
+#: (inputs, outputs) of every layout; "single" is only ever chosen by name
+LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8)}
+
+#: AppleReachSingle-v1 (envs/apple_reach_single_env_cfg.py; checked by validate_single_io.py)
+#: goal: the apple centre (radius + SINGLE_STANDOFF) out from the palm point along the palm
+#: normal, within SINGLE_POS_TOL, held still (no contact: the hanging apple is too light
+#: for the palm sensor)
+SINGLE_STANDOFF = 0.02
+SINGLE_POS_TOL = 0.02
+#: hand schedule: open at the start, latched once the palm point is within
+#: SINGLE_HAND_LEVEL_TOL of the (perceived) apple centre's height, then ramped to the
+#: partial cup (pregrasp.FINAL_HAND_PRESHAPE) over SINGLE_HAND_RAMP_S; the phase is input 39
+SINGLE_HAND_OPEN = {"right_hand_thumb_0_joint": 0.0, "right_hand_thumb_1_joint": 0.6, "right_hand_thumb_2_joint": 0.0,
+                    "right_hand_index_0_joint": 0.0, "right_hand_index_1_joint": 0.0,
+                    "right_hand_middle_0_joint": 0.0, "right_hand_middle_1_joint": 0.0}
+SINGLE_HAND_CLOSED = {"right_hand_thumb_0_joint": 0.0, "right_hand_thumb_1_joint": 0.15,
+                      "right_hand_thumb_2_joint": -0.340,
+                      "right_hand_index_0_joint": 0.0, "right_hand_index_1_joint": 1.05,
+                      "right_hand_middle_0_joint": 0.0, "right_hand_middle_1_joint": 1.05}
+SINGLE_HAND_LEVEL_TOL = 0.03
+SINGLE_HAND_RAMP_S = 0.3
+#: fingers UP (thumb below) for an apple centre above the right shoulder + this, DOWN below
+SINGLE_FINGER_SWITCH_DZ = 0.15
 
 
 # ─────────────────────────────────────────────
@@ -267,6 +293,7 @@ class ReachState:
     apple: np.ndarray           # [3] apple CENTRE
     touch_force: float = 0.0    # N, palm
     ring: np.ndarray | None = None   # [8] clearance ring (1 = free)
+    hand_phase: float = 0.0     # "single" only: the hand schedule's phase (SingleHandSchedule)
 
 
 def build_obs(layout: str, kin: G1Kinematics, st: ReachState, prev_raw: np.ndarray,
@@ -274,6 +301,18 @@ def build_obs(layout: str, kin: G1Kinematics, st: ReachState, prev_raw: np.ndarr
     """(obs, frames). prev_raw: [7] or [8] previous raw action (zeros at the start)."""
     fr = fr or kin.frames(st.waist_q, st.arm_q)
     ring = np.ones(RING_SECTORS) if st.ring is None else np.asarray(st.ring, float)
+    if layout == "single":
+        parts = [
+            st.arm_q - ARM_DEFAULT,
+            st.arm_dq,
+            st.apple - fr.palm_ref,
+            palm_quat_obs(fr, float(st.waist_q[0]), unyawed=True),
+            np.asarray(prev_raw, float)[:7],
+            ring,
+            [st.waist_q[0] - WAIST_DEFAULT[0]], [st.waist_dq[0]], [float(prev_raw[7])],
+            [float(st.hand_phase)],
+        ]
+        return np.concatenate([np.asarray(p, float).ravel() for p in parts]).astype(np.float32), fr
     parts = [
         st.arm_q - ARM_DEFAULT,
         st.arm_dq,
@@ -347,7 +386,7 @@ def make_limiters(layout: str, clip: str = "v3", dtype=np.float64) -> dict:
     else:
         lo, hi = ARM_DEFAULT - ARM_TARGET_CLIP_OLD, ARM_DEFAULT + ARM_TARGET_CLIP_OLD
     out = {"arm": RateLimiter(ARM_DEFAULT, ARM_SCALE, lo, hi, ARM_MAX_VELOCITY, ARM_MAX_ACCELERATION, dtype=dtype)}
-    if layout == "waist":
+    if layout in ("waist", "single"):
         out["waist"] = RateLimiter([WAIST_DEFAULT[0]], WAIST_SCALE, [-WAIST_YAW_LIMIT], [WAIST_YAW_LIMIT],
                                    WAIST_MAX_VELOCITY, WAIST_MAX_ACCELERATION, brake=True, dtype=dtype)
     return out
@@ -360,7 +399,9 @@ def make_limiters(layout: str, clip: str = "v3", dtype=np.float64) -> dict:
 class ReachPolicy:
     """An exported TorchScript reach policy (normalizer inside), CPU, batch 1."""
 
-    def __init__(self, path: str = POLICY_DEFAULT):
+    def __init__(self, path: str = POLICY_DEFAULT, layout: str | None = None):
+        """layout None: picked from the input size (LAYOUTS: "waist" / "tree"); a name
+        (e.g. "single", which has the "waist" size) is checked against the policy's size."""
         import torch
         # ONE thread: batch-1 inference on tiny tensors gains nothing from a 20-thread pool,
         # and the pool's spinning workers cost ~30 ms a step when other processes are busy
@@ -371,6 +412,14 @@ class ReachPolicy:
         self.net = torch.jit.load(path, map_location="cpu").eval()
         ws = [p for _, p in self.net.named_parameters() if p.dim() == 2]
         self.n_in, self.n_out = int(ws[0].shape[1]), int(ws[-1].shape[0])
+        if layout is not None:
+            if layout not in LAYOUT_DIMS:
+                raise ValueError(f"unknown reach layout '{layout}' ({sorted(LAYOUT_DIMS)})")
+            if (self.n_in, self.n_out) != LAYOUT_DIMS[layout]:
+                raise ValueError(f"{path}: {self.n_in} in / {self.n_out} out, the {layout} layout has "
+                                 f"{LAYOUT_DIMS[layout][0]} / {LAYOUT_DIMS[layout][1]}")
+            self.layout = layout
+            return
         if self.n_in not in LAYOUTS:
             raise ValueError(f"{path}: {self.n_in} inputs -- not a reach layout {sorted(LAYOUTS)}")
         self.layout = LAYOUTS[self.n_in]
@@ -382,6 +431,60 @@ class ReachPolicy:
         with self.torch.no_grad():
             x = self.torch.as_tensor(np.asarray(obs, np.float32)).view(1, -1)
             return self.net(x)[0].numpy().astype(float)
+
+
+# ─────────────────────────────────────────────
+#  AppleReachSingle-v1: hand schedule, goal, approach
+# ─────────────────────────────────────────────
+
+class SingleHandSchedule:
+    """single_reach.step_hand_schedule for one env: latched once the palm point is within
+    SINGLE_HAND_LEVEL_TOL of the apple centre's height, then the phase ramps 0 -> 1 over
+    ramp_s; targets = open + phase (closed - open). The sim updates it BEFORE the
+    observation of the same step (an interval event), so step() comes before build_obs.
+    ramp_s: the deployment's speed factor plays the motion 1/s slower -- pass
+    SINGLE_HAND_RAMP_S / s to keep the hand in step with the arm."""
+
+    def __init__(self, ramp_s: float = SINGLE_HAND_RAMP_S, level_tol: float = SINGLE_HAND_LEVEL_TOL, dt: float = DT):
+        self.ramp_s, self.level_tol, self.dt = float(ramp_s), float(level_tol), float(dt)
+        self.open = np.array([SINGLE_HAND_OPEN[f"right_hand_{n}_joint"] for n in DEX3_ORDER])
+        self.closed = np.array([SINGLE_HAND_CLOSED[f"right_hand_{n}_joint"] for n in DEX3_ORDER])
+        self.reset()
+
+    def reset(self):
+        self.phase, self.latched = 0.0, False
+
+    def step(self, palm_ref: np.ndarray, apple: np.ndarray) -> float:
+        if abs(float(palm_ref[2]) - float(apple[2])) < self.level_tol:
+            self.latched = True
+        if self.latched:
+            self.phase = min(1.0, self.phase + self.dt / self.ramp_s)
+        return self.phase
+
+    def targets(self) -> np.ndarray:
+        """[7] Dex3 joint targets (DEX3_ORDER)."""
+        return self.open + self.phase * (self.closed - self.open)
+
+
+def single_seat_error(fr: Frames, apple: np.ndarray, radius: float, standoff: float = SINGLE_STANDOFF) -> float:
+    """reach_rewards._palm_target_dist: how far the apple centre is from the seat
+    (radius + standoff) out from the palm point along the palm normal. The goal is
+    < SINGLE_POS_TOL, held still."""
+    seat = fr.palm_ref + (radius + standoff) * fr.palm_normal
+    return float(np.linalg.norm(np.asarray(apple, float) - seat))
+
+
+def single_approach_yaw(apple_or_target: np.ndarray) -> float:
+    """single_reach.set_approach_origin: the approach is the horizontal line from the
+    waist axis (the pelvis origin) to the apple -- nothing from the stem."""
+    p = np.asarray(apple_or_target, float)
+    return math.atan2(p[1], p[0])
+
+
+def single_fingers_up(apple: np.ndarray, shoulder: np.ndarray) -> bool:
+    """What the policy was rewarded for (reward_fingers_vertical): fingers UP (thumb
+    below) for an apple centre above the right shoulder + SINGLE_FINGER_SWITCH_DZ."""
+    return float(apple[2]) - float(shoulder[2]) > SINGLE_FINGER_SWITCH_DZ
 
 
 # ─────────────────────────────────────────────
