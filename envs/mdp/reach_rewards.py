@@ -106,8 +106,19 @@ def _approach_dir(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg) -> torch
     Falls back to the horizontal shoulder -> apple direction where no stem
     direction has been set (scenes without randomize_tree_and_apple).
 
+    If env._approach_from_body is set (single_reach.set_approach_origin), the
+    stem is not used at all: the horizontal direction from that body to the
+    apple (robot-knowable, unlike the stem).
+
     Returns: [num_envs, 3] (z = 0)
     """
+    origin = getattr(env, "_approach_from_body", None)
+    if origin is not None:
+        robot: Articulation = env.scene["robot"]
+        apple: RigidObject = env.scene[object_cfg.name]
+        d = apple.data.root_pos_w - robot.data.body_pos_w[:, origin, :]
+        d[:, 2] = 0.0
+        return d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     stem = getattr(env, "_stem_dir", None)
     if isinstance(stem, torch.Tensor):
         d = stem.clone()

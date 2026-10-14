@@ -323,3 +323,13 @@ class AppleReachFinalChainedV2PPORunnerCfg(AppleGraspPPORunnerCfg):
     experiment_name = "apple_reach_final_chained_v2"
     max_iterations = 600
     save_interval = 25
+
+
+@configclass
+class AppleReachSinglePPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachSingle-v1: one reach policy, no touch input, palm forward,
+    fingers vertical, scripted hand close. Own log folder
+    (logs/rsl_rl/apple_reach_single_v1)."""
+    experiment_name = "apple_reach_single_v1"
+    max_iterations = 3000
+    save_interval = 50

@@ -543,3 +543,29 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# One reach policy, no touch input (apple_reach_single_env_cfg.py): palm along waist axis -> apple,
+# fingers vertical by fruit height, hand open -> partial cup once level with the fruit
+
+from .apple_reach_single_env_cfg import AppleReachSingleEnvCfg, AppleReachSingleEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleReachSinglePPORunnerCfg
+
+gym.register(
+    id="AppleReachSingle-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSingleEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachSinglePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachSingle-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachSingleEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachSinglePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
