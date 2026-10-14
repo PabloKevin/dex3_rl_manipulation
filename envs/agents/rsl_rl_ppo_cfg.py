@@ -284,3 +284,36 @@ class AppleReachFinalPPORunnerCfg(AppleGraspPPORunnerCfg):
     """AppleReachFinal-v1: two-stage reach, part 2 (pregrasp -> gentle palm
     touch, cupped hand). Own log folder (logs/rsl_rl/apple_reach_final)."""
     experiment_name = "apple_reach_final"
+
+
+@configclass
+class AppleReachPregraspV2PPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachPregrasp-v2: part 1 with the smoothness / settle rewards.
+    Own log folder (logs/rsl_rl/apple_reach_pregrasp_v2); the chained part-2
+    training picks its newest checkpoint from there."""
+    experiment_name = "apple_reach_pregrasp_v2"
+    max_iterations = 600
+
+
+@configclass
+class AppleReachFinalChainedPPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachFinalChained-v1: part 2 trained behind the frozen part 1.
+    Own log folder (logs/rsl_rl/apple_reach_final_chained)."""
+    experiment_name = "apple_reach_final_chained"
+    max_iterations = 600
+
+
+@configclass
+class AppleReachPregraspV3PPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachPregrasp-v3: v2 + target push + rise near the body first.
+    Own log folder (logs/rsl_rl/apple_reach_pregrasp_v3)."""
+    experiment_name = "apple_reach_pregrasp_v3"
+    max_iterations = 600
+
+
+@configclass
+class AppleReachFinalChainedV2PPORunnerCfg(AppleGraspPPORunnerCfg):
+    """AppleReachFinalChained-v2: tiered touch, behind the frozen v3 part 1.
+    Own log folder (logs/rsl_rl/apple_reach_final_chained_v2)."""
+    experiment_name = "apple_reach_final_chained_v2"
+    max_iterations = 600

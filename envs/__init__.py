@@ -65,6 +65,14 @@ from .apple_reach_twostage_env_cfg import (
     AppleReachPregraspEnvCfg_PLAY,
     AppleReachFinalEnvCfg,
     AppleReachFinalEnvCfg_PLAY,
+    AppleReachPregraspV2EnvCfg,
+    AppleReachPregraspV2EnvCfg_PLAY,
+    AppleReachFinalChainedEnvCfg,
+    AppleReachFinalChainedEnvCfg_PLAY,
+    AppleReachPregraspV3EnvCfg,
+    AppleReachPregraspV3EnvCfg_PLAY,
+    AppleReachFinalChainedV2EnvCfg,
+    AppleReachFinalChainedV2EnvCfg_PLAY,
 )
 from .agents.rsl_rl_ppo_cfg import (
     AppleGraspPPORunnerCfg,
@@ -83,6 +91,10 @@ from .agents.rsl_rl_ppo_cfg import (
     AppleArmGoalPPORunnerCfg,
     AppleArmGoalWaistPPORunnerCfg,
     AppleReachPregraspPPORunnerCfg,
+    AppleReachPregraspV2PPORunnerCfg,
+    AppleReachPregraspV3PPORunnerCfg,
+    AppleReachFinalChainedV2PPORunnerCfg,
+    AppleReachFinalChainedPPORunnerCfg,
     AppleReachFinalPPORunnerCfg,
 )
 
@@ -444,6 +456,90 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": AppleReachFinalEnvCfg_PLAY,
         "rsl_rl_cfg_entry_point": AppleReachFinalPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Two-stage reach v2: smoother / settling part 1, and part 2 trained behind the frozen part 1
+
+gym.register(
+    id="AppleReachPregrasp-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachPregraspV2EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachPregraspV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachPregrasp-Play-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachPregraspV2EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachPregraspV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachFinalChained-v1",
+    entry_point="envs.chained_reach_env:ChainedReachEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachFinalChainedEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachFinalChainedPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachFinalChained-Play-v1",
+    entry_point="envs.chained_reach_env:ChainedReachEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachFinalChainedEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachFinalChainedPPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+# Two-stage reach v3 / chained v2: rise near the body first; tiered touch (palm > palm + base phalanx > base phalanx)
+
+gym.register(
+    id="AppleReachPregrasp-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachPregraspV3EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachPregraspV3PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachPregrasp-Play-v3",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachPregraspV3EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachPregraspV3PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachFinalChained-v2",
+    entry_point="envs.chained_reach_env:ChainedReachEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachFinalChainedV2EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleReachFinalChainedV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleReachFinalChained-Play-v2",
+    entry_point="envs.chained_reach_env:ChainedReachEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleReachFinalChainedV2EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleReachFinalChainedV2PPORunnerCfg,
     },
     disable_env_checker=True,
 )
