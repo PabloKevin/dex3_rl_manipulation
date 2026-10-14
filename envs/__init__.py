@@ -569,3 +569,28 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Grasp after the single no-touch reach (apple_grasp_single_env_cfg.py)
+
+from .apple_grasp_single_env_cfg import AppleGraspSingleEnvCfg, AppleGraspSingleEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspSinglePPORunnerCfg
+
+gym.register(
+    id="AppleGraspSingle-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSingleEnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspSinglePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspSingle-Play-v1",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSingleEnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspSinglePPORunnerCfg,
+    },
+    disable_env_checker=True,
+)

@@ -67,11 +67,27 @@ def neighbour_clearance_ring(
     N = env.num_envs
     if not hasattr(env, "_tree"):
         return torch.ones(N, n_sectors, device=env.device)
+    q, hanging = _neighbour_state(env)                                       # [N, K, 3]
+    return clearance_ring_from(env, env.scene["apple"].data.root_pos_w, q, hanging, n_sectors, max_range,
+                               shoulder_body)
+
+
+def clearance_ring_from(
+    env: "ManagerBasedRLEnv",
+    c: torch.Tensor,
+    q: torch.Tensor,
+    hanging: torch.Tensor,
+    n_sectors: int = 8,
+    max_range: float = 0.10,
+    shoulder_body: str = "right_shoulder_pitch_link",
+) -> torch.Tensor:
+    """neighbour_clearance_ring from given positions: target centre c [N, 3],
+    neighbour centres q [N, K, 3], hanging mask [N, K] (world). The live
+    shoulder sets the viewing direction (forward kinematics on the robot)."""
+    N = env.num_envs
     robot = env.scene["robot"]
     if not hasattr(env, "_ring_shoulder_id"):
         env._ring_shoulder_id = robot.data.body_names.index(shoulder_body)
-    c = env.scene["apple"].data.root_pos_w                                   # [N, 3]
-    q, hanging = _neighbour_state(env)                                       # [N, K, 3]
     r = env._apple_radius.view(N, 1)
     sh = robot.data.body_pos_w[:, env._ring_shoulder_id]
     a = c - sh

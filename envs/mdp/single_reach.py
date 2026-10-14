@@ -13,9 +13,14 @@ envs/apple_reach_single_env_cfg.py): the pieces beyond the pregrasp reach.
   - penalty_elbow_out: the right elbow out beyond the shoulder, sideways in
     the torso's own frame.
   - apple measurement: the apple centre as the robot's perception gives it,
-    true + a per-episode bias (calibration / surface->centre radius error,
-    larger along the viewing depth) + per-step jitter. The policy input and
-    the hand schedule read it; rewards and success keep the true position.
+    taken ONCE at the episode start (true + a per-episode bias: calibration
+    / surface->centre radius error, larger along the viewing depth) and held
+    for the whole episode, as sim2real/toy_reach.py does (detections sampled
+    at home, then self.apple fixed: near the fruit the hand hides it from
+    the camera). It does not follow the fruit if it is pushed. The policy
+    inputs and the hand schedule read it; rewards / success keep the truth.
+    The neighbours too (neighbour_ring_measured): seen in the same detection,
+    same bias, held.
   - hand schedule: the hand starts open and closes to a partial cup once the
     palm point is level with the fruit (latched per episode, ramped), with
     the phase in [0, 1] as an observation. Everything it reads (palm point
@@ -74,43 +79,56 @@ def reset_apple_measurement(
     cross_std: float = 0.005,
     cross_clip: float = 0.015,
 ) -> None:
-    """mode="reset", after the tree / apple placement: a new per-episode bias
-    of the perceived apple centre, Gaussian and clipped, depth_std along the
-    horizontal origin -> apple direction (the camera's depth; where a wrong
-    radius in the surface -> centre step lands), cross_std sideways and
-    vertically. Stored in world axes (the apple does not move much)."""
+    """mode="reset", after the tree / apple placement: this episode's
+    perceived apple centre, env._apple_meas [N, 3] (world), fixed until the
+    next reset = the placed apple + a bias, Gaussian and clipped, depth_std
+    along the horizontal origin -> apple direction (the camera's depth;
+    where a wrong radius in the surface -> centre step lands), cross_std
+    sideways and vertically. No per-step noise: the robot averages its
+    detections at home (toy_reach --detect_s) and then keeps one point."""
     N, dev = env.num_envs, env.device
-    if not hasattr(env, "_apple_meas_bias"):
-        env._apple_meas_bias = torch.zeros(N, 3, device=dev)
+    true = env.scene[object_cfg.name].data.root_pos_w
+    if getattr(env, "_apple_meas", None) is None:
+        env._apple_meas = true.clone()
     n = len(env_ids)
     bd = (torch.randn(n, device=dev) * depth_std).clamp(-depth_clip, depth_clip)
     bc = (torch.randn(n, 2, device=dev) * cross_std).clamp(-cross_clip, cross_clip)
     d, lat, up = _depth_frame(env, object_cfg, origin_body)
-    env._apple_meas_bias[env_ids] = (bd.unsqueeze(-1) * d[env_ids] + bc[:, :1] * lat[env_ids]
-                                     + bc[:, 1:] * up[env_ids])
-    env._apple_meas = None
+    bias = bd.unsqueeze(-1) * d[env_ids] + bc[:, :1] * lat[env_ids] + bc[:, 1:] * up[env_ids]
+    env._apple_meas[env_ids] = true[env_ids] + bias
+    # the neighbours, seen in the same detection: positions + hanging mask at
+    # the start, shifted by the same bias (one camera calibration), then held
+    if hasattr(env, "_tree"):
+        from .tree_reach import _neighbour_state
 
-
-def step_apple_measurement(env: "ManagerBasedRLEnv", env_ids: torch.Tensor | None, object_cfg: SceneEntityCfg,
-                           jitter_std: float = 0.002) -> None:
-    """mode="interval" every step, BEFORE step_hand_schedule (declaration
-    order): this step's perceived apple centre, env._apple_meas [N, 3]."""
-    true = env.scene[object_cfg.name].data.root_pos_w
-    bias = getattr(env, "_apple_meas_bias", None)
-    if bias is None:
-        bias = torch.zeros_like(true)
-    env._apple_meas = true + bias + torch.randn_like(true) * jitter_std
+        q, hanging = _neighbour_state(env)
+        if getattr(env, "_neigh_meas", None) is None:
+            env._neigh_meas = q.clone()
+            env._neigh_hanging_meas = hanging.clone()
+        env._neigh_meas[env_ids] = q[env_ids] + bias.unsqueeze(1)
+        env._neigh_hanging_meas[env_ids] = hanging[env_ids]
 
 
 def apple_pos_measured(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg) -> torch.Tensor:
-    """[N, 3] perceived apple centre (world): this step's measurement, or the
-    true position + bias before the first step."""
+    """[N, 3] this episode's perceived apple centre (world), or the true
+    position before the first reset."""
     m = getattr(env, "_apple_meas", None)
-    if m is not None:
-        return m
-    true = env.scene[object_cfg.name].data.root_pos_w
-    bias = getattr(env, "_apple_meas_bias", None)
-    return true if bias is None else true + bias
+    return env.scene[object_cfg.name].data.root_pos_w if m is None else m
+
+
+def neighbour_ring_measured(env: "ManagerBasedRLEnv", n_sectors: int = 8, max_range: float = 0.10,
+                            shoulder_body: str = "right_shoulder_pitch_link") -> torch.Tensor:
+    """[N, n_sectors] tree_reach.neighbour_clearance_ring from this episode's
+    perceived target and neighbours (reset_apple_measurement), not the live
+    fruit: a neighbour pushed or knocked off later still reads where it was
+    seen. Before the first reset: the live ring."""
+    from .tree_reach import clearance_ring_from, neighbour_clearance_ring
+
+    q = getattr(env, "_neigh_meas", None)
+    if q is None:
+        return neighbour_clearance_ring(env, n_sectors, max_range, shoulder_body)
+    return clearance_ring_from(env, apple_pos_measured(env, SceneEntityCfg("apple")), q, env._neigh_hanging_meas,
+                               n_sectors, max_range, shoulder_body)
 
 
 def apple_pos_palm_measured(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg,
@@ -118,6 +136,19 @@ def apple_pos_palm_measured(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg
     """[N, 3] observations.object_pos_relative_to_body with the perceived
     apple centre: apple - palm reference point, world (pelvis) axes."""
     return apple_pos_measured(env, object_cfg) - rr._palm_ref_pos(env, robot_cfg, local_offset)
+
+
+def apple_pos_pocket_measured(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg,
+                              ref_local: Sequence[float] = (0.0, 0.0, 0.0)) -> torch.Tensor:
+    """[N, 3] observations.object_pos_in_body_frame with the perceived apple
+    centre: in the palm link's own frame, minus ref_local (the grasp task's
+    fruit-in-pocket input)."""
+    from isaaclab.utils.math import quat_conjugate
+
+    robot = env.scene[robot_cfg.name]
+    q = robot.data.body_quat_w[:, robot_cfg.body_ids[0]]
+    delta = apple_pos_measured(env, object_cfg) - robot.data.body_pos_w[:, robot_cfg.body_ids[0]]
+    return quat_apply(quat_conjugate(q), delta) - torch.tensor(ref_local, device=env.device, dtype=delta.dtype)
 
 
 # ─────────────────────────────────────────────
@@ -231,11 +262,14 @@ def step_hand_schedule(
     palm_local_offset: Sequence[float],
     level_tol: float = 0.03,
     ramp_s: float = 0.3,
+    write_targets: bool = True,
 ) -> None:
     """mode="interval" every step (interval_range_s (0, 0), global time):
     latch once the palm point is within level_tol of the PERCEIVED apple
     centre's height (apple_pos_measured, as on the robot), then ramp the
-    hand targets open -> closed over ramp_s."""
+    hand targets open -> closed over ramp_s. write_targets=False only
+    advances the phase (the grasp task: its hand action term reads
+    env._hand_phase during the reach phase and owns the targets)."""
     ids = _hand_ids(env, open_targets, closed_targets)
     robot = env.scene[robot_cfg.name]
     p = rr._palm_ref_pos(env, robot_cfg, palm_local_offset)
@@ -243,6 +277,8 @@ def step_hand_schedule(
     env._hand_latched |= level
     env._hand_phase = torch.where(env._hand_latched, (env._hand_phase + env.step_dt / ramp_s).clamp(max=1.0),
                                   env._hand_phase)
+    if not write_targets:
+        return
     ph = env._hand_phase.unsqueeze(-1)
     tgt = robot.data.joint_pos_target.clone()
     tgt[:, ids] = env._hs_open + ph * (env._hs_closed - env._hs_open)

@@ -164,6 +164,30 @@ def _reach_obs(
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
 
+    if layout == "single":
+        # AppleReachSingle-v1 (envs/apple_reach_single_env_cfg.py): the
+        # "waist" vector without the touch slot, the PERCEIVED apple
+        # (single_reach.apple_pos_measured), hand schedule phase last = 40
+        from .single_reach import apple_pos_palm_measured, hand_phase_obs, neighbour_ring_measured
+        from .waist_reach import palm_quat_torso_unyawed
+
+        if not hasattr(env, "_autoplay_pelvis_cfg"):
+            env._autoplay_pelvis_cfg = SceneEntityCfg("robot", body_names=["pelvis"])
+            env._autoplay_pelvis_cfg.resolve(env.scene)
+        wcfg = waist["joint_cfg"]
+        return torch.cat([
+            joint_pos_selected(env, arm_cfg),
+            joint_vel_selected(env, arm_cfg),
+            apple_pos_palm_measured(env, object_cfg, robot_body_cfg, local_offset=palm_local_offset),
+            palm_quat_torso_unyawed(env, robot_body_cfg, env._autoplay_torso_cfg, env._autoplay_pelvis_cfg, wcfg),
+            prev_raw_action,
+            neighbour_ring_measured(env, max_range=waist["ring_range"]),
+            joint_pos_selected(env, wcfg),
+            joint_vel_selected(env, wcfg),
+            waist["prev_raw"],
+            hand_phase_obs(env),
+        ], dim=-1)
+
     if layout == "waist":
         from .tree_reach import neighbour_clearance_ring, palm_contact_force_any
         from .waist_reach import palm_quat_torso_unyawed
@@ -533,6 +557,16 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
             else torch.full((n, j), float(self._offset), device=self.device)
         for name, value in (cfg.reach_offset or {}).items():
             self._reach_hold[:, self._joint_names.index(name)] = value
+        # reach-phase hand schedule (open -> closed by env._hand_phase)
+        self._sched = None
+        if cfg.reach_hold_schedule is not None:
+            open_t, closed_t = cfg.reach_hold_schedule
+            o, c = self._reach_hold[0].clone(), self._reach_hold[0].clone()
+            for name, value in open_t.items():
+                o[self._joint_names.index(name)] = value
+            for name, value in closed_t.items():
+                c[self._joint_names.index(name)] = value
+            self._sched = (o, c)
 
         # Waist yaw driven by the reach policy's extra (8th) output during
         # the reach, then held where the reach left it (braking to a stop);
@@ -632,6 +666,11 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
                 waist_raw = reach_raw[:, self._reach_prev_raw.shape[1]:]
                 self._waist_prev_raw.copy_(torch.where(phase, self._waist_prev_raw, waist_raw))
             reach_target = self._reach_prev_raw * self.cfg.reach_scale + self._offset
+        elif self._sched is not None:
+            ph = getattr(self._env, "_hand_phase", None)
+            ph = torch.zeros(self._env.num_envs, device=self.device) if ph is None else ph
+            o, c = self._sched
+            reach_target = o + ph.unsqueeze(-1) * (c - o)
         else:
             reach_target = self._reach_hold
 
@@ -777,6 +816,10 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     reach_offset: dict[str, float] | None = None
     """Joint name -> target held during the REACH phase when no reach policy
     drives this term (the hand: the reach's pre-shape); default pose otherwise."""
+    reach_hold_schedule: tuple[dict, dict] | None = None
+    """(open, closed) joint name -> target dicts: instead of reach_offset, the
+    reach-phase target goes open -> closed with env._hand_phase in [0, 1]
+    (single_reach.step_hand_schedule, write_targets=False)."""
     # With unlock_with_grip, the LAST pre_grip_free_dims joints (in
     # cfg.joint_names order) keep their normal scale even before the first
     # grip; the rest are held at exactly the hand-off pose until then. For

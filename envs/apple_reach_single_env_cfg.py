@@ -29,9 +29,11 @@ arrival (settled / brake / palm speed). Changes:
     Pregrasp-v3's 39 + hand phase LAST). NOT the "waist" 40-input layout
     of sim2real/reach_io.py, which picks its layout by input size.
   - perception noise on the apple position input (and the hand trigger,
-    which reads the same estimate on the robot): per-episode bias, larger
-    along the viewing depth, + per-step jitter. Rewards / success use the
-    true position. The sizes are GUESSES (the only measured number is the
+    which reads the same estimate on the robot): ONE perceived point per
+    episode, the apple at the start + a bias larger along the viewing depth,
+    held fixed (the robot detects at home, then keeps it: near the fruit the
+    hand hides it). Rewards / success use the true position. The clearance
+    ring likewise: the neighbours as seen at the start (same bias), held. The sizes are GUESSES (the only measured number is the
     head-camera calibration residual, 3 mm mean over 37 points; a wrong
     radius in the surface -> centre step adds up to ~1 cm along the depth):
     measure the real error on fixed apples and put it in APPLE_MEAS_NOISE.
@@ -59,12 +61,11 @@ SINGLE_POS_TOL = 0.02
 #: apple centre this far above the right shoulder: fingers up / thumb down
 FINGER_SWITCH_DZ = 0.15
 
-#: perceived apple centre = true + per-episode bias + per-step jitter (m)
+#: perceived apple centre = true at the episode start + a bias, then held (m)
 APPLE_MEAS_NOISE = {
     "depth_std": 0.010, "depth_clip": 0.025,   # along the horizontal pelvis -> apple line
     "cross_std": 0.005, "cross_clip": 0.015,   # sideways and vertically
 }
-APPLE_MEAS_JITTER_STD = 0.002
 
 HAND_OPEN = {
     "right_hand_thumb_0_joint": 0.0,
@@ -100,10 +101,6 @@ class EventsSingleCfg(EventsPregraspCfg):
     # after the tree / apple placement (declaration order)
     apple_measurement_reset = EventTerm(func=sr.reset_apple_measurement, mode="reset",
                                         params={"object_cfg": _APPLE, "origin_body": "pelvis", **APPLE_MEAS_NOISE})
-    # every step, before hand_schedule (it reads this step's measurement)
-    apple_measurement = EventTerm(func=sr.step_apple_measurement, mode="interval", interval_range_s=(0.0, 0.0),
-                                  is_global_time=True,
-                                  params={"object_cfg": _APPLE, "jitter_std": APPLE_MEAS_JITTER_STD})
     # after hold_default_targets (declaration order)
     hand_schedule_reset = EventTerm(func=sr.reset_hand_schedule, mode="reset",
                                     params={"open_targets": HAND_OPEN, "closed_targets": HAND_CLOSED})
@@ -129,6 +126,8 @@ class AppleReachSingleEnvCfg(AppleReachPregraspV3EnvCfg):
         # same slot, perceived apple instead of the true one
         ap = self.observations.policy.apple_pos_palm
         self.observations.policy.apple_pos_palm = ObsTerm(func=sr.apple_pos_palm_measured, params=dict(ap.params))
+        ring = self.observations.policy.neighbour_ring
+        self.observations.policy.neighbour_ring = ObsTerm(func=sr.neighbour_ring_measured, params=dict(ring.params))
         self.observations.policy.hand_phase = ObsTerm(func=sr.hand_phase_obs)
 
 

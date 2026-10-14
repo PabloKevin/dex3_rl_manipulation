@@ -333,3 +333,11 @@ class AppleReachSinglePPORunnerCfg(AppleGraspPPORunnerCfg):
     experiment_name = "apple_reach_single_v1"
     max_iterations = 3000
     save_interval = 50
+
+
+@configclass
+class AppleGraspSinglePPORunnerCfg(AppleGraspTreePPORunnerCfg):
+    """AppleGraspSingle-v1: the spindle v3 grasp after the single no-touch
+    reach, arm free before the grip. Own log folder
+    (logs/rsl_rl/apple_grasp_single_v1)."""
+    experiment_name = "apple_grasp_single_v1"
