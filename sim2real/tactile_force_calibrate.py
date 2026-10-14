@@ -10,6 +10,7 @@ nothing is commanded, the hand only has to be powered and publishing rt/dex3/rig
   python3 sim2real/tactile_force_calibrate.py --net-if enp62s0
   python3 sim2real/tactile_force_calibrate.py --only index_dist thumb_dist --trials 4
   python3 sim2real/tactile_calibrate.py --check       # then: live N per place; hang the scale to compare
+  python3 sim2real/tactile_force_gui.py --net-if enp62s0     # the same, in a window with the hand, lamps and buttons
 
 What it does, for each phalanx in turn (thumb, middle, index; prox then dist)
   1. says which phalanx to load and shows the seven joint angles
@@ -146,7 +147,7 @@ class Beeper:
         print("\a", end="", flush=True)
 
 
-def parse(argv=None):
+def make_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--net-if", default="enp62s0")
     ap.add_argument("--out", default=T.DEFAULT_CALIB, help="the calibration file to read and add the gains to")
@@ -168,7 +169,11 @@ def parse(argv=None):
     ap.add_argument("--open_tol", type=float, default=0.15, help="rad from open the joints may sit before it warns")
     ap.add_argument("--drift_tol", type=float, default=0.05, help="rad a finger joint may move during a pull")
     ap.add_argument("--arm_tol", type=float, default=0.03, help="rad an arm joint may move during a palm pull")
-    return ap.parse_args(argv)
+    return ap
+
+
+def parse(argv=None):
+    return make_parser().parse_args(argv)
 
 
 class HandReader:
@@ -280,9 +285,26 @@ def fit_gain(counts, newtons, method="median"):
     return g, float((r.max() - r.min()) / g)
 
 
+def hint_kg(k, total):
+    """The aim of pull k of `total` [kg]: a single pull goes for the middle of the range."""
+    return HINT_KG[1] if total == 1 else HINT_KG[min(k, len(HINT_KG) - 1)]
+
+
+def analyse_pull(win, zero, z, idx, noise, q0, min_counts):
+    """One pull window [(t, pressure elements, joint angles)] -> (counts of the hold, its length [s],
+    its spread, finger-joint drift [rad], the elements of `idx` that answered). `zero` is the
+    trial's resting pressure, z = zero + the dead zone."""
+    t = np.array([w[0] for w in win])
+    c = np.array([counts_of(w[1], z, idx) for w in win])
+    drift = float(np.nanmax(np.abs(np.array([w[2] for w in win]) - q0)))
+    val, dur, cv = plateau(t, c)
+    resp = T.responders(T.window_rise([w[1] for w in win], zero), zero, noise, 8.0, min_counts)
+    return val, dur, cv, drift, [i for i in idx if i in resp]
+
+
 def run_trial(hand, loc, idx, base, noise, dead, k, total):
     """One pull. Returns a trial dict, or 'redo' / 's' (skip the place) / 'q' (stop and save)."""
-    kg = HINT_KG[1] if total == 1 else HINT_KG[min(k, len(HINT_KG) - 1)]   # one pull: the middle of the range
+    kg = hint_kg(k, total)
     _, q, _ = hand.read()
     print(f"\n   {loc}  pull {k + 1}/{total}: aim for about {kg:.2f} kg ({kg * G:.1f} N), then hold steady")
     if loc == "palm":
@@ -343,12 +365,7 @@ def run_trial(hand, loc, idx, base, noise, dead, k, total):
         print(f"   only {len(win)} samples in {a.pull_s} s: the hand state is not streaming")
         return "redo"
 
-    t = np.array([w[0] for w in win])
-    c = np.array([counts_of(w[1], z, idx) for w in win])
-    drift = float(np.nanmax(np.abs(np.array([w[2] for w in win]) - q0)))
-    val, dur, cv = plateau(t, c)
-    resp = T.responders(T.window_rise([w[1] for w in win], zero), zero, noise, 8.0, a.min_counts)
-    answered = [i for i in idx if i in resp]
+    val, dur, cv, drift, answered = analyse_pull(win, zero, z, idx, noise, q0, a.min_counts)
     print(f"   pads: {val:.0f} counts, {len(answered)} of {len(idx)} elements answered, held {dur:.1f} s "
           f"(spread {cv * 100:.0f}%), finger joints moved {drift:.3f} rad"
           + (f", arm moved {arm_move[0]:.3f} rad" if loc == "palm" and np.isfinite(aq0).all() else ""))
