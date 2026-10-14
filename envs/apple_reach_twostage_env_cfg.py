@@ -34,6 +34,8 @@ part-2 cup, part 2 with the palm sensor (toy_reach.py / reach_io.py need
 the hand-off added; not done here).
 """
 
+import os
+
 from isaaclab.managers import EventTermCfg as EventTerm, ObservationTermCfg as ObsTerm, RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
@@ -67,6 +69,12 @@ _FINGER_LINKS = [
     "right_hand_index_0_link", "right_hand_index_1_link",
     "right_hand_middle_0_link", "right_hand_middle_1_link",
 ]
+#: Worker PROCESSES that build the trees ahead of the simulation (tree_sampler.py):
+#: sampling one costs ~100 ms of single-threaded Python, and at 512 envs it was
+#: most of every iteration. TREE_SAMPLER_WORKERS=0 samples inline (the old way).
+#: Default: half the cores, at most 8 -- set it lower when training two tasks
+#: on one machine and the cores are shared.
+SAMPLER_WORKERS = int(os.environ.get("TREE_SAMPLER_WORKERS", min(8, max(1, (os.cpu_count() or 2) // 2))))
 #: per-link target-contact penalties saturate at this force: any real touch
 #: (> 0.5 N) costs the full weight, a graze proportionally less
 _CONTACT_CAP_N = 0.5
@@ -128,7 +136,8 @@ class AppleReachPregraspEnvCfg(AppleReachSpindleV3EnvCfg):
         for t in (self.rewards.hold, self.rewards.face_apple_hold, self.terminations.reach_success):
             t.params = {**t.params, "sensor_cfg": None, "pos_tol": PREGRASP_POS_TOL}
         tree = self.events.randomize_tree
-        tree.params = {**tree.params, "stem_params": dict(pg.MAGNET_STEM_PARAMS)}
+        tree.params = {**tree.params, "stem_params": dict(pg.MAGNET_STEM_PARAMS),
+                       "sampler_workers": SAMPLER_WORKERS}
 
 
 @configclass
@@ -183,7 +192,7 @@ class AppleReachFinalEnvCfg(AppleReachSpindleV3EnvCfg):
         tree = dict(ev.randomize_tree.params)
         tree["stem_params"] = dict(pg.MAGNET_STEM_PARAMS)
         tree["order"] = "random"
-        ev.randomize_tree = EventTerm(func=pg.place_tree_at_pregrasp, mode="reset", params={"tree": tree})
+        ev.randomize_tree = EventTerm(func=pg.place_tree_at_pregrasp, mode="reset", params={"tree": tree, "sampler_workers": SAMPLER_WORKERS})
 
 
 @configclass

@@ -277,6 +277,7 @@ class AppleReachPregraspPPORunnerCfg(AppleGraspPPORunnerCfg):
     """AppleReachPregrasp-v1: two-stage reach, part 1 (home -> in front of the
     apple, fingers open). Own log folder (logs/rsl_rl/apple_reach_pregrasp)."""
     experiment_name = "apple_reach_pregrasp"
+    save_interval = 25
 
 
 @configclass
@@ -284,6 +285,7 @@ class AppleReachFinalPPORunnerCfg(AppleGraspPPORunnerCfg):
     """AppleReachFinal-v1: two-stage reach, part 2 (pregrasp -> gentle palm
     touch, cupped hand). Own log folder (logs/rsl_rl/apple_reach_final)."""
     experiment_name = "apple_reach_final"
+    save_interval = 25
 
 
 @configclass
@@ -293,6 +295,7 @@ class AppleReachPregraspV2PPORunnerCfg(AppleGraspPPORunnerCfg):
     training picks its newest checkpoint from there."""
     experiment_name = "apple_reach_pregrasp_v2"
     max_iterations = 600
+    save_interval = 25
 
 
 @configclass
@@ -301,6 +304,7 @@ class AppleReachFinalChainedPPORunnerCfg(AppleGraspPPORunnerCfg):
     Own log folder (logs/rsl_rl/apple_reach_final_chained)."""
     experiment_name = "apple_reach_final_chained"
     max_iterations = 600
+    save_interval = 25
 
 
 @configclass
@@ -309,6 +313,7 @@ class AppleReachPregraspV3PPORunnerCfg(AppleGraspPPORunnerCfg):
     Own log folder (logs/rsl_rl/apple_reach_pregrasp_v3)."""
     experiment_name = "apple_reach_pregrasp_v3"
     max_iterations = 600
+    save_interval = 25
 
 
 @configclass
@@ -317,3 +322,4 @@ class AppleReachFinalChainedV2PPORunnerCfg(AppleGraspPPORunnerCfg):
     Own log folder (logs/rsl_rl/apple_reach_final_chained_v2)."""
     experiment_name = "apple_reach_final_chained_v2"
     max_iterations = 600
+    save_interval = 25

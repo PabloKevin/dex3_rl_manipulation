@@ -205,16 +205,23 @@ def place_tree_at_pregrasp(
     heading_noise_deg: float = FINAL_START_HEADING_DEG,
     target_clear: float = FINAL_START_TARGET_CLEAR,
     attempts: int = 100,
+    sampler_workers: int = 0,
 ) -> None:
     """mode="reset", in place of apple_tree.place_apple_tree (`tree`: its
     parameters; spindle tree, new tree every reset). Per env: a library
     hand pose; the target apple in front of its palm (surface gap_range from
-    the palm point along the palm normal, +-lateral across it); its stem
-    heading the palm's heading +-heading_noise_deg, clipped to the trees'
-    range; the tree built around it with no other fruit inside the hand
-    (keep-out spheres + KEEP_OUT_MARGIN). The pose is kept in env._pg_q /
-    env._pg_waist for set_pregrasp_joints."""
+    the palm point along the palm normal, +-lateral across it; moved out of
+    the fingers if need be); its stem heading the palm's heading
+    +-heading_noise_deg, clipped to the trees' range; the tree built around
+    it with no other fruit inside the hand (keep-out spheres +
+    KEEP_OUT_MARGIN). The pose is kept in env._pg_q / env._pg_waist for
+    set_pregrasp_joints.
+    sampler_workers > 0: the tree sampling (~100 ms each, pure Python) runs
+    in worker processes, and each environment's NEXT start is chosen and its
+    tree requested right after this one is taken, so a reset normally finds
+    it finished (see tree_sampler.py)."""
     from . import apple_tree as at
+    from .tree_sampler import make_spindle_job
 
     lib = _library(env, library)
     M = len(lib["q"])
@@ -223,27 +230,72 @@ def place_tree_at_pregrasp(
     rad_keep = lib["keep_rad"] + KEEP_OUT_MARGIN
     if not hasattr(env, "_forced_seed"):
         env._forced_seed = {}
-    for i in ids:
+    pool = None
+    if sampler_workers > 0:
+        pool = at.get_sampler_pool(env, sampler_workers, tree["seed_envelope"], tree["member_envelope"],
+                                   tree["workspace_map"])
+        if not hasattr(env, "_pg_next"):
+            env._pg_next = {}
+    rng = random.Random(random.getrandbits(32))
+
+    def choose(i):
+        """(library index, forced-target dict) for env i, or None."""
+        r = float(env._apple_radius[i])
+        k = random.randrange(M)
+        p, n = lib["palm_ref"][k].astype(float), lib["palm_normal"][k].astype(float)
+        pts = lib["keep_pts"][k].astype(float)
+        apple = sample_target_in_front(p, n, pts, lib["keep_rad"], r, gap_range, lateral, target_clear)
+        if apple is None:
+            return None
+        h_palm = math.atan2(n[1], n[0])
+        heading = max(-lim, min(lim, h_palm + math.radians(random.uniform(-heading_noise_deg, heading_noise_deg))))
+        return k, {"apple": apple, "heading": heading, "pts": pts, "rad": rad_keep}
+
+    def prepare(i):
+        """A start with its tree requested from the pool: {"k", "fut"}."""
         r = float(env._apple_radius[i])
         for _ in range(attempts):
-            k = random.randrange(M)
-            p, n = lib["palm_ref"][k].astype(float), lib["palm_normal"][k].astype(float)
-            pts = lib["keep_pts"][k].astype(float)
-            apple = sample_target_in_front(p, n, pts, lib["keep_rad"], r, gap_range, lateral, target_clear)
-            if apple is None:
-                continue
-            h_palm = math.atan2(n[1], n[0])
-            heading = max(-lim, min(lim, h_palm + math.radians(random.uniform(-heading_noise_deg, heading_noise_deg))))
-            env._forced_seed[i] = {"apple": apple, "heading": heading, "pts": pts, "rad": rad_keep}
-            try:
-                at.place_apple_tree(env, torch.tensor([i], device=env.device), **tree)
-            except RuntimeError:
-                continue                      # no tree fits around this one: another pose
-            env._pg_q[i] = torch.tensor(lib["q"][k], device=env.device)
-            env._pg_waist[i] = float(lib["waist"][k])
-            break
+            c = choose(i)
+            if c is not None:
+                k, f = c
+                job = make_spindle_job(rng, tree["n_apples"], r, tree["standoff"], tree["stem_heading_max_deg"],
+                                       tree["stem_length_range"], tree["cluster_sizes"], tree["cluster_weights"],
+                                       tree["cluster_gap"], tree["sep_min"], tree["spindle"],
+                                       seed=(f["apple"], f["heading"]), keep_out=(f["pts"], f["rad"]))
+                return {"k": k, "fut": pool.submit(job)}
+        raise RuntimeError(f"place_tree_at_pregrasp: env {i}: no target spot in {attempts} attempts")
+
+    for i in ids:
+        if pool is not None:
+            nxt = env._pg_next.pop(i, None) or prepare(i)
+            for _ in range(attempts):
+                try:
+                    tree_i = nxt["fut"].result()
+                except RuntimeError:                  # no tree fits around this one (or the pool is gone)
+                    nxt = prepare(i)
+                    continue
+                at.place_apple_tree(env, torch.tensor([i], device=env.device), trees={i: tree_i},
+                                    target_spot0=True, **tree)
+                k = nxt["k"]
+                break
+            else:
+                raise RuntimeError(f"place_tree_at_pregrasp: env {i}: no start in {attempts} attempts")
+            env._pg_next[i] = prepare(i)              # the next reset's start, meanwhile
         else:
-            raise RuntimeError(f"place_tree_at_pregrasp: env {i}: no start in {attempts} attempts")
+            for _ in range(attempts):
+                c = choose(i)
+                if c is None:
+                    continue
+                k, env._forced_seed[i] = c
+                try:
+                    at.place_apple_tree(env, torch.tensor([i], device=env.device), **tree)
+                except RuntimeError:
+                    continue                          # no tree fits around this one: another pose
+                break
+            else:
+                raise RuntimeError(f"place_tree_at_pregrasp: env {i}: no start in {attempts} attempts")
+        env._pg_q[i] = torch.tensor(lib["q"][k], device=env.device)
+        env._pg_waist[i] = float(lib["waist"][k])
 
 
 def set_pregrasp_joints(env: "ManagerBasedRLEnv", env_ids: torch.Tensor) -> None:

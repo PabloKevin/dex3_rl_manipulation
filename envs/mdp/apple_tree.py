@@ -67,247 +67,11 @@ def apple_entity(k: int) -> str:
 def apple_prim(k: int) -> str:
     return "Apple" if k == 0 else f"Apple_{k}"
 
-
-# ─────────────────────────────────────────────
-#  Tree sampling (pure numpy, env-local frame)
-# ─────────────────────────────────────────────
-
-class Envelope:
-    """Shoulder-relative reach envelope + safe-workspace map, as
-    domain_randomization.randomize_tree_and_apple samples it."""
-
-    def __init__(self, shoulder, reach_min, reach_max, az_center_deg, az_span_deg, dz_range,
-                 min_forward=0.0, min_horizontal=0.0, workspace=None):
-        self.sh = np.asarray(shoulder, float)
-        self.rmin, self.rmax = reach_min, reach_max
-        self.az = (math.radians(az_center_deg - az_span_deg / 2), math.radians(az_center_deg + az_span_deg / 2))
-        self.dz, self.fwd, self.hor = dz_range, min_forward, min_horizontal
-        self.ws = workspace
-
-    def feasible(self, rel) -> bool:
-        if self.ws is None:
-            return True
-        xe, ye, ze, feas = self.ws
-        idx = [int(math.floor((v - e[0]) / (e[1] - e[0]))) for v, e in zip(rel, (xe, ye, ze))]
-        return all(0 <= i < n for i, n in zip(idx, feas.shape)) and bool(feas[tuple(idx)])
-
-    def contains(self, target, slack=0.0) -> bool:
-        rel = target - self.sh
-        r, rxy = np.linalg.norm(rel), np.linalg.norm(rel[:2])
-        az = math.atan2(rel[1], rel[0])
-        return (self.rmin - slack <= r <= self.rmax + slack and self.dz[0] - slack <= rel[2] <= self.dz[1] + slack
-                and self.az[0] - slack / 0.3 <= az <= self.az[1] + slack / 0.3
-                and rel[0] >= self.fwd - slack and rxy >= self.hor - slack and self.feasible(rel))
-
-    def sample_target(self, rng: random.Random):
-        for _ in range(500):
-            dz = rng.uniform(*self.dz)
-            rxy_max = math.sqrt(max(self.rmax ** 2 - dz ** 2, 1e-4))
-            rxy_min = max(math.sqrt(max(self.rmin ** 2 - dz ** 2, 0.0)), self.hor)
-            if rxy_min >= rxy_max:
-                continue
-            rxy, az = rng.uniform(rxy_min, rxy_max), rng.uniform(*self.az)
-            rel = np.array([rxy * math.cos(az), rxy * math.sin(az), dz])
-            if rel[0] >= self.fwd and self.feasible(rel):
-                return self.sh + rel
-        raise RuntimeError("Envelope.sample_target: envelope unsatisfiable")
+from .tree_sampler import (  # noqa: E402,F401
+    Envelope, SamplerPool, harvest_order, make_spindle_job, sample_spindle_tree, sample_tree, trunk_axis,
+)
 
 
-def sample_tree(rng: random.Random, n: int, radius: float, seed_env: Envelope, member_env: Envelope,
-                standoff: float, trunk_dist: float, trunk_jitter: float, heading_max_deg: float,
-                stem_len_range: tuple[float, float], cluster_sizes, cluster_weights,
-                cluster_gap: tuple[float, float], sep_min: float, tries: int = 200) -> dict:
-    """One tree: n apple centres in clusters, every one reachable (its grasp
-    target -- standoff beyond the apple surface, opposite its stem -- inside
-    the envelope), stems pointing at the trunk within heading_max_deg of +x.
-
-    Cluster seeds come from seed_env (the grasp task's placement envelope),
-    the other members of a cluster from member_env (the reach policy's
-    wider training envelope): they sit wherever their seed's neighbourhood
-    puts them."""
-    sh = seed_env.sh
-    az_c = 0.5 * sum(seed_env.az)
-    for _ in range(tries):
-        trunk = sh[:2] + trunk_dist * np.array([math.cos(az_c), math.sin(az_c)]) \
-            + np.array([rng.uniform(-trunk_jitter, trunk_jitter), rng.uniform(-trunk_jitter, trunk_jitter)])
-        lim = math.radians(heading_max_deg)
-
-        def heading_from(p):
-            h = math.atan2(trunk[1] - p[1], trunk[0] - p[0])
-            return max(-lim, min(lim, h))
-
-        def apple_from_target(t):
-            h = heading_from(t)
-            d = np.array([math.cos(h), math.sin(h), 0.0])
-            return t + d * (radius + standoff), d
-
-        apples, dirs, cluster = [], [], []
-        ok = True
-        c = 0
-        while len(apples) < n and ok:
-            size = min(rng.choices(cluster_sizes, weights=cluster_weights)[0], n - len(apples))
-            placed = False
-            for _ in range(60):                                   # the seed
-                t = seed_env.sample_target(rng)
-                a, d = apple_from_target(t)
-                if all(np.linalg.norm(a - b) >= 2 * radius + sep_min for b in apples):
-                    placed = True
-                    break
-            if not placed:
-                ok = False
-                break
-            members, mdirs = [a], [d]
-            for _ in range(size - 1):                             # the rest of the cluster, around it
-                placed = False
-                for _ in range(80):
-                    anchor = members[rng.randrange(len(members))]
-                    u = np.array([rng.uniform(-1, 1), rng.uniform(-1, 1), rng.uniform(-1, 1)])
-                    u -= 0.7 * np.dot(u, mdirs[0]) * mdirs[0]     # mostly beside, not in front/behind
-                    if np.linalg.norm(u) < 1e-3:
-                        continue
-                    u /= np.linalg.norm(u)
-                    p = anchor + u * (2 * radius + rng.uniform(*cluster_gap))
-                    h = heading_from(p)
-                    dp = np.array([math.cos(h), math.sin(h), 0.0])
-                    t = p - dp * (radius + standoff)
-                    if not member_env.contains(t, slack=0.01):
-                        continue
-                    if any(np.linalg.norm(p - m) < 2 * radius + cluster_gap[0] - 1e-6 for m in members):
-                        continue
-                    if any(np.linalg.norm(p - b) < 2 * radius + sep_min for b in apples):
-                        continue
-                    members.append(p); mdirs.append(dp)
-                    placed = True
-                    break
-                if not placed:
-                    break                                         # a smaller cluster than drawn
-            apples += members; dirs += mdirs; cluster += [c] * len(members)
-            c += 1
-        if not ok or len(apples) < n:
-            continue
-        apples, dirs = np.array(apples), np.array(dirs)
-        stem_len = np.array([rng.uniform(*stem_len_range) for _ in range(n)])
-        tips = apples + dirs * (radius + stem_len)[:, None]
-        return {"apple": apples, "stem_dir": dirs, "stem_len": stem_len, "tip": tips,
-                "cluster": np.array(cluster), "trunk": trunk}
-    raise RuntimeError(f"sample_tree: could not place {n} apples in {tries} trees -- too many for the envelope?")
-
-
-def trunk_axis(tree: dict, z: float) -> np.ndarray:
-    """Trunk axis point (env-local) at height z: vertical from tree["trunk"]
-    (base x, y) up to tree["kink"], straight along tree["lean"] (dx/dz,
-    dy/dz) above it. Trees without a kink are plain vertical trunks."""
-    k = tree.get("kink", float("inf"))
-    lean = tree.get("lean", np.zeros(2))
-    xy = np.asarray(tree["trunk"], float) + lean * max(z - k, 0.0)
-    return np.array([xy[0], xy[1], z])
-
-
-def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Envelope, member_env: Envelope,
-                        standoff: float, heading_max_deg: float, stem_len_range: tuple[float, float],
-                        cluster_sizes, cluster_weights, cluster_gap: tuple[float, float], sep_min: float,
-                        spindle: dict, tries: int = 300, seed: tuple | None = None,
-                        keep_out: tuple | None = None) -> dict:
-    """Tall-spindle tree: ONE thin trunk, vertical up to a kink (spindle
-    ["kink_range"], m), then straight, leaning spindle["lean_deg"] in a
-    random direction. Every apple hangs off it on a short branch
-    (spindle["branch_range"]) plus its stem, on the side facing the aisle:
-    the stem (apple -> trunk) points into the row, within heading_max_deg of
-    +x, as in the fruiting-wall tree. Clusters (sizes / gap / sep_min as in
-    sample_tree) stack along the trunk. Every apple's grasp target lies in
-    the envelope, as in sample_tree.
-
-    seed: (apple centre [3], stem heading [rad]) -- apple 0 hangs exactly
-    there instead of being sampled from seed_env (the final-approach task
-    builds the tree around a fruit placed in front of a given hand pose).
-    keep_out: (points [P, 3], radii [P]) -- no OTHER apple within its radius
-    + radii of these points (the hand and forearm at that start pose).
-
-    Same dict as sample_tree, plus "kink" (z) and "lean" (dx/dz, dy/dz)."""
-    lim = math.radians(heading_max_deg)
-    tr = spindle["trunk_radius"]
-
-    def clear(a):
-        if keep_out is None:
-            return True
-        pts, rad = keep_out
-        return bool(np.all(np.linalg.norm(pts - a, axis=1) >= radius + rad))
-
-    def hang(axis_pt, h, stem_len, branch):
-        """apple centre, stem direction, tip for an apple on the trunk."""
-        d = np.array([math.cos(h), math.sin(h), 0.0])
-        a = axis_pt - d * (tr + branch + stem_len + radius)
-        return a, d
-
-    for _ in range(tries):
-        if seed is None:
-            t0 = seed_env.sample_target(rng)
-            h0 = rng.uniform(-lim, lim)
-        else:
-            h0 = float(seed[1])
-        L0, b0 = rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
-        d0 = np.array([math.cos(h0), math.sin(h0), 0.0])
-        a0 = t0 + d0 * (radius + standoff) if seed is None else np.asarray(seed[0], float)
-        p0 = a0 + d0 * (radius + L0 + b0 + tr)                 # trunk axis at the seed's height
-        kink = rng.uniform(*spindle["kink_range"])
-        alpha, psi = math.radians(rng.uniform(*spindle["lean_deg"])), rng.uniform(0.0, 2 * math.pi)
-        lean = math.tan(alpha) * np.array([math.cos(psi), math.sin(psi)])
-        tree = {"trunk": p0[:2] - lean * max(p0[2] - kink, 0.0), "kink": kink, "lean": lean}
-        z_lo = seed_env.sh[2] + seed_env.dz[0] - 0.02
-        z_hi = seed_env.sh[2] + seed_env.dz[1] + 0.02
-
-        apples, dirs, stems, cluster = [a0], [d0], [L0], [0]
-        size = min(rng.choices(cluster_sizes, weights=cluster_weights)[0], n)
-        c, ok = 0, True
-        while len(apples) < n and ok:
-            if c > 0:                                          # a new cluster's seed, anywhere on the trunk
-                size = min(rng.choices(cluster_sizes, weights=cluster_weights)[0], n - len(apples))
-                for _ in range(80):
-                    h, L, b = rng.uniform(-lim, lim), rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
-                    a, d = hang(trunk_axis(tree, rng.uniform(z_lo, z_hi)), h, L, b)
-                    if seed_env.contains(a - d * (radius + standoff)) and clear(a) and \
-                            all(np.linalg.norm(a - q) >= 2 * radius + sep_min for q in apples):
-                        apples.append(a); dirs.append(d); stems.append(L); cluster.append(c)
-                        break
-                else:
-                    ok = False
-                    break
-            members = [len(apples) - 1]
-            for _ in range(size - 1):                          # the rest of the cluster, touching it
-                for _ in range(80):
-                    anchor = apples[members[rng.randrange(len(members))]]
-                    z = anchor[2] + rng.uniform(-1.0, 1.0) * (2 * radius + cluster_gap[1])
-                    h, L, b = rng.uniform(-lim, lim), rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
-                    a, d = hang(trunk_axis(tree, z), h, L, b)
-                    gaps_in = [np.linalg.norm(a - apples[m]) - 2 * radius for m in members]
-                    if not (cluster_gap[0] - 1e-6 <= min(gaps_in) <= cluster_gap[1] + 0.01):
-                        continue
-                    if any(np.linalg.norm(a - q) < 2 * radius + sep_min
-                           for j, q in enumerate(apples) if cluster[j] != c):
-                        continue
-                    if not member_env.contains(a - d * (radius + standoff), slack=0.01) or not clear(a):
-                        continue
-                    apples.append(a); dirs.append(d); stems.append(L); cluster.append(c); members.append(len(apples) - 1)
-                    break
-                else:
-                    break                                      # a smaller cluster than drawn
-            c += 1
-        if not ok or len(apples) < n:
-            continue
-        apples, dirs, stems = np.array(apples), np.array(dirs), np.array(stems)
-        tree.update({"apple": apples, "stem_dir": dirs, "stem_len": stems,
-                     "tip": apples + dirs * (radius + stems)[:, None], "cluster": np.array(cluster)})
-        return tree
-    raise RuntimeError(f"sample_spindle_tree: could not place {n} apples on one trunk in {tries} trees")
-
-
-def harvest_order(tree: dict, mode: str, rng: random.Random) -> np.ndarray:
-    n = len(tree["apple"])
-    if mode == "random":
-        o = list(range(n)); rng.shuffle(o)
-        return np.array(o)
-    z = tree["apple"][:, 2]
-    return np.argsort(-z if mode == "top_down" else z, kind="stable")      # ("clearance" starts bottom-up)
 
 
 # ─────────────────────────────────────────────
@@ -526,6 +290,20 @@ def next_apple_requested(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return env._tree.next_request.clone()
 
 
+def get_sampler_pool(env: "ManagerBasedRLEnv", workers: int, seed_envelope: dict, member_envelope: dict,
+                     workspace_map: str | None, shoulder_body_name: str = "right_shoulder_pitch_link") -> SamplerPool:
+    """The environment's tree-sampling worker pool (tree_sampler.SamplerPool),
+    started on first use with the same envelopes place_apple_tree builds."""
+    pool = getattr(env, "_sampler_pool", None)
+    if pool is None:
+        robot = env.scene["robot"]
+        sh = (robot.data.body_pos_w[0, robot.data.body_names.index(shoulder_body_name)]
+              - env.scene.env_origins[0]).cpu().numpy()
+        pool = env._sampler_pool = SamplerPool(workers, sh, seed_envelope, member_envelope, workspace_map)
+        env._tree_prefetch = {}
+    return pool
+
+
 def place_apple_tree(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor,
@@ -550,6 +328,9 @@ def place_apple_tree(
     trunk_radius: float = 0.06,
     shoulder_body_name: str = "right_shoulder_pitch_link",
     spindle: dict | None = None,
+    sampler_workers: int = 0,
+    trees: dict | None = None,
+    target_spot0: bool = False,
 ) -> None:
     """mode="reset", in place of randomize_tree_and_apple. Per env: a NEW
     tree when env._tree.new_tree is set (the first reset, and whenever the
@@ -566,7 +347,13 @@ def place_apple_tree(
     trunk, vertical then leaning, short branches); keys kink_range,
     lean_deg, branch_range, trunk_radius, and top_prim (the upper trunk
     segment's prim, a 1 m Z cylinder). The capsule list then ends with the
-    two trunk segments (other trees: the trunk, then a dummy far away)."""
+    two trunk segments (other trees: the trunk, then a dummy far away).
+    sampler_workers > 0 (spindle trees): the trees are sampled by that many
+    worker PROCESSES (tree_sampler.SamplerPool), each environment's NEXT tree
+    already in flight while the current one is in use, so a reset does not
+    wait for the sampler. 0: sampled here, as before.
+    trees: {env index: tree dict} already sampled (pregrasp.place_tree_at_
+    pregrasp); target_spot0: with those, apple 0 of the tree is the target."""
     import omni.usd
 
     stage = omni.usd.get_context().get_stage()
@@ -616,7 +403,27 @@ def place_apple_tree(
         elif new_tree_each_reset or bool(T.new_tree[i]) or T.trees[i] is None:
             # a target forced in front of a given hand pose (pregrasp.place_tree_at_pregrasp)
             forced = getattr(env, "_forced_seed", {}).pop(i, None)
-            if spindle is not None:
+            pre = None if trees is None else trees.pop(i, None)
+            if pre is not None:
+                tree = pre
+                forced = True if target_spot0 else None
+            elif spindle is not None and sampler_workers > 0 and forced is None:
+                pool = get_sampler_pool(env, sampler_workers, seed_envelope, member_envelope, workspace_map,
+                                        shoulder_body_name)
+
+                def _job():
+                    return make_spindle_job(rng, n, r, standoff, stem_heading_max_deg, stem_length_range,
+                                            cluster_sizes, cluster_weights, cluster_gap, sep_min, spindle)
+
+                fut = env._tree_prefetch.pop(i, None) or pool.submit(_job())
+                try:
+                    tree = fut.result()
+                except RuntimeError:             # no tree fits, or the pool is gone: here, as before
+                    tree = sample_spindle_tree(rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg,
+                                               stem_length_range, cluster_sizes, cluster_weights, cluster_gap,
+                                               sep_min, spindle)
+                env._tree_prefetch[i] = pool.submit(_job())      # the NEXT reset's tree, meanwhile
+            elif spindle is not None:
                 tree = sample_spindle_tree(rng, n, r, seed_env, member_env, standoff, stem_heading_max_deg,
                                            stem_length_range, cluster_sizes, cluster_weights, cluster_gap,
                                            sep_min, spindle,
