@@ -34,6 +34,7 @@ from isaaclab.utils import configclass
 from .apple_grasp_env_cfg import PALM_LOCAL_OFFSET
 from .apple_grasp_spindle_env_cfg import AppleGraspSpindleV3EnvCfg
 from .apple_grasp_tree_train_env_cfg import TREE_GRASP_WINDOW_S
+from .apple_reach_twostage_env_cfg import SAMPLER_WORKERS
 from .apple_reach_single_env_cfg import (
     APPLE_MEAS_NOISE,
     HAND_CLOSED,
@@ -70,6 +71,9 @@ class AppleGraspSingleEnvCfg(AppleGraspSpindleV3EnvCfg):
         hand.reach_hold_schedule = (dict(HAND_OPEN), dict(HAND_CLOSED))
 
         ev = self.events
+        # trees built in worker processes ahead of the resets, as in the reach
+        # ($TREE_SAMPLER_WORKERS; inline, ~100 ms each, stalls large runs)
+        ev.randomize_tree.params.update(sampler_workers=SAMPLER_WORKERS)
         ev.approach_origin = EventTerm(func=sr.set_approach_origin, mode="startup", params={"body": "pelvis"})
         # after the tree placement (declaration order: appended last)
         ev.apple_measurement_reset = EventTerm(func=sr.reset_apple_measurement, mode="reset",
