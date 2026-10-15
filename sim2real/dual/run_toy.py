@@ -216,6 +216,19 @@ def main():
         rest.remove("--verbose")
     if not VERBOSE and not any(x in ("-h", "--help") for x in rest):
         sys.stdout = _Tee()
+    # a raw rsl_rl checkpoint (model_N.pt) -> its TorchScript export (exported/policy_N.pt)
+    for i, x in enumerate(rest):
+        if x == "--policy" and i + 1 < len(rest):
+            import re as _re
+            m = _re.match(r"model_(\d+)\.pt$", os.path.basename(rest[i + 1]))
+            if m:
+                exp = os.path.join(os.path.dirname(rest[i + 1]), "exported", f"policy_{m.group(1)}.pt")
+                if os.path.exists(exp):
+                    sys.__stdout__.write(f"  --policy {rest[i + 1]} is a training checkpoint: using its export {exp}\n")
+                    rest[i + 1] = exp
+                else:
+                    sys.exit(f"{rest[i + 1]} is a training checkpoint, not a TorchScript export, and {exp} does not "
+                             f"exist: export it (scripts/export_policy_jit.py) or pass the exported .pt")
     T.PickerIO = DualIO
     T.Watch = LightWatch
     if kind == "single":

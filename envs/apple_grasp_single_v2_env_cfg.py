@@ -26,7 +26,9 @@ perceived point that is itself off by up to 2.5 cm (envs/mdp/probe_grasp.py):
     apple_left_hand), and the arm action is 0.15 rad / unit (v1 0.05:
     ~6 cm of travel), so the grasp can finish the approach;
   - time to probe: stem release 3.5-4.5 s after the hand-off (was 2.0-2.5),
-    grasp window 8 s (was 6);
+    grasp window 8 s (was 6); and a release curriculum: no release at all
+    for the first 300 iterations, the final times by 1000 (the first run
+    without it: 91-92% apple_fell_from_grip at the release, nothing learned);
   - rewards: + pocket progress, + contact depth (palm > base > tip),
     - fruit pushed off its spot, - stem strained, - stem broken early,
     - fruit lost, - fruit damaged, - trunk too close / hit; the
@@ -44,15 +46,28 @@ from isaaclab.managers import EventTermCfg as EventTerm, ObservationTermCfg as O
 from isaaclab.managers import SceneEntityCfg, TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
-from .apple_grasp_grasp_env_cfg import GRASP_CENTER_LOCAL
+from .apple_grasp_grasp_env_cfg import GRASP_CENTER_LOCAL, GRASP_PPO_STEPS_PER_ITER
 from .apple_grasp_single_env_cfg import SINGLE_HANDOFF_WATCHDOG_S, AppleGraspSingleEnvCfg
 from .apple_grasp_tree_env_cfg import HandOnlyObservationsCfg, TREE_STEM_PARAMS
 from .mdp import probe_grasp as pg
 
 #: grasp-phase window after the hand-off (v1: 6 s)
 SINGLE_V2_GRASP_WINDOW_S = 8.0
-#: stem release, s after the hand-off (v1: 2.0-2.5)
+#: stem release, s after the hand-off, once the curriculum is done (v1: 2.0-2.5)
 SINGLE_V2_RELEASE_S = (3.5, 4.5)
+#: release curriculum, PPO iterations: before the first, the stem never lets
+#: go (release time past the window: the fruit only falls if the hand breaks
+#: the stem); then the release time shrinks linearly to SINGLE_V2_RELEASE_S
+#: by the second. Without it (first run, 2026-10-15): 91-92% of episodes
+#: ended in apple_fell_from_grip right at the release, pocket_progress ~0 --
+#: the fruit fell before the policy had learned to reach it, as in
+#: AppleGrasp-v1's history (apple_grasp_grasp_env_cfg, "fixed 1-2 s deadline
+#: from iteration 0 ... nothing learned"). Counted from the start of each
+#: training PROCESS (env.common_step_counter): a resumed run starts it again.
+SINGLE_V2_RELEASE_CURRICULUM = (300, 1000)
+#: twist / pull load after the release ramps in over these iterations (v1:
+#: 0-300, i.e. before any fruit was released here); releases start ~it 430
+SINGLE_V2_LOAD_CURRICULUM = (400, 1000)
 #: the branch the fruit hangs from: softer than harvest.StemParams (lateral
 #: 100-300 N/m, bend 0.6-1.0), so a push moves the fruit. Guesses.
 SINGLE_V2_STEM_PARAMS = {**TREE_STEM_PARAMS, "k_lateral": (40.0, 150.0), "k_bend": (0.3, 0.7)}
@@ -101,8 +116,14 @@ class AppleGraspSingleV2EnvCfg(AppleGraspSingleEnvCfg):
 
         ev = self.events
         ev.randomize_tree.params["stem_params"] = dict(SINGLE_V2_STEM_PARAMS)
-        ev.reset_reach_grasp_phase.params.update(stem_release_time_range=SINGLE_V2_RELEASE_S,
-                                                 stem_release_schedule=None)
+        it0, it1 = SINGLE_V2_RELEASE_CURRICULUM
+        ev.reset_reach_grasp_phase.params.update(
+            stem_release_time_range=None,
+            # (start_s, end_s, start_step, end_step, jitter_s): grasp_autoplay.reset_reach_grasp_phase
+            stem_release_schedule=(SINGLE_V2_GRASP_WINDOW_S + 1.0, SINGLE_V2_RELEASE_S[0],
+                                   it0 * GRASP_PPO_STEPS_PER_ITER, it1 * GRASP_PPO_STEPS_PER_ITER,
+                                   SINGLE_V2_RELEASE_S[1] - SINGLE_V2_RELEASE_S[0]))
+        ev.release_stem_and_load.params["curriculum"] = SINGLE_V2_LOAD_CURRICULUM
         # the realism model owns the gain now
         ev.randomize_tactile_gain.params["gain_range"] = (1.0, 1.0)
         ev.tactile_realism = EventTerm(func=pg.reset_tactile_realism, mode="reset", params=dict(TACTILE_REALISM))
