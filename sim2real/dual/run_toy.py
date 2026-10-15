@@ -35,7 +35,7 @@ SIM2REAL = os.path.dirname(HERE)
 sys.path[:0] = [HERE, SIM2REAL]
 import toy_reach as T  # noqa: E402
 from brief_log import BriefLog  # noqa: E402
-from dual_io import DualIO  # noqa: E402
+from dual_io import V20_HOLD_KD, V20_HOLD_KP, DualIO  # noqa: E402
 from light_watch import LightWatch  # noqa: E402
 
 R = T.R
@@ -43,6 +43,43 @@ C_CYN, C_OFF, C_YEL, C_RED = T.C_CYN, T.C_OFF, T.C_YEL, T.C_RED
 STRICT = False
 VERBOSE = False
 CLOSER_CM = 0.0
+#: s of the stiffness ramp kp 100 -> v20's 400 before "bye" (see DualToyMixin.handover_to_hold)
+HANDOVER_S = 1.0
+#: rad: corner rounding of the scripted joint paths (smooth_joint_path_traj)
+CORNER_BLEND_RAD = 0.20
+
+_linear_joint_path_traj = T.joint_path_traj
+
+
+def smooth_joint_path_traj(points, vmax, dt=R.DT, min_s=1.0):
+    """toy_reach.joint_path_traj with the corners rounded. The toy's version runs one quintic
+    along a polyline: at every waypoint each joint's velocity changes at once (the return
+    path, simplify_path's points + HOME, and plan_home's via points) -- a jerk mid-motion.
+    Here each inner corner is replaced by a quadratic Bezier from CORNER_BLEND_RAD before the
+    waypoint to as far after it (at most 45% of either segment), sampled densely, so the
+    direction changes continuously; the timing is the toy's (arc length, quintic, vmax).
+    The body checks run on what this returns (path_check / plan_home call it), so the
+    rounded path is the checked one."""
+    pts = [np.asarray(p, float) for p in points]
+    keep = [pts[0]]
+    for q in pts[1:]:
+        if np.max(np.abs(q - keep[-1])) > 1e-3:
+            keep.append(q)
+    if len(keep) <= 2:
+        return _linear_joint_path_traj(keep, vmax, dt=dt, min_s=min_s)
+    dense = [keep[0]]
+    for i in range(1, len(keep) - 1):
+        a, p, b = keep[i - 1], keep[i], keep[i + 1]
+        l_in, l_out = float(np.linalg.norm(p - a)), float(np.linalg.norm(b - p))
+        d = min(CORNER_BLEND_RAD, 0.45 * l_in, 0.45 * l_out)
+        c0 = p - d * (p - a) / l_in
+        c1 = p + d * (b - p) / l_out
+        dense.append(c0)
+        for u in np.linspace(0.0, 1.0, 13)[1:-1]:
+            dense.append((1 - u) ** 2 * c0 + 2 * (1 - u) * u * p + u ** 2 * c1)
+        dense.append(c1)
+    dense.append(keep[-1])
+    return _linear_joint_path_traj(dense, vmax, dt=dt, min_s=min_s)
 
 
 class _Tee:
@@ -125,6 +162,24 @@ class DualToyMixin:
     def set_phase(self, ph):
         super().set_phase(ph)
         self.brief("STEP", ph.lower().replace("_", " "), fold_s=0.0)
+        if ph.startswith("MOVE_HOME"):
+            self.voice("stand_clear")
+        elif ph == "POLICY":
+            self.voice("reaching")
+
+    # ---- the robot's voice: the picker's recorded clips (apple_picker/audio_msgs_config.json) ----
+    #   stand_clear "please stand clear, I am going to move my arms"   arm to home
+    #   looking_for_fruit "I'm looking for fruit"                      sampling the camera at home
+    #   ask_fruit "what kind of fruit should I harvest today"          READY: click the apple
+    #   found_one "I found one, planning my move"                      apple chosen, waiting for GO
+    #   reaching "reaching for it now"                                 the policy starts
+    #   got_it / missed_it "I missed that one, let me try again"       REACHED / time limit
+    #   need_help "I need help, please check my arm"                   any stop or error
+    #   finish_my_work "I have finished my work here"                  back home, run over
+    def voice(self, key, **kw):
+        speak = getattr(self.io, "speak", None)
+        if speak is not None:
+            speak(key, **kw)
 
     def plan_home(self, q_from, s):
         """The straight path first (one body check, ~10 ms); the toy's full search of ~120
@@ -146,6 +201,7 @@ class DualToyMixin:
         tracks, n = [], 0
         t_start = io.now()
         self.brief("STEP", f"looking at the fruit for {a.detect_s:.0f} s (arm at home)")
+        self.voice("looking_for_fruit")
 
         def sample():
             nonlocal n
@@ -171,6 +227,7 @@ class DualToyMixin:
         click = getattr(io, "click", None)
         if click is None and a.pick is None:
             self.brief.wait("CLICK the apple on the dashboard camera (ENTER here = the nearest one)")
+            self.voice("ask_fruit", max_age_s=0.0)          # READY to choose: never dropped as stale
             try:
                 while getattr(io, "click", None) is None:
                     err = sample()
@@ -205,6 +262,7 @@ class DualToyMixin:
         a.apple_radius = float(np.median(radii)) if radii else a.apple_radius
         self.brief("INFO", f"apple {np.round(means[i], 3).tolist()} (pelvis), r {a.apple_radius * 1000:.0f} mm: {why}")
         self.plan(s, apple_pelvis=means[i])
+        self.voice("found_one")
         return None
 
     # ---- "go closer": the policy is told the apple is further along the approach ----
@@ -240,6 +298,14 @@ class DualToyMixin:
     def policy_loop(self):
         d = self.closer_m()
         out = super().policy_loop()
+        o = str(out[0])
+        if o.startswith("REACHED"):
+            self.voice("got_it")
+        elif o.startswith("TIME LIMIT"):
+            self.voice("missed_it")
+        else:
+            self.voice("need_help", priority=True, max_age_s=0.0)
+            self._said_help = True
         try:
             if getattr(self, "apple_true", None) is not None:
                 fr = self.frames(self.io.read())
@@ -292,12 +358,63 @@ class DualToyMixin:
         finally:
             sys.stdout = out
 
+    # ---- the hand-over to v20's hold, without a jump ----
+    def handover_to_hold(self):
+        """After "bye" v20 holds the LAST target at kp 400 / kd 12; under the stream's kp 100 the
+        arm sags g/100 below that target, so at the switch it snapped UP (seen at home 2026-10-15:
+        hold_latch at q_cmd_last = HOME after every run). Here the stiffness ramps to v20's over
+        HANDOVER_S while the target moves so that the arm stays where it is: at kp k the target is
+        q_sent - g (1/kp0 - 1/k) (= q_sent at k = kp0). v20 then latches the last one at its own
+        gains: no step in target or stiffness."""
+        io = self.io
+        if (not getattr(io, "commands", False) or not getattr(io, "_entered", False) or io.estop_why is not None
+                or self.q_sent is None or not getattr(io, "rl_mine", False)):
+            return
+        kp0, kd0 = float(self.args.kp), float(self.args.kd)
+        s = io.read()
+        g = self.kin.gravity_torque(s.waist_q, s.arm_q, named=T.hand_named(s))
+        q_c = np.asarray(self.q_sent, float).copy()
+        n = max(1, int(HANDOVER_S / R.DT))
+        t_next = io.now()
+        q = q_c
+        for k in range(1, n + 1):
+            if io.estop_why is not None:
+                return
+            f = T.quintic(k / n)
+            kp = kp0 + f * (V20_HOLD_KP - kp0)
+            q = np.clip(q_c - g * (1.0 / kp0 - 1.0 / kp), self.lo, self.hi)
+            io.send_arm(q, kp=kp, kd=kd0 + f * (V20_HOLD_KD - kd0))
+            t_next += R.DT
+            io.sleep_until(t_next)
+        self.q_sent = q
+        self.brief("INFO", f"stiffness handed to the robot's hold (kp {kp0:g} -> {V20_HOLD_KP:g} in {HANDOVER_S:g} s, "
+                           f"target moved {np.max(np.abs(q - q_c)):.3f} rad so the arm stays put)", fold_s=0.0)
+
     # ---- always a log, whatever ends the run ----
     def finish(self, outcome, restore_mode=True):
         if self._finished:
             return self._outcome
         self._finished = True
         self._outcome = outcome
+        o = str(outcome)
+        if o.startswith(("REACHED", "TIME LIMIT", "HOME")):
+            self.voice("finish_my_work", max_age_s=0.0)
+        elif not getattr(self, "_said_help", False):
+            self.voice("need_help", priority=True, max_age_s=0.0)
+        try:
+            self.handover_to_hold()
+        except Exception as e:
+            self.brief("WARN", f"hand-over to the robot's hold failed: {e}")
+        try:
+            if hasattr(self.io, "speech_done"):
+                self.io.leave_rl()                    # the robot holds the arm while the last line plays
+                self.io.speech_done(8.0)              # ... heard before the process ends
+        except Exception:
+            pass
+        n_keep = getattr(self.io, "n_keep", 0)
+        if n_keep:
+            self.brief("INFO", f"keep-alive repeated the last arm target {n_keep}x while the toy computed "
+                               f"(silences > {1000 * 0.06:.0f} ms filled; the daemon holds after 250 ms)", fold_s=0.0)
         out = super().finish(outcome, restore_mode=restore_mode)
         o = str(outcome)
         kind = "DONE" if o.startswith(("REACHED", "HOME", "shadow")) else "END" if o.startswith("TIME LIMIT") else "STOP"
@@ -354,6 +471,7 @@ def main():
                              f"exist: export it (scripts/export_policy_jit.py) or pass the exported .pt")
     T.PickerIO = DualIO
     T.Watch = LightWatch
+    T.joint_path_traj = smooth_joint_path_traj
     if kind == "single":
         import toy_reach_single as S
         S.ToySingle = mix(S.ToySingle)

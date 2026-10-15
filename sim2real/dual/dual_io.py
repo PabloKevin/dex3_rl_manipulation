@@ -33,6 +33,19 @@ GO_TOPIC = "/apple_picker/go"
 SELECT_TOPIC = "/apple_picker/select_fruit"      # the dashboard's click (torso frame), as the picker uses it
 CLOSER_TOPIC = "/apple_picker/reach_closer"      # {"cm": x} from the dashboard
 HB_HZ = 20.0
+#: v20 grabs the arm with its own stiff hold (HOLD_KP 400 at its latch) when no target came for
+#: QREF_STALE_S = 0.25 s; at the switch back to the stream's kp 100 the arm jumps by the sag
+#: difference. Measured 2026-10-15 (session 15-27-04): 300-1474 ms gaps while the toy computed
+#: body-clearance checks (run start, path home after a RELEASE, return start), each followed by
+#: a v20 hold_latch. So the last target is repeated (zero-order hold, exactly what the daemon
+#: plays between messages) whenever the main loop is silent for KEEP_GAP_S ...
+KEEP_GAP_S = 0.06
+#: ... but only this long after the main loop's last own send: a hung toy still loses the arm to
+#: v20's hold, as before
+KEEP_MAX_S = 5.0
+#: arm_mpc_server.py (v20) HOLD_KP / HOLD_KD: the hold it latches after "bye"
+V20_HOLD_KP = 400.0
+V20_HOLD_KD = 12.0
 
 
 class DualIO(T.PickerIO):
@@ -42,6 +55,15 @@ class DualIO(T.PickerIO):
         self.src = f"toy-{os.getpid()}"
         # the picker's own /apple_picker/target_fruit callback (inherited by the toy's node) speaks
         # through `audio`, which the toy never builds: a label message must not kill the ROS thread
+        # The robot's voice: the picker's own player and clips (audio_msgs_config.json, robot speaker).
+        # Shadow stays silent; any failure leaves a silent stand-in.
+        self.audio_ok = False
+        if not shadow and not hasattr(self.node, "audio"):
+            try:
+                self.node._init_audio()
+                self.audio_ok = bool(getattr(self.node.audio, "enabled", False))
+            except Exception as e:
+                print(f"  audio: the picker's player failed ({e}): the toy stays silent")
         if not hasattr(self.node, "audio"):
             self.node.audio = type("NoAudio", (), {"say": lambda *_a, **_k: None,
                                                    "__getattr__": lambda _s, _n: (lambda *_a, **_k: None)})()
@@ -65,6 +87,10 @@ class DualIO(T.PickerIO):
         #: "aim N cm past the apple" from the dashboard (None = not set there)
         self.closer_cm = None
         self.node.create_subscription(self.String, CLOSER_TOPIC, self._on_closer, 10)
+        self._tx_lock = threading.Lock()
+        self._tx_t = self._main_t = 0.0
+        self._tx_last = None                       # the last send_arm arguments (keep-alive repeats them)
+        self.n_keep = 0                            # keep-alive repeats sent (logged by run_toy)
         if not shadow:
             self._ctl = ChannelPublisher(RL_CTL_TOPIC, String_)
             self._ctl.Init()
@@ -72,6 +98,7 @@ class DualIO(T.PickerIO):
             self._rlpub.Init()
             self._rlcmd = LowCmdMsg()
             threading.Thread(target=self._hb_loop, daemon=True, name="rl_hb").start()
+            threading.Thread(target=self._keep_loop, daemon=True, name="rl_keep").start()
 
     # ---------------- the daemon's RL state ----------------
     def _on_rl(self, msg):
@@ -133,6 +160,43 @@ class DualIO(T.PickerIO):
             if self._hb_on:
                 self._ctl_send({"cmd": "hb"})
             time.sleep(1.0 / HB_HZ)
+
+    def speak(self, key, max_age_s=None, priority=False):
+        """One of the picker's clips (audio_msgs_config.json key), queued; never blocks."""
+        if not self.audio_ok or (self.estop_why is not None and not priority):
+            return
+        try:
+            self.node.audio.say(key, priority=priority, max_age_s=max_age_s)
+        except Exception:
+            pass
+
+    def speech_done(self, timeout_s):
+        """Wait until the queue is empty and the clip playing has ended (or timeout_s). Idle
+        must hold for 0.2 s: the worker takes a clip off the queue before it locks to play it."""
+        if not self.audio_ok:
+            return
+        au = self.node.audio
+        t_end = time.monotonic() + timeout_s
+        idle_since = None
+        while time.monotonic() < t_end:
+            with au._q_lock:
+                busy = bool(au._q) or au._play_lock.locked()
+            if busy:
+                idle_since = None
+            elif idle_since is None:
+                idle_since = time.monotonic()
+            elif time.monotonic() - idle_since >= 0.2:
+                return
+            time.sleep(0.05)
+
+    def _keep_loop(self):
+        while True:
+            time.sleep(0.02)
+            now = time.monotonic()
+            if (self._hb_on and self._entered and self.estop_why is None and self._tx_last is not None
+                    and now - self._tx_t > KEEP_GAP_S and now - self._main_t < KEEP_MAX_S):
+                self._write(*self._tx_last)
+                self.n_keep += 1
 
     def _on_estop_topic(self, msg):
         """The dashboard's old /apple_picker/estop: forwarded to the daemon's RL E-STOP."""
@@ -199,28 +263,45 @@ class DualIO(T.PickerIO):
             time.sleep(0.05)
         return False
 
-    def send_arm(self, q, dq=None, waist=None, waist_dq=0.0):
+    def send_arm(self, q, dq=None, waist=None, waist_dq=0.0, kp=None, kd=None):
+        """kp / kd: None = --kp / --kd (the policy's); only the hand-over to v20's hold changes them."""
         if not self.commands or self.estop_why is not None:
             return
-        dq = np.zeros(7) if dq is None else dq
-        c = self._rlcmd.motor_cmd
-        for j, n in enumerate(R.RIGHT_ARM_JOINTS):
-            m = c[R.MOTOR_IDX[n]]
-            m.mode = 1
-            m.q, m.dq, m.tau = float(q[j]), float(dq[j]), 0.0
-            m.kp, m.kd = float(self.args.kp), float(self.args.kd)
-        w = c[R.MOTOR_IDX["waist_yaw_joint"]]
-        if waist is not None:
-            w.mode, w.q, w.dq, w.tau, w.kp, w.kd = 1, float(waist), float(waist_dq), 0.0, 1.0, 0.0
-        else:
-            w.mode, w.kp = 0, 0.0
-        self._rlpub.Write(self._rlcmd)
+        dq = np.zeros(7) if dq is None else np.asarray(dq, float).copy()
+        kp = float(self.args.kp if kp is None else kp)
+        kd = float(self.args.kd if kd is None else kd)
+        self._main_t = time.monotonic()
+        self._write(np.asarray(q, float).copy(), dq, waist, waist_dq, kp, kd)
+
+    def _write(self, q, dq, waist, waist_dq, kp, kd):
+        with self._tx_lock:
+            if not self.commands or self.estop_why is not None:
+                return
+            c = self._rlcmd.motor_cmd
+            for j, n in enumerate(R.RIGHT_ARM_JOINTS):
+                m = c[R.MOTOR_IDX[n]]
+                m.mode = 1
+                m.q, m.dq, m.tau = float(q[j]), float(dq[j]), 0.0
+                m.kp, m.kd = kp, kd
+            w = c[R.MOTOR_IDX["waist_yaw_joint"]]
+            if waist is not None:
+                w.mode, w.q, w.dq, w.tau, w.kp, w.kd = 1, float(waist), float(waist_dq), 0.0, 1.0, 0.0
+            else:
+                w.mode, w.kp = 0, 0.0
+            self._rlpub.Write(self._rlcmd)
+            self._tx_last = (q, dq, waist, waist_dq, kp, kd)
+            self._tx_t = time.monotonic()
         self.streaming = True
 
-    def close(self, restore_mode=True):
+    def leave_rl(self):
+        """Hand the arm back to v20 (ORIGINAL). Idempotent: close() calls it too."""
         self._hb_on = False
-        if self.commands and self._entered and self.estop_why is None:
+        if self.commands and self._entered and self.estop_why is None and not getattr(self, "_left", False):
+            self._left = True
             for _ in range(3):                          # one lost packet must not leave RL mode
                 self._ctl_send({"cmd": "bye"})
                 time.sleep(0.05)
+
+    def close(self, restore_mode=True):
+        self.leave_rl()
         super().close(restore_mode=False)
