@@ -30,6 +30,8 @@ RL_CMD_TOPIC = "rt/arm_rl/cmd"
 RL_CTL_TOPIC = "rt/arm_rl/ctl"
 RL_STATE_TOPIC = "rt/arm_rl/state"
 GO_TOPIC = "/apple_picker/go"
+SELECT_TOPIC = "/apple_picker/select_fruit"      # the dashboard's click (torso frame), as the picker uses it
+CLOSER_TOPIC = "/apple_picker/reach_closer"      # {"cm": x} from the dashboard
 HB_HZ = 20.0
 
 
@@ -38,6 +40,11 @@ class DualIO(T.PickerIO):
         super().__init__(args, shadow)
         self.name = ("dual loopback" if self.loopback else "dual") + (" shadow" if shadow else "")
         self.src = f"toy-{os.getpid()}"
+        # the picker's own /apple_picker/target_fruit callback (inherited by the toy's node) speaks
+        # through `audio`, which the toy never builds: a label message must not kill the ROS thread
+        if not hasattr(self.node, "audio"):
+            self.node.audio = type("NoAudio", (), {"say": lambda *_a, **_k: None,
+                                                   "__getattr__": lambda _s, _n: (lambda *_a, **_k: None)})()
         self.brief = None                          # set by run_toy (BriefLog)
         from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_ as LowCmdMsg
@@ -52,6 +59,12 @@ class DualIO(T.PickerIO):
         self._estop_seen = False
         self.go_t = None
         self.node.create_subscription(self.String, GO_TOPIC, lambda m: setattr(self, "go_t", time.monotonic()), 10)
+        #: the dashboard's click on a fruit: (torso-frame position, monotonic time) or None
+        self.click = None
+        self.node.create_subscription(self.String, SELECT_TOPIC, self._on_select, 10)
+        #: "aim N cm past the apple" from the dashboard (None = not set there)
+        self.closer_cm = None
+        self.node.create_subscription(self.String, CLOSER_TOPIC, self._on_closer, 10)
         if not shadow:
             self._ctl = ChannelPublisher(RL_CTL_TOPIC, String_)
             self._ctl.Init()
@@ -73,6 +86,24 @@ class DualIO(T.PickerIO):
             self._on_estop(f"{e.get('why') or d.get('mode')}", str(e.get("src") or "robot"))
         if self.brief is not None and d.get("refused") and d.get("reply_to") == self.src:
             self.brief("WARN", f"RL mode refused by the robot: {d['refused']}")
+
+    def _on_select(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except Exception:
+            return
+        if d.get("clear"):
+            self.click = None
+        elif all(k in d for k in ("x", "y", "z")):
+            self.click = (np.array([float(d["x"]), float(d["y"]), float(d["z"])]), time.monotonic())
+            if self.brief is not None:
+                self.brief("INFO", f"apple clicked on the dashboard at {np.round(self.click[0], 3).tolist()} (torso)")
+
+    def _on_closer(self, msg):
+        try:
+            self.closer_cm = float(json.loads(msg.data)["cm"])
+        except Exception:
+            pass
 
     @property
     def rl_mine(self) -> bool:

@@ -13,6 +13,8 @@ imported unchanged; three of their pieces are swapped here:
 Own options (everything else goes to the toy):
   --verbose           the toy's full output in this terminal (default: only the short log here,
                       the full output in <run>/toy_full.log)
+  --closer_cm X       tell the policy the apple is X cm further along the approach, so it ends
+                      X cm closer to the real one (the dashboard's 'closer' field overrides it)
   --strict_envelope   refuse a target outside the policy's training envelope (default: run it,
                       with a warning -- an imprecise reach beats no motion)
 The old toys (sim2real/toy_*.py) still talk to v20 directly and keep working.
@@ -40,6 +42,7 @@ R = T.R
 C_CYN, C_OFF, C_YEL, C_RED = T.C_CYN, T.C_OFF, T.C_YEL, T.C_RED
 STRICT = False
 VERBOSE = False
+CLOSER_CM = 0.0
 
 
 class _Tee:
@@ -93,11 +96,13 @@ def _fast_dds(args):
 class DualToyMixin:
     def __init__(self, args):
         _fast_dds(args)
+        args.closer_cm = CLOSER_CM
         if not STRICT and not args.force:
             args.force = True
             self._envelope_note = True
         self._finished = False
         self._outcome = None
+        self._closer_set = False
         super().__init__(args)
         node = getattr(self.io, "node", None)
         self.brief = BriefLog(os.path.join(self.log_dir, "brief.log"), node=node, echo=not VERBOSE)
@@ -133,6 +138,118 @@ class DualToyMixin:
         finally:
             self.brief.wait(None)
 
+    # ---- which apple: the one clicked on the dashboard ----
+    def plan_from_detections(self):
+        """Sample the tracked fruit at home (as the toys do), then take the one nearest to the
+        dashboard click. No click yet: wait for one (ENTER = the nearest fruit instead)."""
+        a, io = self.args, self.io
+        tracks, n = [], 0
+        t_start = io.now()
+        self.brief("STEP", f"looking at the fruit for {a.detect_s:.0f} s (arm at home)")
+
+        def sample():
+            nonlocal n
+            err = self.hold(R.HOME_Q, 0.2, label="hold home" if io.commands else "")
+            if err:
+                return err
+            s = io.read()
+            fr = self.frames(s)
+            n += 1
+            for p_t, rad in io.detection_targets():
+                p = fr.torso_R @ np.asarray(p_t, float) + fr.torso_pos
+                tr = next((t for t in tracks if np.linalg.norm(np.mean(t["p"][-20:], 0) - p) < 0.03), None)
+                if tr is None:
+                    tracks.append({"p": [p], "r": [rad]})
+                else:
+                    tr["p"].append(p)
+                    tr["r"].append(rad)
+            return None
+        while io.now() - t_start < a.detect_s:
+            err = sample()
+            if err:
+                return err
+        click = getattr(io, "click", None)
+        if click is None and a.pick is None:
+            self.brief.wait("CLICK the apple on the dashboard camera (ENTER here = the nearest one)")
+            try:
+                while getattr(io, "click", None) is None:
+                    err = sample()
+                    if err:
+                        return err
+                    r, _, _ = select.select([sys.stdin], [], [], 0.0)
+                    if r:
+                        sys.stdin.readline()
+                        break
+            finally:
+                self.brief.wait(None)
+            click = getattr(io, "click", None)
+        if not tracks:
+            return "no fruit tracked (live_locator + fruits_to_torso running? the dashboard camera shows detections?)"
+        s = io.read()
+        fr = self.frames(s)
+        means = [np.mean(t["p"][-20:], 0) for t in tracks]
+        if click is not None:
+            p_click = fr.torso_R @ click[0] + fr.torso_pos
+            i = int(np.argmin([np.linalg.norm(m - p_click) for m in means]))
+            d = float(np.linalg.norm(means[i] - p_click))
+            if d > 0.10:
+                return f"no tracked fruit within 10 cm of the click (nearest {d * 100:.0f} cm): click again, nearer"
+            why = f"clicked ({d * 100:.1f} cm from the click)"
+        elif a.pick is not None and a.pick < len(tracks):
+            i, why = a.pick, f"--pick {a.pick}"
+        else:
+            sh = self.shoulder0(s)
+            i = int(np.argmin([np.linalg.norm(m - sh) for m in means]))
+            why = "nearest to the shoulder (no click)"
+        radii = [r for r in tracks[i]["r"] if r]
+        a.apple_radius = float(np.median(radii)) if radii else a.apple_radius
+        self.brief("INFO", f"apple {np.round(means[i], 3).tolist()} (pelvis), r {a.apple_radius * 1000:.0f} mm: {why}")
+        self.plan(s, apple_pelvis=means[i])
+        return None
+
+    # ---- "go closer": the policy is told the apple is further along the approach ----
+    def closer_m(self):
+        v = getattr(self.io, "closer_cm", None)
+        v = self.args.closer_cm if v is None else v
+        return float(np.clip(v, 0.0, 15.0)) / 100.0
+
+    def plan(self, s, apple_pelvis=None):
+        super().plan(s, apple_pelvis=apple_pelvis)
+        self.apple_true = None if self.apple is None else self.apple.copy()
+        self.target_true = None if getattr(self, "target", None) is None else self.target.copy()
+        self._closer = 0.0
+        self.apply_closer()
+
+    def apply_closer(self):
+        """(Re)place the apple the policy sees: the real one + 'closer' along pelvis -> apple."""
+        if getattr(self, "apple_true", None) is None:
+            return
+        d = self.closer_m()
+        if abs(d - getattr(self, "_closer", 0.0)) < 1e-4 and self._closer_set:
+            return
+        u = np.array([self.apple_true[0], self.apple_true[1], 0.0])
+        u /= max(np.linalg.norm(u), 1e-6)
+        self.apple = self.apple_true + d * u
+        if self.target_true is not None:
+            self.target = self.target_true + d * u
+        self._closer, self._closer_set = d, True
+        self.brief("INFO", "closer = 0: the policy sees the real apple" if d == 0 else
+                   f"closer = {d * 100:.1f} cm: the policy is told the apple is {d * 100:.1f} cm further, "
+                   f"so it should end {d * 100:.1f} cm closer to the real one", fold_s=0.0)
+
+    def policy_loop(self):
+        d = self.closer_m()
+        out = super().policy_loop()
+        try:
+            if getattr(self, "apple_true", None) is not None:
+                fr = self.frames(self.io.read())
+                gap = float(np.linalg.norm(self.apple_true - fr.palm_ref)) - self.args.apple_radius
+                self.brief("INFO", f"palm {gap * 100:+.1f} cm from the REAL apple's surface"
+                                   + (f" (policy aimed {d * 100:.1f} cm past it)" if d > 0 else ""), fold_s=0.0)
+        except Exception:
+            pass
+        return out
+
     # ---- one GO ----
     def confirm(self, prompt) -> bool:
         if "RUN THE POLICY" not in prompt and "RUN THE CHAIN" not in prompt:
@@ -157,6 +274,7 @@ class DualToyMixin:
                     return False
                 if getattr(io, "go_t", None) is not None and io.go_t > t0:
                     return True
+                self.apply_closer()                   # the dashboard's 'closer' may change while waiting
                 r, _, _ = select.select([sys.stdin], [], [], 0.0)
                 if r:
                     return sys.stdin.readline().strip().lower() != "q"
@@ -214,6 +332,11 @@ def main():
     if "--verbose" in rest:
         VERBOSE = True
         rest.remove("--verbose")
+    global CLOSER_CM
+    if "--closer_cm" in rest:
+        i = rest.index("--closer_cm")
+        CLOSER_CM = float(rest[i + 1])
+        del rest[i:i + 2]
     if not VERBOSE and not any(x in ("-h", "--help") for x in rest):
         sys.stdout = _Tee()
     # a raw rsl_rl checkpoint (model_N.pt) -> its TorchScript export (exported/policy_N.pt)
