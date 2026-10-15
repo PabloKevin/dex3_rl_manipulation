@@ -341,3 +341,11 @@ class AppleGraspSinglePPORunnerCfg(AppleGraspTreePPORunnerCfg):
     reach, arm free before the grip. Own log folder
     (logs/rsl_rl/apple_grasp_single_v1)."""
     experiment_name = "apple_grasp_single_v1"
+
+
+@configclass
+class AppleGraspSingleV2PPORunnerCfg(AppleGraspSinglePPORunnerCfg):
+    """AppleGraspSingle-v2: the v1 grasp finishing the approach by feel
+    (per-place tactile + memory + arm action inputs, realistic pads, new
+    rewards). Own log folder (logs/rsl_rl/apple_grasp_single_v2)."""
+    experiment_name = "apple_grasp_single_v2"

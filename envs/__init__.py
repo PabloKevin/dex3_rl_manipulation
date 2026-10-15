@@ -594,3 +594,28 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Grasp that finishes the approach by feel (apple_grasp_single_v2_env_cfg.py)
+
+from .apple_grasp_single_v2_env_cfg import AppleGraspSingleV2EnvCfg, AppleGraspSingleV2EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspSingleV2PPORunnerCfg
+
+gym.register(
+    id="AppleGraspSingle-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSingleV2EnvCfg,
+        "rsl_rl_cfg_entry_point": AppleGraspSingleV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="AppleGraspSingle-Play-v2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": AppleGraspSingleV2EnvCfg_PLAY,
+        "rsl_rl_cfg_entry_point": AppleGraspSingleV2PPORunnerCfg,
+    },
+    disable_env_checker=True,
+)

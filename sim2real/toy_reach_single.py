@@ -61,6 +61,40 @@ C_RED, C_YEL, C_GRN, C_CYN, C_OFF = T.C_RED, T.C_YEL, T.C_GRN, T.C_CYN, T.C_OFF
 #: palm local +X: wrist -> fingertips (reach_rewards.PALM_FINGER_AXIS)
 PALM_FINGER_AXIS = np.array([1.0, 0.0, 0.0])
 
+#: THIS process's DDS config (unitree_sdk2py's own template + discovery settings). The SDK
+#: default announces the laptop by multicast every 30 s (/tmp/cdds.LOG: SPDPInterval 30 s,
+#: no peers) -- the ~20-35 s a fresh process waits before the robot's daemon sees it
+#: (estop_link.py, toy_reach.enter_qref). Here the robot is also a unicast peer, announced
+#: every second. Only this script's process: the picker and toy_reach.py keep the SDK default.
+FAST_DDS_TEMPLATE = '''<?xml version="1.0" encoding="UTF-8" ?>
+    <CycloneDDS>
+        <Domain Id="any">
+            <General>
+                <Interfaces>
+                    <NetworkInterface name="$__IF_NAME__$" priority="default" multicast="default"/>
+                </Interfaces>
+            </General>
+            <Discovery>
+                <SPDPInterval>$__SPDP__$s</SPDPInterval>
+                <Peers>
+                    <Peer Address="$__PEER__$"/>
+                </Peers>
+            </Discovery>
+            <Tracing>
+                <Verbosity>config</Verbosity>
+                <OutputFile>/tmp/cdds.LOG</OutputFile>
+            </Tracing>
+        </Domain>
+    </CycloneDDS>'''
+
+
+def use_fast_dds(robot_ip: str, spdp_s: float) -> None:
+    """Before the picker's robot app calls ChannelFactoryInitialize (the SDK fills in the
+    interface name from the template it imported)."""
+    import unitree_sdk2py.core.channel as ch
+    ch.ChannelConfigHasInterface = (FAST_DDS_TEMPLATE.replace("$__PEER__$", robot_ip)
+                                    .replace("$__SPDP__$", f"{spdp_s:g}"))
+
 
 def parse_args():
     """toy_reach.py's options, with the single policy's own --hand and defaults."""
@@ -71,11 +105,16 @@ def parse_args():
                    help=f"s of the closing ramp (default {R.SINGLE_HAND_RAMP_S} / --speed)")
     p.add_argument("--layout_ok", action="store_true",
                    help="run a --policy whose path does not say 'single' (it must still be AppleReachSingle-v1)")
+    p.add_argument("--dds_default", action="store_true",
+                   help="keep the SDK's DDS config (multicast every 30 s: ~20-35 s until the daemon sees us)")
+    p.add_argument("--robot_ip", default="192.168.123.164", help="unicast DDS peer (the robot's Jetson)")
+    p.add_argument("--spdp_s", type=float, default=1.0, help="s between this process's DDS announcements")
     p.add_argument("-h", "--help", action="store_true")
     mine, rest = p.parse_known_args()
     if mine.help:
         print(__doc__)
         print("toy_reach_single.py options:\n  --hand {schedule,keep}  --hand_ramp_s S  --layout_ok\n"
+              "  --dds_default  --robot_ip IP  --spdp_s S\n"
               "toy_reach.py options (all apply, except --hand / --touch / --grasp):")
         sys.argv = [sys.argv[0], "--help"]
         T.parse_args()
@@ -90,6 +129,7 @@ def parse_args():
     a = T.parse_args()
     a.hand = mine.hand
     a.layout_ok = mine.layout_ok
+    a.dds_default, a.robot_ip, a.spdp_s = mine.dds_default, mine.robot_ip, mine.spdp_s
     a.hand_ramp_s = mine.hand_ramp_s or R.SINGLE_HAND_RAMP_S / a.speed
     if not user_tol:
         a.reach_tol = R.SINGLE_POS_TOL
@@ -106,7 +146,21 @@ def parse_args():
 
 class ToySingle(T.Toy):
     def __init__(self, args):
+        self.t_launch = time.monotonic()
+        if not args.mock and not args.dds_default:
+            use_fast_dds(args.robot_ip, args.spdp_s)
+            print(f"  DDS (this process only): robot {args.robot_ip} as a unicast peer, announced every "
+                  f"{args.spdp_s:g} s (--dds_default: the SDK's 30 s multicast)")
         super().__init__(args)
+        print(f"  [time] {time.monotonic() - self.t_launch:5.1f} s  robot app + policy loaded")
+        connect = self.io.connect
+
+        def connect_timed():
+            t = time.monotonic()
+            connect()
+            print(f"  [time] {time.monotonic() - self.t_launch:5.1f} s  lowstate + arm daemon seen "
+                  f"({time.monotonic() - t:.1f} s)", flush=True)
+        self.io.connect = connect_timed
         # toy_reach picks the layout by size ("waist" for 40 inputs): load it by name
         self.pol = R.ReachPolicy(args.policy, layout="single")
         self.layout = "single"
@@ -124,6 +178,13 @@ class ToySingle(T.Toy):
             else:
                 hand_set(kind)
         self.io.hand_set = hand_set_single
+
+    def enter_qref(self, q_hold, timeout_s=45.0):
+        t = time.monotonic()
+        err = super().enter_qref(q_hold, timeout_s)
+        print(f"  [time] {time.monotonic() - self.t_launch:5.1f} s  daemon in qref, receiving this stream "
+              f"({time.monotonic() - t:.1f} s)", flush=True)
+        return err
 
     def send_hand(self, force=False):
         q = self.sched.targets()
@@ -302,6 +363,8 @@ class ToySingle(T.Toy):
         waist_sent, waist_sent_t = 0.0, -9.0
         level = sm.OK
         latched_t = None
+        print(f"  [time] {time.monotonic() - self.t_launch:5.1f} s  policy starts (includes your ENTER answers)",
+              flush=True)
         want_up = R.single_fingers_up(self.apple, self.shoulder)
         if a.waist == "follow" and not io.qref_waist:
             self.say("waist: FOLLOW through set_waist ramps (this daemon has no qref waist, e.g. v20) -- "

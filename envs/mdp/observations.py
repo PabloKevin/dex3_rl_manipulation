@@ -316,7 +316,13 @@ def _sensed_tactile_forces(
     if not hasattr(env, "_tactile_gain"):
         env._tactile_gain = torch.ones(env.num_envs, sensed.shape[-1], device=env.device)
 
-    return sensed * env._tactile_gain
+    sensed = sensed * env._tactile_gain
+    # Dead band / noise / dead taxels: only in tasks that run
+    # probe_grasp.reset_tactile_realism (AppleGraspSingle-v2); others unchanged.
+    if getattr(env, "_tactile_realism", None) is not None:
+        from .probe_grasp import apply_tactile_realism
+        sensed = apply_tactile_realism(env, sensed)
+    return sensed
 
 
 def _taxel_finger_groups(env: ManagerBasedRLEnv) -> dict[str, list[int]]:
