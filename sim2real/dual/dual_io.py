@@ -33,6 +33,9 @@ GO_TOPIC = "/apple_picker/go"
 SELECT_TOPIC = "/apple_picker/select_fruit"      # the dashboard's click (torso frame), as the picker uses it
 CLOSER_TOPIC = "/apple_picker/reach_closer"      # {"cm": x} from the dashboard
 HB_HZ = 20.0
+VOICE_DIR = os.path.join(os.path.dirname(HERE), "voice")
+#: speak() key -> WAV in sim2real/voice
+EXTRA_CLIPS = {"hasta_la_vista": "hasta_la_vista_baby.wav"}
 #: v20 grabs the arm with its own stiff hold (HOLD_KP 400 at its latch) when no target came for
 #: QREF_STALE_S = 0.25 s; at the switch back to the stream's kp 100 the arm jumps by the sag
 #: difference. Measured 2026-10-15 (session 15-27-04): 300-1474 ms gaps while the toy computed
@@ -62,6 +65,15 @@ class DualIO(T.PickerIO):
             try:
                 self.node._init_audio()
                 self.audio_ok = bool(getattr(self.node.audio, "enabled", False))
+                if self.audio_ok:
+                    # clips of this repo (sim2real/voice, 16 kHz mono 16-bit WAV, < 3 s), registered in
+                    # this process only: the picker's audio_msgs_config.json is not touched
+                    for key, fname in EXTRA_CLIPS.items():
+                        path = os.path.join(VOICE_DIR, fname)
+                        if os.path.isfile(path):
+                            self.node.audio._msgs[key] = {"type": "wav", "file": path, "sample_rate_hz": 16000,
+                                                          "channels": 1, "sample_width_bytes": 2,
+                                                          "volume_gain": 1.8}
             except Exception as e:
                 print(f"  audio: the picker's player failed ({e}): the toy stays silent")
         if not hasattr(self.node, "audio"):

@@ -9,6 +9,9 @@ imported unchanged; three of their pieces are swapped here:
   python3 sim2real/dual/run_toy.py single --policy P --speed 0.3 --target detection
   python3 sim2real/dual/run_toy.py reach  --policy P --speed 0.3 --target X Y Z
   python3 sim2real/dual/run_toy.py apple|grasp|chain ...     (as toy_apple / toy_grasp / toy_chain)
+  python3 sim2real/dual/run_toy.py v1 --speed 0.3            the harvest test bench's reach (reach_v1.py):
+                      grasp_handoff_reach_apple.pt (default --policy), arm only (--waist hold), hand open,
+                      the dashboard-clicked apple (--target detection); toy_reach.py's sequence
 
 Own options (everything else goes to the toy):
   --verbose           the toy's full output in this terminal (default: only the short log here,
@@ -25,6 +28,7 @@ import atexit
 import json
 import os
 import select
+import signal
 import sys
 import time
 
@@ -42,6 +46,8 @@ R = T.R
 C_CYN, C_OFF, C_YEL, C_RED = T.C_CYN, T.C_OFF, T.C_YEL, T.C_RED
 STRICT = False
 VERBOSE = False
+#: --dds_default for the toys whose parser has no such option (all but single)
+DDS_DEFAULT = False
 CLOSER_CM = 0.0
 #: s of the stiffness ramp kp 100 -> v20's 400 before "bye" (see DualToyMixin.handover_to_hold)
 HANDOVER_S = 1.0
@@ -82,6 +88,24 @@ def smooth_joint_path_traj(points, vmax, dt=R.DT, min_s=1.0):
     return _linear_joint_path_traj(dense, vmax, dt=dt, min_s=min_s)
 
 
+FINISHING = False
+
+
+def install_ctrl_c():
+    """g1_launch.py ignores SIGINT while a toy runs (so the launcher itself survives the Ctrl-C),
+    and a child inherits an ignored signal: Python then never installs its KeyboardInterrupt
+    handler, and rclpy's own handler (it chains to the 'original' = ignore) only shut ROS down --
+    Ctrl-C, and the launcher's SIGINT at shutdown, did nothing to the run (loopback, 2026-10-15).
+    Restore the handler: the first Ctrl-C raises KeyboardInterrupt in the main thread; during
+    finish() (hand-over, last voice line) it is ignored so the arm is handed back cleanly."""
+    def handler(signum, frame):
+        if FINISHING:
+            sys.__stderr__.write("  (Ctrl-C ignored: the run is already ending)\n")
+            return
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, handler)
+
+
 class _Tee:
     """stdout -> the run's toy_full.log (the terminal keeps only the short log). Until the
     run's folder exists, lines are buffered; if the run dies before that, they are shown."""
@@ -117,7 +141,7 @@ class _Tee:
 
 def _fast_dds(args):
     """Robot as a unicast DDS peer for this process (no 20-35 s discovery wait)."""
-    if args.mock or getattr(args, "dds_default", False):
+    if args.mock or getattr(args, "dds_default", False) or DDS_DEFAULT:
         return
     try:
         cfg = json.load(open(args.config or os.path.join(args.picker_dir, "apple_picker_config.json")))
@@ -176,6 +200,16 @@ class DualToyMixin:
     #   got_it / missed_it "I missed that one, let me try again"       REACHED / time limit
     #   need_help "I need help, please check my arm"                   any stop or error
     #   finish_my_work "I have finished my work here"                  back home, run over
+    #   hasta_la_vista "Hasta la vista, baby" (sim2real/voice)         Ctrl-C, before the run ends
+    def hasta_la_vista(self):
+        """Ctrl-C: the clip (sim2real/voice/hasta_la_vista_baby.wav) plays at once -- it jumps the
+        queue -- and finish() waits for it before the process ends. Once per run."""
+        if getattr(self, "_said_help", False):
+            return
+        self._said_help = True
+        self.voice("hasta_la_vista", priority=True, max_age_s=0.0)
+        self.brief("INFO", "Ctrl-C: hasta la vista, baby", fold_s=0.0)
+
     def voice(self, key, **kw):
         speak = getattr(self.io, "speak", None)
         if speak is not None:
@@ -299,7 +333,9 @@ class DualToyMixin:
         d = self.closer_m()
         out = super().policy_loop()
         o = str(out[0])
-        if o.startswith("REACHED"):
+        if "Ctrl-C" in o:
+            self.hasta_la_vista()
+        elif o.startswith("REACHED"):
             self.voice("got_it")
         elif o.startswith("TIME LIMIT"):
             self.voice("missed_it")
@@ -396,8 +432,12 @@ class DualToyMixin:
             return self._outcome
         self._finished = True
         self._outcome = outcome
+        global FINISHING
+        FINISHING = True
         o = str(outcome)
-        if o.startswith(("REACHED", "TIME LIMIT", "HOME")):
+        if "Ctrl-C" in o:
+            self.hasta_la_vista()
+        elif o.startswith(("REACHED", "TIME LIMIT", "HOME")):
             self.voice("finish_my_work", max_age_s=0.0)
         elif not getattr(self, "_said_help", False):
             self.voice("need_help", priority=True, max_age_s=0.0)
@@ -438,8 +478,9 @@ def mix(cls):
 
 def main():
     global STRICT, VERBOSE
+    install_ctrl_c()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "apple", "grasp", "chain"):
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "apple", "grasp", "chain", "v1"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     kind, rest = argv[0], argv[1:]
@@ -472,6 +513,10 @@ def main():
     T.PickerIO = DualIO
     T.Watch = LightWatch
     T.joint_path_traj = smooth_joint_path_traj
+    if kind != "single" and "--dds_default" in rest:      # the launcher adds it in --loopback
+        global DDS_DEFAULT
+        DDS_DEFAULT = True
+        rest.remove("--dds_default")
     if kind == "single":
         import toy_reach_single as S
         S.ToySingle = mix(S.ToySingle)
@@ -484,6 +529,14 @@ def main():
         return CH.main()
     defaults = {"apple": {"--target": ["detection"], "--waist": ["follow"]},
                 "grasp": {"--target": ["detection"], "--waist": ["follow"]}}.get(kind, {})
+    if kind == "v1":
+        import reach_v1
+        reach_v1.install(R)                       # this process only: reach_io.py is not changed
+        if "--waist" in rest and rest[rest.index("--waist") + 1] != "hold":
+            sys.exit("v1 is an arm-only policy (7 outputs): --waist hold only")
+        # hand open: AppleGrasp-v1 holds the hand at its default (open) pose during the reach
+        defaults = {"--target": ["detection"], "--waist": ["hold"], "--hand": ["open"],
+                    "--policy": [reach_v1.default_policy(os.path.dirname(SIM2REAL))]}
     for flag, val in defaults.items():
         if flag not in rest:
             rest = rest + [flag] + val
