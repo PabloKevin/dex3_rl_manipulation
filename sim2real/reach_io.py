@@ -143,6 +143,39 @@ SINGLE_HAND_LEVEL_TOL = 0.03
 SINGLE_HAND_RAMP_S = 0.3
 #: fingers UP (thumb below) for an apple centre above the right shoulder + this, DOWN below
 SINGLE_FINGER_SWITCH_DZ = 0.15
+#: which hand trigger the schedule uses: "level" (v1: palm point level with the apple centre)
+#: or "distance" (v2: palm point within SINGLE_HAND_NEAR of it, 3D)
+SINGLE_HAND_TRIGGER = "level"
+SINGLE_HAND_NEAR = 0.10
+SINGLE_VERSION = 1
+
+#: AppleReachSingle-v2 (envs/apple_reach_single_v2_env_cfg.py): the apple ENCLOSED in the
+#: hand -- the palm touching it (radius + 16 mm out from the palm point), a push of up to
+#: 1.5 cm accepted; the hand closes once the palm point is within 10 cm of the apple. Same
+#: 40-input "single" layout. use_single_v2() switches this module's SINGLE_* to these.
+SINGLE_V2 = {"SINGLE_STANDOFF": 0.016, "SINGLE_POS_TOL": 0.015, "SINGLE_HAND_TRIGGER": "distance",
+             "SINGLE_HAND_NEAR": 0.10, "SINGLE_VERSION": 2}
+#: v2's placement: APPLE CENTRES (not grasp targets) relative to the right shoulder at waist
+#: yaw 0, on the map scripts/probe_side_reach.py --single_v2 measured (+ the old waist map)
+ENVELOPE_SINGLE_V2 = dict(reach_min=0.20, reach_max=0.70, az_center_deg=-25.0, az_span_deg=200.0,
+                          dz_range=(-0.45, 0.45), min_forward=0.05, min_horizontal=0.15, apple_ref=True,
+                          map=os.path.join(REPO, "envs", "assets", "reach_workspace_single_v2.npz"))
+
+
+def use_single_v2() -> None:
+    """AppleReachSingle-v2's goal, tolerance, hand trigger (this process only)."""
+    globals().update(SINGLE_V2)
+
+
+def single_version_of(policy_path: str) -> int:
+    """2 when the policy is an AppleReachSingle-v2 one: its path, or the .txt naming the
+    checkpoint it was exported from (scripts/train_single_v2_chain.sh), says single_v2."""
+    if "single_v2" in policy_path:
+        return 2
+    side = os.path.splitext(policy_path)[0] + ".txt"
+    if os.path.exists(side) and "single_v2" in open(side).read():
+        return 2
+    return 1
 
 
 # ─────────────────────────────────────────────
@@ -439,14 +472,19 @@ class ReachPolicy:
 
 class SingleHandSchedule:
     """single_reach.step_hand_schedule for one env: latched once the palm point is within
-    SINGLE_HAND_LEVEL_TOL of the apple centre's height, then the phase ramps 0 -> 1 over
+    SINGLE_HAND_LEVEL_TOL of the apple centre's height (v1; v2 "distance": within
+    SINGLE_HAND_NEAR of the apple centre), then the phase ramps 0 -> 1 over
     ramp_s; targets = open + phase (closed - open). The sim updates it BEFORE the
     observation of the same step (an interval event), so step() comes before build_obs.
     ramp_s: the deployment's speed factor plays the motion 1/s slower -- pass
     SINGLE_HAND_RAMP_S / s to keep the hand in step with the arm."""
 
-    def __init__(self, ramp_s: float = SINGLE_HAND_RAMP_S, level_tol: float = SINGLE_HAND_LEVEL_TOL, dt: float = DT):
+    def __init__(self, ramp_s: float = SINGLE_HAND_RAMP_S, level_tol: float = SINGLE_HAND_LEVEL_TOL, dt: float = DT,
+                 trigger: str | None = None, near: float | None = None):
         self.ramp_s, self.level_tol, self.dt = float(ramp_s), float(level_tol), float(dt)
+        # None: this module's current SINGLE_HAND_TRIGGER / _NEAR (use_single_v2 switches them)
+        self.trigger = SINGLE_HAND_TRIGGER if trigger is None else trigger
+        self.near = float(SINGLE_HAND_NEAR if near is None else near)
         self.open = np.array([SINGLE_HAND_OPEN[f"right_hand_{n}_joint"] for n in DEX3_ORDER])
         self.closed = np.array([SINGLE_HAND_CLOSED[f"right_hand_{n}_joint"] for n in DEX3_ORDER])
         self.reset()
@@ -455,7 +493,11 @@ class SingleHandSchedule:
         self.phase, self.latched = 0.0, False
 
     def step(self, palm_ref: np.ndarray, apple: np.ndarray) -> float:
-        if abs(float(palm_ref[2]) - float(apple[2])) < self.level_tol:
+        if self.trigger == "distance":
+            hit = float(np.linalg.norm(np.asarray(palm_ref, float) - np.asarray(apple, float))) < self.near
+        else:
+            hit = abs(float(palm_ref[2]) - float(apple[2])) < self.level_tol
+        if hit:
             self.latched = True
         if self.latched:
             self.phase = min(1.0, self.phase + self.dt / self.ramp_s)
@@ -466,10 +508,11 @@ class SingleHandSchedule:
         return self.open + self.phase * (self.closed - self.open)
 
 
-def single_seat_error(fr: Frames, apple: np.ndarray, radius: float, standoff: float = SINGLE_STANDOFF) -> float:
+def single_seat_error(fr: Frames, apple: np.ndarray, radius: float, standoff: float | None = None) -> float:
     """reach_rewards._palm_target_dist: how far the apple centre is from the seat
-    (radius + standoff) out from the palm point along the palm normal. The goal is
-    < SINGLE_POS_TOL, held still."""
+    (radius + standoff, default this module's current SINGLE_STANDOFF) out from the palm
+    point along the palm normal. The goal is < SINGLE_POS_TOL, held still."""
+    standoff = SINGLE_STANDOFF if standoff is None else standoff
     seat = fr.palm_ref + (radius + standoff) * fr.palm_normal
     return float(np.linalg.norm(np.asarray(apple, float) - seat))
 

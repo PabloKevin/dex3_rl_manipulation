@@ -202,6 +202,12 @@ def _palm_normal_angle(
     if object_cfg is None:
         object_cfg = SceneEntityCfg("apple")
     n_world = _palm_normal_world(env, robot_cfg, palm_normal_axis)
+    if getattr(env, "_heading_horizontal", False):
+        # single_reach.set_reach_goal_v2: the HEADING only (the normal's
+        # horizontal part); the tilt is the tilt terms' business
+        n_world = n_world.clone()
+        n_world[:, 2] = 0.0
+        n_world = n_world / n_world.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     cos = (n_world * _approach_dir(env, object_cfg)).sum(dim=-1).clamp(-1.0, 1.0)
     return torch.acos(cos)
 
@@ -435,9 +441,18 @@ def reach_neighbourhood(
     terminations_and_events.reach_success and the grasp task's converged
     hand-off so they cannot disagree.
 
+    If env._enclosure_goal is set (single_reach.set_reach_goal_v2), the
+    position test is single_reach.enclosed instead (apple in the hand's
+    pocket, pushed in at most a little, the target not dragged off its spot);
+    pos_tol / standoff are then unused.
+
     Returns: [num_envs] bool
     """
-    inside = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis) < pos_tol
+    if getattr(env, "_enclosure_goal", None) is not None:
+        from .single_reach import enclosed
+        inside = enclosed(env, robot_cfg, object_cfg, palm_local_offset, palm_normal_axis)
+    else:
+        inside = _palm_target_dist(env, robot_cfg, object_cfg, standoff, palm_local_offset, palm_normal_axis) < pos_tol
     if tilt_tol_rad is not None:
         inside = inside & (_palm_tilt(env, robot_cfg, palm_normal_axis) < tilt_tol_rad)
     if stem_tol_rad is not None:

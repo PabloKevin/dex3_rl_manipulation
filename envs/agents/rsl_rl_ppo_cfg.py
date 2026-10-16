@@ -349,3 +349,17 @@ class AppleGraspSingleV2PPORunnerCfg(AppleGraspSinglePPORunnerCfg):
     (per-place tactile + memory + arm action inputs, realistic pads, new
     rewards). Own log folder (logs/rsl_rl/apple_grasp_single_v2)."""
     experiment_name = "apple_grasp_single_v2"
+
+
+@configclass
+class AppleReachSingleV2PPORunnerCfg(AppleReachSinglePPORunnerCfg):
+    """AppleReachSingle-v2: the apple enclosed in the hand, tilted palm,
+    distance hand trigger. Own log folder (logs/rsl_rl/apple_reach_single_v2)."""
+    experiment_name = "apple_reach_single_v2"
+
+
+@configclass
+class AppleGraspSingleV3PPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
+    """AppleGraspSingle-v3: grasp only, behind AppleReachSingle-v2. Own log
+    folder (logs/rsl_rl/apple_grasp_single_v3)."""
+    experiment_name = "apple_grasp_single_v3"

@@ -109,11 +109,16 @@ def parse_args():
                    help="keep the SDK's DDS config (multicast every 30 s: ~20-35 s until the daemon sees us)")
     p.add_argument("--robot_ip", default="192.168.123.164", help="unicast DDS peer (the robot's Jetson)")
     p.add_argument("--spdp_s", type=float, default=1.0, help="s between this process's DDS announcements")
+    p.add_argument("--single_version", choices=["auto", "1", "2"], default="auto",
+                   help="1: AppleReachSingle-v1 (2 cm short, hand closes level with the apple); 2: "
+                        "AppleReachSingle-v2 (apple enclosed, hand closes within 10 cm, apple-centred envelope); "
+                        "auto (default): 2 when the policy path (or its .txt) says single_v2")
     p.add_argument("-h", "--help", action="store_true")
     mine, rest = p.parse_known_args()
     if mine.help:
         print(__doc__)
-        print("toy_reach_single.py options:\n  --hand {schedule,keep}  --hand_ramp_s S  --layout_ok\n"
+        print("toy_reach_single.py options:\n  --hand {schedule,keep}  --hand_ramp_s S  --layout_ok  "
+              "--single_version {auto,1,2}\n"
               "  --dds_default  --robot_ip IP  --spdp_s S\n"
               "toy_reach.py options (all apply, except --hand / --touch / --grasp):")
         sys.argv = [sys.argv[0], "--help"]
@@ -127,6 +132,14 @@ def parse_args():
     user_tol = "--reach_tol" in rest or any(x.startswith("--reach_tol=") for x in rest)
     sys.argv = [sys.argv[0]] + rest + ["--hand", "keep", "--touch", "zero"]
     a = T.parse_args()
+    a.single_version = R.single_version_of(a.policy) if mine.single_version == "auto" else int(mine.single_version)
+    if a.single_version == 2:
+        R.use_single_v2()
+        R.ENVELOPE_WAIST = R.ENVELOPE_SINGLE_V2     # apple centres, not grasp targets (ToySingle.check_apple)
+    print(f"  single reach v{a.single_version}: goal {R.SINGLE_STANDOFF * 100:.1f} cm off the surface "
+          f"(tol {R.SINGLE_POS_TOL * 100:.1f} cm), hand closes "
+          + ("once the palm point is level with the apple" if R.SINGLE_HAND_TRIGGER == "level"
+             else f"within {R.SINGLE_HAND_NEAR * 100:.0f} cm of the apple"))
     a.hand = mine.hand
     a.layout_ok = mine.layout_ok
     a.dds_default, a.robot_ip, a.spdp_s = mine.dds_default, mine.robot_ip, mine.spdp_s
@@ -204,6 +217,11 @@ class ToySingle(T.Toy):
     def _target_from_apple(self, apple, r, yaw):
         return np.asarray(apple, float) - (r + R.SINGLE_STANDOFF) * self._u(yaw)
 
+    def check_apple(self, apple, target, sh, quiet=False):
+        """toy_reach's envelope check on what the policy's map holds: the grasp target (v1)
+        or the apple centre (v2's map, R.ENVELOPE_SINGLE_V2)."""
+        return self.check(apple if R.SINGLE_VERSION == 2 else target, sh, quiet=quiet)
+
     def plan(self, s, apple_pelvis=None):
         a = self.args
         fr = self.frames(s)
@@ -238,7 +256,7 @@ class ToySingle(T.Toy):
               f"surface), approach {math.degrees(yaw):+.0f} deg (pelvis -> apple); trained: fingers "
               f"{'UP, thumb below' if up else 'DOWN, thumb above'} (apple {(apple[2] - sh[2]) * 100:+.0f} cm from "
               f"the shoulder, switch at +{R.SINGLE_FINGER_SWITCH_DZ * 100:.0f})")
-        chk = self.check(target, sh)
+        chk = self.check_apple(apple, target, sh)
         if not chk["ok"]:
             if a.force:
                 self.say("target outside the envelope -- running anyway (--force)", C_YEL)
@@ -284,7 +302,7 @@ class ToySingle(T.Toy):
             spread = float(np.max(np.linalg.norm(P - mean, axis=1)))
             radii = [r for r in t["r"] if r]
             r = float(np.median(radii)) if radii else a.apple_radius
-            chk = self.check(self._target_from_apple(mean, r, self._yaw(mean)), sh, quiet=True)
+            chk = self.check_apple(mean, self._target_from_apple(mean, r, self._yaw(mean)), sh, quiet=True)
             seen = len(P) / n
             ok = chk["ok"] and seen >= 0.6 and spread <= a.detect_spread
             why = ("REACHABLE" if ok else "no: " + "; ".join(

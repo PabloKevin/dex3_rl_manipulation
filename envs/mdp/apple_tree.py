@@ -463,8 +463,11 @@ def place_apple_tree(
             T.cluster[i] = torch.tensor(tree["cluster"], device=dev)
             T.trunk[i] = torch.tensor(tree["trunk"], device=dev, dtype=torch.float32)
             o = harvest_order(tree, order, rng)
-            if forced is not None:                       # the forced apple (spot 0) is the target
+            if forced is not None or tree.get("stretch", False):    # the forced / stretch apple (spot 0) is the target
                 o = np.concatenate([[0], o[o != 0]])
+            if not hasattr(env, "_target_stretch"):
+                env._target_stretch = torch.zeros(N, dtype=torch.bool, device=dev)
+            env._target_stretch[i] = bool(tree.get("stretch", False))
             T.order[i] = torch.tensor(o, device=dev)
             T.cursor[i] = 0
             T.status[i] = WAITING

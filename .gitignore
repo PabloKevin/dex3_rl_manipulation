@@ -23,3 +23,4 @@ IEEEtran.cls
 *EnvCommercialAppleTrees/
 # which reach checkpoint the local grasp hand-off export came from (scripts/train_grasp_single.sh)
 envs/agents/best_weights/grasp_handoff_reach_single.txt
+envs/agents/best_weights/grasp_handoff_reach_single_v2.txt

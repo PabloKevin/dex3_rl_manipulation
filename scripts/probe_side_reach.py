@@ -31,8 +31,20 @@ AppleReachTreeWaist-v1 action range) and the sweep/grid widen toward the
 front-centre and further out. Cells stay relative to the shoulder AT WAIST
 YAW 0 (a fixed point, as placement uses it). Writes
 envs/assets/reach_workspace_waist.npz (REACH_WAIST_WORKSPACE_MAP).
+
+--single_v2: AppleReachSingle-v2's end pose (implies --waist): the apple
+centre in the hand's pocket (palm touching it, single_reach.enclosure_state),
+the palm heading along the horizontal pelvis -> apple line (no stem), the
+fingers DOWN (up for fruit above shoulder + 15 cm) and leaning ~30 deg
+forward along the approach so all fingertips sit at one depth, the hand in
+the closed cup. CLEAN: pocket error < OK_POS, heading < 45 deg, tilt < 40
+deg, finger roll < 30 deg, no self-collision, shoulder roll in the box. Cells
+hold the APPLE CENTRE relative to the shoulder (tree_sampler.Envelope
+apple_ref=True). Wider sweep and grid. Writes
+envs/assets/reach_workspace_single_v2.npz.
 """
 import argparse
+import math
 import os
 import sys
 
@@ -53,8 +65,14 @@ parser.add_argument("--union", type=str, default=None,
                          "waist yaw 0 is always available, and the 8-DOF IK stalls more often).")
 parser.add_argument("--waist", action="store_true",
                     help="Waist yaw in the IK (+-WAIST_YAW_LIMIT), wider sweep; writes reach_workspace_waist.npz.")
+parser.add_argument("--single_v2", action="store_true",
+                    help="AppleReachSingle-v2 end pose (apple in the pocket, tilted palm, cup); implies --waist.")
+parser.add_argument("--union_shift", type=float, nargs=3, default=(0.0, 0.0, 0.0),
+                    help="Shift (m) added to the --union map's cell centres (grasp-target map -> apple-centre map).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.single_v2:
+    args_cli.waist = True
 app = AppLauncher(args_cli).app
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -86,13 +104,25 @@ FOCUS = dict(reach_min=0.17, reach_max=0.37, reach_azimuth_center_deg=-45.0,
 SWEEP_WAIST = dict(reach_min=0.12, reach_max=0.55, reach_azimuth_center_deg=-25.0,
                    reach_azimuth_span_deg=170.0, target_dz_range=(-0.40, 0.35),
                    reach_min_forward=0.0, reach_min_horizontal=0.0, workspace_map=None)
+# --single_v2: wider still (apple centres up to ~0.7 m out, all round the front)
+SWEEP_SINGLE_V2 = dict(reach_min=0.10, reach_max=0.70, reach_azimuth_center_deg=-25.0,
+                       reach_azimuth_span_deg=220.0, target_dz_range=(-0.50, 0.50),
+                       reach_min_forward=-0.10, reach_min_horizontal=0.0, workspace_map=None)
 OK_POS, OK_FACE = 0.02, 0.30
+# --single_v2 end pose (envs/apple_reach_single_v2_env_cfg.py)
+V2_TOUCH_GAP = 0.016
+V2_LEAN = math.radians(30.0)
+V2_FINGER_SWITCH_DZ = 0.15
+V2_OK_HEADING, V2_OK_TILT, V2_OK_ROLL = math.radians(45.0), math.radians(40.0), math.radians(30.0)
 CELL = 0.05
 GRID_LO = np.array([-0.15, -0.45, -0.40])   # shoulder-relative x (fwd), y (left), z (up)
 GRID_HI = np.array([0.45, 0.20, 0.35])
 if args_cli.waist:
     GRID_LO = np.array([-0.15, -0.55, -0.40])
     GRID_HI = np.array([0.60, 0.40, 0.35])
+if args_cli.single_v2:
+    GRID_LO = np.array([-0.20, -0.75, -0.55])
+    GRID_HI = np.array([0.80, 0.55, 0.55])
 MIN_SAMPLES, MIN_CLEAN_FRAC = 3, 0.8
 
 
@@ -102,8 +132,12 @@ def main():
     cfg.episode_length_s = 1.0e6
     cfg.terminations.reach_success = None
     cfg.events.reset_arm_jitter = None
-    cfg.events.randomize_tree.params.update(SWEEP_WAIST if args_cli.waist else FOCUS if args_cli.focus else SWEEP)
+    cfg.events.randomize_tree.params.update(
+        SWEEP_SINGLE_V2 if args_cli.single_v2 else SWEEP_WAIST if args_cli.waist else FOCUS if args_cli.focus else SWEEP)
     env = ManagerBasedRLEnv(cfg)
+    if args_cli.single_v2:
+        # the approach is the horizontal pelvis -> apple line (single_reach.set_approach_origin)
+        env._approach_from_body = env.scene["robot"].data.body_names.index("pelvis")
 
     robot = env.scene["robot"]
     palm_cfg = SceneEntityCfg("robot", body_names=["right_hand_palm_link"])
@@ -127,26 +161,55 @@ def main():
     default = robot.data.default_joint_pos[:, ik_ids]
     shoulder_roll = RIGHT_ARM_JOINTS.index("right_shoulder_roll_joint")
     state = {"q": default.clone()}
+    hand_ids, hand_q = [], None
+    if args_cli.single_v2:
+        from envs.apple_reach_single_env_cfg import HAND_CLOSED
+        hand_ids = [robot.joint_names.index(n) for n in HAND_CLOSED]
+        hand_q = torch.tensor(list(HAND_CLOSED.values()), device=env.device)
+        shoulder_id = robot.data.body_names.index("right_shoulder_pitch_link")
+    up = torch.tensor([0.0, 0.0, 1.0], device=env.device)
+    f_local = torch.tensor(rr.PALM_FINGER_AXIS, device=env.device)
 
     def set_arm(q0):
         jp = robot.data.joint_pos.clone()
         jp[:, ik_ids] = q0
+        if hand_ids:
+            jp[:, hand_ids] = hand_q
         robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
         tgt = robot.data.joint_pos_target.clone()
         tgt[:, ik_ids] = q0
+        if hand_ids:
+            tgt[:, hand_ids] = hand_q
         robot.set_joint_position_target(tgt)
         term._prev_target[:, term_ids] = q0[:, :len(arm_ids)]
         term._prev_vel[:] = 0.0
+
+    def v2_goal():
+        """(palm-point target [N, 3], desired normal n* [N, 3], desired finger axis f* [N, 3])."""
+        d = rr._approach_dir(env, apple_cfg)
+        apple = env.scene["apple"].data.root_pos_w
+        s = torch.where(apple[:, 2] - robot.data.body_pos_w[:, shoulder_id, 2] > V2_FINGER_SWITCH_DZ, 1.0, -1.0)
+        s = s.unsqueeze(-1)
+        n_star = math.cos(V2_LEAN) * d - s * math.sin(V2_LEAN) * up
+        f_star = math.sin(V2_LEAN) * d + s * math.cos(V2_LEAN) * up
+        radius = env._apple_radius if isinstance(getattr(env, "_apple_radius", None), torch.Tensor) \
+            else torch.full((env.num_envs,), rr.DEFAULT_APPLE_RADIUS, device=env.device)
+        return apple - (radius + V2_TOUCH_GAP).unsqueeze(-1) * n_star, n_star, f_star, s.squeeze(-1)
 
     def ik_step():
         quat = robot.data.body_quat_w[:, palm_id]
         R = matrix_from_quat(quat)
         off_w = R @ off_local
         ref = robot.data.body_pos_w[:, palm_id] + off_w
-        d = rr._approach_dir(env, apple_cfg)
-        pos_err = rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF) - ref
+        if args_cli.single_v2:
+            goal, n_star, f_star, _ = v2_goal()
+            pos_err = goal - ref
+            n_err = 0.5 * (torch.cross(R @ n_local, n_star, dim=-1) + torch.cross(R @ f_local, f_star, dim=-1))
+        else:
+            d = rr._approach_dir(env, apple_cfg)
+            pos_err = rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF) - ref
+            n_err = torch.cross(R @ n_local, d, dim=-1)   # rotation taking the palm normal onto d
         pos_err = pos_err * (0.05 / pos_err.norm(dim=-1, keepdim=True).clamp(min=0.05))
-        n_err = torch.cross(R @ n_local, d, dim=-1)   # rotation taking the palm normal onto d
 
         J = robot.root_physx_view.get_jacobians()[:, jac_id, :, :][:, :, jac_cols].clone()
         ox, oy, oz = off_w[:, 0], off_w[:, 1], off_w[:, 2]
@@ -165,11 +228,30 @@ def main():
         env.scene.update(env.physics_dt)
 
     def measure():
-        d_pos = (rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF)
-                 - rr._palm_ref_pos(env, palm_cfg, PALM_LOCAL_OFFSET)).norm(dim=-1)
-        face = rr._palm_normal_angle(env, palm_cfg, PALM_NORMAL_AXIS, apple_cfg)
         coll = self_collision_depth(env).amax(dim=-1)
         q = robot.data.joint_pos[:, ik_ids]
+        if args_cli.single_v2:
+            # pocket error: the apple vs radius + touch gap out along the ACTUAL palm normal
+            R = matrix_from_quat(robot.data.body_quat_w[:, palm_id])
+            n_w, f_w = R @ n_local, R @ f_local
+            radius = env._apple_radius if isinstance(getattr(env, "_apple_radius", None), torch.Tensor) \
+                else torch.full((env.num_envs,), rr.DEFAULT_APPLE_RADIUS, device=env.device)
+            seat = rr._palm_ref_pos(env, palm_cfg, PALM_LOCAL_OFFSET) + (radius + V2_TOUCH_GAP).unsqueeze(-1) * n_w
+            d_pos = (env.scene["apple"].data.root_pos_w - seat).norm(dim=-1)
+            d = rr._approach_dir(env, apple_cfg)
+            nh = n_w.clone()
+            nh[:, 2] = 0.0
+            nh = nh / nh.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            heading = torch.acos((nh * d).sum(-1).clamp(-1.0, 1.0))
+            tilt = torch.asin(n_w[:, 2].abs().clamp(max=1.0))
+            _, _, _, s = v2_goal()
+            lat = torch.cross(up.expand_as(d), d, dim=-1)
+            roll = torch.atan2((f_w * lat).sum(-1).abs(), s * f_w[:, 2])
+            face = torch.maximum(heading / V2_OK_HEADING, torch.maximum(tilt / V2_OK_TILT, roll / V2_OK_ROLL)) * OK_FACE
+        else:
+            d_pos = (rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF)
+                     - rr._palm_ref_pos(env, palm_cfg, PALM_LOCAL_OFFSET)).norm(dim=-1)
+            face = rr._palm_normal_angle(env, palm_cfg, PALM_NORMAL_AXIS, apple_cfg)
         reached = (d_pos < OK_POS) & (face < OK_FACE)
         clean = reached & (coll <= 0.0) & (q[:, shoulder_roll] < 0.35)
         score = d_pos / OK_POS + face / OK_FACE + coll / 0.01 - 10.0 * clean.float() - 5.0 * reached.float()
@@ -203,7 +285,10 @@ def main():
             best_score = torch.where(better, score, best_score)
             best = cols if best is None else [torch.where(better, c, b) for c, b in zip(cols, best)]
         sh = env.scene.env_origins + env._shoulder_local_xyz
-        tgt = rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF) - sh
+        if args_cli.single_v2:   # cells hold the APPLE CENTRE (Envelope apple_ref=True)
+            tgt = env.scene["apple"].data.root_pos_w - sh
+        else:
+            tgt = rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF) - sh
         rows.append(torch.cat([tgt] + [c.unsqueeze(-1) for c in best], -1).cpu().numpy())
         print(f"round {rnd + 1}/{args_cli.rounds}: clean so far "
               f"{np.concatenate(rows)[:, -1].mean():.2f}", flush=True)
@@ -232,7 +317,8 @@ def main():
         u = np.load(args_cli.union)
         added = 0
         for i, j, k in zip(*np.nonzero(u["feasible"])):
-            c = np.array([u["x_edges"][i], u["y_edges"][j], u["z_edges"][k]]) + 0.5 * CELL
+            c = np.array([u["x_edges"][i], u["y_edges"][j], u["z_edges"][k]]) + 0.5 * CELL \
+                + np.asarray(args_cli.union_shift)
             n = np.floor((c - GRID_LO) / CELL).astype(int)
             if np.all((n >= 0) & (n < np.array(shape))):
                 added += int(not feasible[tuple(n)])
@@ -257,7 +343,8 @@ def main():
         w = a[clean, 7]
         print(f"\nwaist yaw over clean samples: median |yaw| {np.degrees(np.median(np.abs(w))):.0f} deg, "
               f"at the limit {np.mean(np.abs(w) > WAIST_YAW_LIMIT - 0.02):.2f}")
-    default_map = "reach_workspace_waist.npz" if args_cli.waist else "reach_workspace.npz"
+    default_map = ("reach_workspace_single_v2.npz" if args_cli.single_v2 else
+                   "reach_workspace_waist.npz" if args_cli.waist else "reach_workspace.npz")
     out = args_cli.out or os.path.join(REPO, "envs", "assets", default_map)
     np.savez(out, x_edges=edges[0], y_edges=edges[1], z_edges=edges[2], feasible=feasible,
              count=count, clean_frac=frac, samples=a,

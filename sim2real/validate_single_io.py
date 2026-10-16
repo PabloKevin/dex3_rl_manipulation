@@ -46,7 +46,10 @@ p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDes
 p.add_argument("--collect", action="store_true", help="step 1 (Isaac Lab)")
 p.add_argument("--check", action="store_true", help="step 2 (no Isaac Lab)")
 p.add_argument("--npz", default=DEFAULT_NPZ)
-p.add_argument("--policy", default=None, help="exported AppleReachSingle-v1 policy (default: a driver only)")
+p.add_argument("--policy", default=None, help="exported AppleReachSingle-v1/v2 policy (default: a driver only)")
+p.add_argument("--version", type=int, choices=[1, 2], default=1,
+               help="collect from AppleReachSingle-v1 (default) or -v2 (apple enclosed, distance hand trigger); "
+                    "--check reads the version from the npz")
 p.add_argument("--num_envs", type=int, default=6)
 p.add_argument("--steps", type=int, default=400, help="control steps to record (50 Hz)")
 p.add_argument("--slow", type=float, default=0.5)
@@ -84,9 +87,15 @@ def collect():
     from envs.mdp import reach_rewards as rr
     from envs.mdp import single_reach as sr
 
-    cfg = S.AppleReachSingleEnvCfg()
+    if args.version == 2:
+        from envs import apple_reach_single_v2_env_cfg as S2
+        cfg = S2.AppleReachSingleV2EnvCfg()
+        standoff, task = S2.SINGLE_V2_STANDOFF, "AppleReachSingle-v2"
+    else:
+        cfg = S.AppleReachSingleEnvCfg()
+        standoff, task = S.SINGLE_STANDOFF, "AppleReachSingle-v1"
     cfg.scene.num_envs = args.num_envs
-    env = gym.make("AppleReachSingle-v1", cfg=cfg).unwrapped
+    env = gym.make(task, cfg=cfg).unwrapped
     dev = env.device
     trained = args.policy is not None
     pol_path = args.policy or os.path.join(REPO, "envs", "agents", "best_weights", "grasp_handoff_reach_spindle.pt")
@@ -124,7 +133,7 @@ def collect():
         rec["body_quat"].append(robot.data.body_quat_w[:, bid].cpu().numpy())
         rec["hand_phase"].append(getattr(env, "_hand_phase", torch.zeros(N, device=dev)).cpu().numpy().copy())
         rec["hand_target"].append(robot.data.joint_pos_target[:, hand_ids].cpu().numpy())
-        rec["goal_dist"].append(rr._palm_target_dist(env, goal_cfg, apple_cfg, S.SINGLE_STANDOFF,
+        rec["goal_dist"].append(rr._palm_target_dist(env, goal_cfg, apple_cfg, standoff,
                                                      G.PALM_LOCAL_OFFSET, G.PALM_NORMAL_AXIS).cpu().numpy())
         r = getattr(env, "_apple_radius", None)
         rec["radius"].append(r.cpu().numpy() if isinstance(r, torch.Tensor) else np.full(N, rr.DEFAULT_APPLE_RADIUS))
@@ -150,7 +159,8 @@ def collect():
         "waist_scale": w_cfg.scale, "waist_vmax": w_cfg.max_velocity, "waist_amax": w_cfg.max_acceleration,
         "waist_brake": bool(w_cfg.brake_to_target), "waist_clip": list(w_cfg.clip[".*"]),
         "palm_local_offset": list(G.PALM_LOCAL_OFFSET), "palm_normal_axis": list(G.PALM_NORMAL_AXIS),
-        "single_standoff": S.SINGLE_STANDOFF, "single_pos_tol": S.SINGLE_POS_TOL,
+        "single_version": args.version, "single_standoff": standoff, "single_pos_tol": S.SINGLE_POS_TOL,
+        "hand_trigger": hp.get("trigger", "level"), "hand_near": hp.get("near", 0.10),
         "success_pos_tol": float(cfg.terminations.reach_success.params.get("pos_tol", float("nan"))),
         "finger_switch_dz": S.FINGER_SWITCH_DZ,
         "hand_open": dict(S.HAND_OPEN), "hand_closed": dict(S.HAND_CLOSED),
@@ -199,7 +209,14 @@ def check():
             return a == b
         return abs(float(a) - float(b)) <= 1e-6
 
-    print("constants (reach_io vs the AppleReachSingle-v1 cfg):")
+    version = int(C.get("single_version", 1))
+    if version == 2:
+        R.use_single_v2()
+    print(f"constants (reach_io vs the AppleReachSingle-v{version} cfg):")
+    goal_cmp = (("standoff / goal tol / success tol", [R.SINGLE_STANDOFF, R.SINGLE_POS_TOL, R.SINGLE_POS_TOL],
+                 [C["single_standoff"], C["single_pos_tol"], C["success_pos_tol"]]) if version == 1 else
+                # v2: the goal is the enclosure test (single_reach.enclosed), no position tolerance to copy
+                ("standoff (touch gap)", R.SINGLE_STANDOFF, C["single_standoff"]))
     cmp = [
         ("dt", R.DT, C["dt"]), ("arm joint order", R.RIGHT_ARM_JOINTS, C["arm_joint_names"]),
         ("arm default", list(R.ARM_DEFAULT), C["arm_default"]),
@@ -212,8 +229,9 @@ def check():
         ("waist clip", [-R.WAIST_YAW_LIMIT, R.WAIST_YAW_LIMIT], C["waist_clip"]),
         ("palm offset / normal", [list(R.PALM_LOCAL_OFFSET), list(R.PALM_NORMAL_AXIS)],
          [C["palm_local_offset"], C["palm_normal_axis"]]),
-        ("standoff / goal tol / success tol", [R.SINGLE_STANDOFF, R.SINGLE_POS_TOL, R.SINGLE_POS_TOL],
-         [C["single_standoff"], C["single_pos_tol"], C["success_pos_tol"]]),
+        goal_cmp,
+        ("hand trigger / near", [R.SINGLE_HAND_TRIGGER, R.SINGLE_HAND_NEAR],
+         [C.get("hand_trigger", "level"), C.get("hand_near", 0.10)]),
         ("finger switch height", R.SINGLE_FINGER_SWITCH_DZ, C["finger_switch_dz"]),
         ("hand open", R.SINGLE_HAND_OPEN, C["hand_open"]), ("hand closed", R.SINGLE_HAND_CLOSED, C["hand_closed"]),
         ("hand level tol / ramp", [R.SINGLE_HAND_LEVEL_TOL, R.SINGLE_HAND_RAMP_S],
@@ -254,12 +272,14 @@ def check():
     flips = 0
     e_phase = e_htgt = e_goal = 0.0
     latches = 0
+    boundary = 0
     mine_all = np.zeros_like(d["obs"])
     hand_order = [hand_names.index(f"right_hand_{n}_joint") for n in R.DEX3_ORDER] if len(hand_names) else []
     sim_hand = list(C["hand_names"])
     sim_order = [sim_hand.index(f"right_hand_{n}_joint") for n in R.DEX3_ORDER]
     for e in range(N):
-        sched = R.SingleHandSchedule(ramp_s=C["hand_ramp_s"], level_tol=C["hand_level_tol"], dt=C["dt"])
+        sched = R.SingleHandSchedule(ramp_s=C["hand_ramp_s"], level_tol=C["hand_level_tol"], dt=C["dt"],
+                                     trigger=C.get("hand_trigger", "level"), near=C.get("hand_near", 0.10))
         was = False
         for t in range(T):
             jp, jv = d["joint_pos"][t, e], d["joint_vel"][t, e]
@@ -277,6 +297,13 @@ def check():
                 was = False
             if t > 0:
                 sched.step(fr.palm_ref, meas)
+                # distance trigger: the URDF palm point sits ~1 mm off the USD one, so a palm hovering
+                # at the threshold latches at a different step -- same rule: resync, count it apart
+                sim_latched = float(d["hand_phase"][t, e]) > 0.0
+                if (sched.trigger == "distance" and sched.latched != sim_latched
+                        and abs(float(np.linalg.norm(fr.palm_ref - meas)) - sched.near) < 0.002):
+                    sched.latched, sched.phase = sim_latched, float(d["hand_phase"][t, e])
+                    boundary += 1
             if sched.latched and not was:
                 latches += 1
             was = sched.latched
@@ -297,7 +324,8 @@ def check():
     for key in sl:
         report(key, err[key], tol[key])
     print(f"  palm quat sign: {flips} of {T * N} sim quaternions had w < 0 after the w >= 0 rebuild")
-    print(f"hand schedule replayed from the rebuilt palm point + the perceived apple ({latches} latches seen):")
+    print(f"hand schedule replayed from the rebuilt palm point + the perceived apple ({latches} latches seen"
+          + (f", {boundary} resynced at the distance threshold (URDF vs USD palm point, < 2 mm)" if boundary else "") + "):")
     report("hand phase", e_phase, 0.08)
     report("hand targets (Dex3 order)", e_htgt, 0.08, " rad")
     if latches == 0:

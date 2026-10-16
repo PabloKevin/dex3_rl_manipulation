@@ -9,6 +9,9 @@ imported unchanged; three of their pieces are swapped here:
   python3 sim2real/dual/run_toy.py single --policy P --speed 0.3 --target detection
   python3 sim2real/dual/run_toy.py reach  --policy P --speed 0.3 --target X Y Z
   python3 sim2real/dual/run_toy.py apple|grasp|chain ...     (as toy_apple / toy_grasp / toy_chain)
+  python3 sim2real/dual/run_toy.py calib --policy P --speed 0.3 --target detection
+                      the single toy + a calibration session after the policy stops: jog / float the
+                      palm to where it should have ended, SPACE records it (sim2real/dual/calib_reach.py)
   python3 sim2real/dual/run_toy.py v1 --speed 0.3            the harvest test bench's reach (reach_v1.py):
                       grasp_handoff_reach_apple.pt (default --policy), arm only (--waist hold), hand open,
                       the dashboard-clicked apple (--target detection); toy_reach.py's sequence
@@ -20,6 +23,8 @@ Own options (everything else goes to the toy):
                       X cm closer to the real one (the dashboard's 'closer' field overrides it)
   --strict_envelope   refuse a target outside the policy's training envelope (default: run it,
                       with a warning -- an imprecise reach beats no motion)
+  --calib JSON        single / calib: shift the apple fed to the policy by the fitted correction
+                      (sim2real/fit_reach_calib.py; on top of --closer_cm)
 The old toys (sim2real/toy_*.py) still talk to v20 directly and keep working.
 """
 from __future__ import annotations
@@ -49,6 +54,8 @@ VERBOSE = False
 #: --dds_default for the toys whose parser has no such option (all but single)
 DDS_DEFAULT = False
 CLOSER_CM = 0.0
+#: --calib: a sim2real/fit_reach_calib.py correction (reach_calib.ReachCalib), single / calib only
+CALIB = None
 #: s of the stiffness ramp kp 100 -> v20's 400 before "bye" (see DualToyMixin.handover_to_hold)
 HANDOVER_S = 1.0
 #: rad: corner rounding of the scripted joint paths (smooth_joint_path_traj)
@@ -321,9 +328,14 @@ class DualToyMixin:
             return
         u = np.array([self.apple_true[0], self.apple_true[1], 0.0])
         u /= max(np.linalg.norm(u), 1e-6)
-        self.apple = self.apple_true + d * u
+        cal = np.zeros(3) if CALIB is None else CALIB.delta(self.apple_true)
+        self.apple = self.apple_true + d * u + cal
         if self.target_true is not None:
-            self.target = self.target_true + d * u
+            self.target = self.target_true + d * u + cal
+        if CALIB is not None and not self._closer_set:
+            self._calib_path = CALIB.path
+            self.brief("INFO", f"calibration {CALIB.describe()}: the apple fed is shifted "
+                               f"{np.round(cal * 100, 1).tolist()} cm (pelvis)", fold_s=0.0)
         self._closer, self._closer_set = d, True
         self.brief("INFO", "closer = 0: the policy sees the real apple" if d == 0 else
                    f"closer = {d * 100:.1f} cm: the policy is told the apple is {d * 100:.1f} cm further, "
@@ -480,7 +492,8 @@ def main():
     global STRICT, VERBOSE
     install_ctrl_c()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "apple", "grasp", "chain", "v1"):
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "apple", "grasp", "chain", "v1",
+                                                                   "calib"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     kind, rest = argv[0], argv[1:]
@@ -494,6 +507,14 @@ def main():
     if "--closer_cm" in rest:
         i = rest.index("--closer_cm")
         CLOSER_CM = float(rest[i + 1])
+        del rest[i:i + 2]
+    global CALIB
+    if "--calib" in rest:
+        i = rest.index("--calib")
+        if kind not in ("single", "calib"):
+            sys.exit("--calib is for the single reach (single / calib)")
+        import reach_calib
+        CALIB = reach_calib.ReachCalib(rest[i + 1])
         del rest[i:i + 2]
     if not VERBOSE and not any(x in ("-h", "--help") for x in rest):
         sys.stdout = _Tee()
@@ -513,7 +534,7 @@ def main():
     T.PickerIO = DualIO
     T.Watch = LightWatch
     T.joint_path_traj = smooth_joint_path_traj
-    if kind != "single" and "--dds_default" in rest:      # the launcher adds it in --loopback
+    if kind not in ("single", "calib") and "--dds_default" in rest:      # the launcher adds it in --loopback
         global DDS_DEFAULT
         DDS_DEFAULT = True
         rest.remove("--dds_default")
@@ -522,6 +543,11 @@ def main():
         S.ToySingle = mix(S.ToySingle)
         sys.argv = [sys.argv[0]] + rest
         return S.main()
+    if kind == "calib":
+        import calib_reach as CR
+        CR.CalibToy = mix(CR.CalibToy)
+        sys.argv = [sys.argv[0]] + rest
+        return CR.main()
     if kind == "chain":
         import toy_chain as CH
         CH.ChainToy = mix(CH.ChainToy)

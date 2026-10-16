@@ -619,3 +619,23 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Reach that ends with the apple in the hand (apple_reach_single_v2_env_cfg.py),
+# and the grasp that only closes behind it (apple_grasp_single_v3_env_cfg.py)
+
+from .apple_reach_single_v2_env_cfg import AppleReachSingleV2EnvCfg, AppleReachSingleV2EnvCfg_PLAY
+from .apple_grasp_single_v3_env_cfg import AppleGraspSingleV3EnvCfg, AppleGraspSingleV3EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleReachSingleV2PPORunnerCfg, AppleGraspSingleV3PPORunnerCfg
+
+for _id, _env, _runner in (
+    ("AppleReachSingle-v2", AppleReachSingleV2EnvCfg, AppleReachSingleV2PPORunnerCfg),
+    ("AppleReachSingle-Play-v2", AppleReachSingleV2EnvCfg_PLAY, AppleReachSingleV2PPORunnerCfg),
+    ("AppleGraspSingle-v3", AppleGraspSingleV3EnvCfg, AppleGraspSingleV3PPORunnerCfg),
+    ("AppleGraspSingle-Play-v3", AppleGraspSingleV3EnvCfg_PLAY, AppleGraspSingleV3PPORunnerCfg),
+):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": _runner},
+        disable_env_checker=True,
+    )

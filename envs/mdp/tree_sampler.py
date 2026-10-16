@@ -32,22 +32,54 @@ import numpy as np
 
 class Envelope:
     """Shoulder-relative reach envelope + safe-workspace map, as
-    domain_randomization.randomize_tree_and_apple samples it."""
+    domain_randomization.randomize_tree_and_apple samples it.
+
+    apple_ref: the map / box hold the APPLE CENTRE relative to the shoulder
+    (AppleReachSingle-v2's map, scripts/probe_side_reach.py --single_v2),
+    not the grasp target (radius + standoff back along the stem).
+    stretch_frac: that share of sample_target draws comes from the cells
+    just OUTSIDE the feasible map (not feasible, within stretch_cells cells
+    of a feasible one), to see what the policy does with an apple a little
+    beyond what it can reach; last_stretch says which kind the last draw was."""
 
     def __init__(self, shoulder, reach_min, reach_max, az_center_deg, az_span_deg, dz_range,
-                 min_forward=0.0, min_horizontal=0.0, workspace=None):
+                 min_forward=0.0, min_horizontal=0.0, workspace=None, apple_ref=False,
+                 stretch_frac=0.0, stretch_cells=1):
         self.sh = np.asarray(shoulder, float)
         self.rmin, self.rmax = reach_min, reach_max
         self.az = (math.radians(az_center_deg - az_span_deg / 2), math.radians(az_center_deg + az_span_deg / 2))
         self.dz, self.fwd, self.hor = dz_range, min_forward, min_horizontal
         self.ws = workspace
+        self.apple_ref = bool(apple_ref)
+        self.stretch_frac = float(stretch_frac)
+        self.last_stretch = False
+        self.stretch = None
+        if workspace is not None and self.stretch_frac > 0.0:
+            feas = np.asarray(workspace[3], bool)
+            k = int(stretch_cells)
+            pad = np.pad(feas, k)
+            near = np.zeros_like(feas)
+            for dx in range(-k, k + 1):
+                for dy in range(-k, k + 1):
+                    for dz in range(-k, k + 1):
+                        near |= pad[k + dx:k + dx + feas.shape[0], k + dy:k + dy + feas.shape[1],
+                                    k + dz:k + dz + feas.shape[2]]
+            self.stretch = near & ~feas
+
+    def point(self, apple, stem_dir, radius, standoff):
+        """The point the box / map test: the apple centre (apple_ref) or the
+        grasp target, radius + standoff back from it along the stem."""
+        return apple if self.apple_ref else apple - stem_dir * (radius + standoff)
+
+    def _in(self, rel, mask) -> bool:
+        xe, ye, ze = self.ws[:3]
+        idx = [int(math.floor((v - e[0]) / (e[1] - e[0]))) for v, e in zip(rel, (xe, ye, ze))]
+        return all(0 <= i < n for i, n in zip(idx, mask.shape)) and bool(mask[tuple(idx)])
 
     def feasible(self, rel) -> bool:
         if self.ws is None:
             return True
-        xe, ye, ze, feas = self.ws
-        idx = [int(math.floor((v - e[0]) / (e[1] - e[0]))) for v, e in zip(rel, (xe, ye, ze))]
-        return all(0 <= i < n for i, n in zip(idx, feas.shape)) and bool(feas[tuple(idx)])
+        return self._in(rel, self.ws[3])
 
     def contains(self, target, slack=0.0) -> bool:
         rel = target - self.sh
@@ -58,7 +90,10 @@ class Envelope:
                 and rel[0] >= self.fwd - slack and rxy >= self.hor - slack and self.feasible(rel))
 
     def sample_target(self, rng: random.Random):
-        for _ in range(500):
+        stretch = self.stretch is not None and rng.random() < self.stretch_frac
+        for attempt in range(1000 if stretch else 500):
+            if stretch and attempt == 500:     # nothing beyond the map inside the box: a normal draw
+                stretch = False
             dz = rng.uniform(*self.dz)
             rxy_max = math.sqrt(max(self.rmax ** 2 - dz ** 2, 1e-4))
             rxy_min = max(math.sqrt(max(self.rmin ** 2 - dz ** 2, 0.0)), self.hor)
@@ -66,7 +101,10 @@ class Envelope:
                 continue
             rxy, az = rng.uniform(rxy_min, rxy_max), rng.uniform(*self.az)
             rel = np.array([rxy * math.cos(az), rxy * math.sin(az), dz])
-            if rel[0] >= self.fwd and self.feasible(rel):
+            if rel[0] < self.fwd:
+                continue
+            if self._in(rel, self.stretch) if stretch else self.feasible(rel):
+                self.last_stretch = stretch
                 return self.sh + rel
         raise RuntimeError("Envelope.sample_target: envelope unsatisfiable")
 
@@ -205,7 +243,10 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
             h0 = float(seed[1])
         L0, b0 = rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
         d0 = np.array([math.cos(h0), math.sin(h0), 0.0])
-        a0 = t0 + d0 * (radius + standoff) if seed is None else np.asarray(seed[0], float)
+        if seed is not None:
+            a0 = np.asarray(seed[0], float)
+        else:
+            a0 = t0 if seed_env.apple_ref else t0 + d0 * (radius + standoff)
         p0 = a0 + d0 * (radius + L0 + b0 + tr)                 # trunk axis at the seed's height
         kink = rng.uniform(*spindle["kink_range"])
         alpha, psi = math.radians(rng.uniform(*spindle["lean_deg"])), rng.uniform(0.0, 2 * math.pi)
@@ -223,7 +264,7 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
                 for _ in range(80):
                     h, L, b = rng.uniform(-lim, lim), rng.uniform(*stem_len_range), rng.uniform(*spindle["branch_range"])
                     a, d = hang(trunk_axis(tree, rng.uniform(z_lo, z_hi)), h, L, b)
-                    if seed_env.contains(a - d * (radius + standoff)) and clear(a) and \
+                    if seed_env.contains(seed_env.point(a, d, radius, standoff)) and clear(a) and \
                             all(np.linalg.norm(a - q) >= 2 * radius + sep_min for q in apples):
                         apples.append(a); dirs.append(d); stems.append(L); cluster.append(c)
                         break
@@ -243,7 +284,7 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
                     if any(np.linalg.norm(a - q) < 2 * radius + sep_min
                            for j, q in enumerate(apples) if cluster[j] != c):
                         continue
-                    if not member_env.contains(a - d * (radius + standoff), slack=0.01) or not clear(a):
+                    if not member_env.contains(member_env.point(a, d, radius, standoff), slack=0.01) or not clear(a):
                         continue
                     apples.append(a); dirs.append(d); stems.append(L); cluster.append(c); members.append(len(apples) - 1)
                     break
@@ -254,7 +295,9 @@ def sample_spindle_tree(rng: random.Random, n: int, radius: float, seed_env: Env
             continue
         apples, dirs, stems = np.array(apples), np.array(dirs), np.array(stems)
         tree.update({"apple": apples, "stem_dir": dirs, "stem_len": stems,
-                     "tip": apples + dirs * (radius + stems)[:, None], "cluster": np.array(cluster)})
+                     "tip": apples + dirs * (radius + stems)[:, None], "cluster": np.array(cluster),
+                     # apple 0 drawn beyond the feasible map (Envelope.stretch_frac): it must be the target
+                     "stretch": bool(seed is None and seed_env.last_stretch)})
         return tree
     raise RuntimeError(f"sample_spindle_tree: could not place {n} apples on one trunk in {tries} trees")
 
