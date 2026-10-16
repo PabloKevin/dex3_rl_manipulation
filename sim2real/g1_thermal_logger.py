@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-g1_thermal_logger.py
-Logger PASIVO y continuo del G1 para el modelo energía-temperatura.
+g1_thermal_logger_sdk.py
+Logger PASIVO y continuo del G1 para el modelo energía-temperatura, con el SDK de Unitree
+(unitree_sdk2py, DDS directo), SIN ROS 2. Mismo formato de salida que g1_thermal_logger.py (la versión ROS 2),
+así que g1_logger_analysis.py lo lee igual.
 
-Solo se suscribe (lowstate, BMS, placa principal); NUNCA publica comandos, así
-que puede correr mientras otras personas usan el robot.
+Solo se suscribe (rt/lowstate, rt/lf/bmsstate, rt/lf/mainboardstate); NUNCA publica comandos, así que
+puede correr mientras otras personas usan el robot.
 
 Ciclo de vida:
   - espera hasta que llegue LowState (robot encendido)  -> abre una sesión
@@ -13,24 +15,25 @@ Ciclo de vida:
     batería / cable desconectado) -> cierra la sesión y vuelve a esperar
   - si la batería sube de golpe (SOC +--soc-jump %) -> cierra y abre otra
     sesión (batería cambiada sin que se cortara el logger)
+  - si el tick del robot se reinicia -> cierra y abre otra sesión
   - Ctrl+C cierra limpio
 
 Salida:
   <out>/session_YYYYmmdd_HHMMSS/part_000.csv(.gz), part_001..., meta.json
 
 Columnas por motor (29 del G1, nombres de la tabla de abajo):
-  q_meas_<j>, dq_meas_<j>, tau_est_<j>, temp_<j> (temperature[0]), temp2_<j> (temperature[1]),
-  motorstate_<j> (bits de error: si un motor entra en protección térmica se ve acá)
+  q_meas_<j>, dq_meas_<j>, tau_est_<j>, temp_<j> (temperature[0], carcasa), temp2_<j> (temperature[1],
+  bobinado), motorstate_<j> (bits de error: si un motor entra en protección térmica se ve acá)
 Además: t_wall, t_mono, tick, mode_machine, IMU, BMS (soc, corriente, voltajes,
-temperaturas) y la placa principal en crudo (mbs_value_0..5, mbs_temp_0..5).
+temperaturas) y la placa principal en crudo (mbs_value_0..5 = voltaje_0, voltaje_1, corriente, 0, 0, 0;
+mbs_temp_0..5).
 
-Uso (en el PC conectado al robot):
-  source /opt/ros/humble/setup.bash
-  source ~/ros2_ws/install/setup.bash      # para unitree_hg
-  python3 g1_thermal_logger.py --out ~/g1_logs
+Uso (en el PC conectado al robot, con unitree_sdk2py instalado; sin source de ROS):
+  python3 g1_thermal_logger_sdk.py <interfaz>              # p. ej. enp3s0: la del cable al robot (ip a)
+  python3 g1_thermal_logger_sdk.py <interfaz> --out ~/g1_logs --rate 50
 
   # para dejarlo corriendo aunque se cierre la terminal:
-  nohup python3 g1_thermal_logger.py --out ~/g1_logs > ~/g1_logs/logger.out 2>&1 &
+  nohup python3 g1_thermal_logger_sdk.py <interfaz> --out ~/g1_logs > ~/g1_logs/logger.out 2>&1 &
 """
 
 import argparse
@@ -38,21 +41,14 @@ import gzip
 import json
 import os
 import shutil
-import struct
 import signal
 import threading
 import time
 from datetime import datetime
 
 import numpy as np
-import rclpy
-from rclpy.executors import ExternalShutdownException
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from rclpy.serialization import deserialize_message
-
-from unitree_hg.msg import LowState, BmsState, MainBoardState
-
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_, LowState_, MainBoardState_
 
 # Orden de motor_state[] en el G1 de 29 DOF (los índices 29..34 no se usan).
 G1_JOINTS = [
@@ -89,9 +85,10 @@ for _i, _c in enumerate(columns()):
         FMT[_i] = "%d"
 for _c in ("bms_t", "mbs_t"):  # horas de la última lectura de batería / placa
     FMT[columns().index(_c)] = "%.2f"
-# LowState llega en CDR: 4 bytes de encapsulado + version uint32[2] + mode_pr, mode_machine uint8 + 2 de
-# relleno -> tick (uint32) en el byte 16. Se lee de cada mensaje sin deserializar (para ver reinicios).
-TICK_OFF = 16
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 class Session:
@@ -111,10 +108,11 @@ class Session:
         self.n_buf = 0
         self.meta = dict(start=datetime.fromtimestamp(self.t0).isoformat(), start_reason=reason,
                          end=None, end_reason=None, rows=0, parts=[], soc_start=None, soc_end=None,
-                         temp_max_arm={}, columns_note="temp_=temperature[0], temp2_=temperature[1]; motorstate_ = "
+                         temp_max_arm={}, source="unitree_sdk2py (sin ROS 2)",
+                         columns_note="temp_=temperature[0] (carcasa), temp2_=temperature[1] (bobinado); motorstate_ = "
                          "bits de error del motor (en el GO-M8010-6 de Unitree el error 1 = sobrecalentamiento, protección "
                          "a 90 °C que exige reiniciar el motor; en el G1 sin documentar); "
-                         "mbs_value_* = MainBoardState.value[] en crudo")
+                         "mbs_value_* = MainBoardState.value[] en crudo (0, 1 = voltajes, 2 = corriente)")
         self._new_part()
 
     def _new_part(self):
@@ -147,7 +145,7 @@ class Session:
             threading.Thread(target=gz, daemon=False).start()
 
     def row(self):
-        """Fila libre del buffer para llenar en el lugar (sin armar listas ni strings por mensaje)."""
+        """Fila libre del buffer para llenar en el lugar."""
         if self.n_buf == len(self.buf):
             self._write_buf()
         r = self.buf[self.n_buf]
@@ -179,45 +177,47 @@ class Session:
         self.save_meta()
 
 
-class ThermalLogger(Node):
+class ThermalLogger:
+    """Los handlers del SDK (hilo de DDS) solo guardan el último mensaje; el bucle principal toma una fila a --rate
+    (LowState llega a ~500 Hz) y una vez por segundo hace flush, revisa cortes y muestra el estado."""
+
     def __init__(self, args):
-        super().__init__("g1_thermal_logger")
         self.a = args
-        self.period = 1.0 / args.rate
         self.lock = threading.Lock()
         self.session = None
-        self.last_low = None        # time.monotonic() del último LowState
-        self.last_write = 0.0
+        self.low = None              # último LowState_
+        self.last_low = None         # time.monotonic() del último LowState
+        self.n_low = 0
         self.last_tick = None
         self.soc = None
-        self.last_status = time.monotonic()
-        self.n_since_status = 0
-
-        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
-        # LowState llega a ~500 Hz: recibirlo con un callback despertaba a Python 500 veces por segundo
-        # (rclpy además convertía cada mensaje de 35 motores a objetos). Ahora la suscripción vive en un
-        # nodo que NO entra al executor, con cola de 1 (DDS, en C, descarta los viejos) y un timer a --rate
-        # toma solo el último, en bruto; se deserializa solo lo que se graba.
-        self.low_node = rclpy.create_node("g1_thermal_logger_lowstate")
-        qos1 = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.low_sub = self.low_node.create_subscription(LowState, args.lowstate_topic, lambda _m: None, qos1, raw=True)
-        self.create_timer(self.period, self.poll_low)
         self.bms_row = np.full(8, np.nan)
         self.mbs_row = np.full(13, np.nan)
-        self.create_subscription(BmsState, args.bms_topic, self.on_bms, qos)
-        self.create_subscription(MainBoardState, args.mbs_topic, self.on_mbs, qos)
-        self.create_timer(1.0, self.on_timer)
-        self.get_logger().info(
-            f"Esperando al robot en '{args.lowstate_topic}' (BMS '{args.bms_topic}', placa '{args.mbs_topic}'), "
-            f"grabando a {args.rate:g} Hz en {args.out}")
+        self.stop = threading.Event()
 
-    # ---------- callbacks ----------
+        self.subs = []
+        for topic, typ, fn in ((args.lowstate_topic, LowState_, self.on_low),
+                               (args.bms_topic, BmsState_, self.on_bms),
+                               (args.mbs_topic, MainBoardState_, self.on_mbs)):
+            sub = ChannelSubscriber(topic, typ)
+            sub.Init(fn, 1)          # cola de 1 en un hilo del SDK: si se atrasa, se queda con el último
+            self.subs.append(sub)
+        log(f"Esperando al robot en '{args.lowstate_topic}' (BMS '{args.bms_topic}', placa '{args.mbs_topic}', "
+            f"interfaz {args.iface or 'auto'}), grabando a {args.rate:g} Hz en {args.out}")
+
+    # ---------- handlers (hilo del SDK) ----------
+    def on_low(self, m):
+        with self.lock:
+            self.low = m
+            self.last_low = time.monotonic()
+            self.n_low += 1
+
     def on_bms(self, m):
         temps = [t for t in m.temperature if t != 0] or [0]
-        self.soc = int(m.soc)
-        self.bms_row[:] = [time.time(), m.soc, m.current, m.bmsvoltage[0], m.bmsvoltage[1], m.bmsvoltage[2],
-                           sum(temps) / len(temps), max(temps)]
+        row = [time.time(), m.soc, m.current, m.bmsvoltage[0], m.bmsvoltage[1], m.bmsvoltage[2],
+               sum(temps) / len(temps), max(temps)]
         with self.lock:
+            self.bms_row[:] = row
+            self.soc = int(m.soc)
             s = self.session
             if s is None:
                 return
@@ -230,34 +230,28 @@ class ThermalLogger(Node):
             s.meta["soc_end"] = self.soc
 
     def on_mbs(self, m):
-        self.mbs_row[0] = time.time()
-        self.mbs_row[1:7] = m.value
-        self.mbs_row[7:13] = m.temperature
-
-    def poll_low(self):
-        with self.low_sub.handle:
-            got = self.low_sub.handle.take_message(LowState, True)
-        if got is not None:
-            self.on_low(got[0])
-
-    def on_low(self, raw):
-        now_m = time.monotonic()
-        self.last_low = now_m
-        tick = struct.unpack_from("<I", raw, TICK_OFF)[0]
         with self.lock:
+            self.mbs_row[0] = time.time()
+            self.mbs_row[1:7] = list(m.value)
+            self.mbs_row[7:13] = list(m.temperature)
+
+    # ---------- bucle principal ----------
+    def sample(self):
+        """Una fila con el último LowState (si llegó uno nuevo desde la fila anterior)."""
+        with self.lock:
+            m, n = self.low, self.n_low
+            if m is None or n == self._n_last:
+                return
+            self._n_last = n
             if self.session is None:
                 self.session = Session(self.a.out, self.a.chunk_min, self.a.gzip, "LowState detectado")
-                self.get_logger().info(f"Robot detectado -> nueva sesión {self.session.dir}")
+                log(f"Robot detectado -> nueva sesión {self.session.dir}")
             # tick reiniciado = el robot se reinició aunque no notamos el corte
-            if self.last_tick is not None and tick + 1000 < self.last_tick:
-                self._restart_session(f"tick reiniciado {self.last_tick}→{tick}")
-            self.last_tick = tick
-            if now_m - self.last_write < 0.5 * self.period:
-                return
-            self.last_write = now_m
-            m = deserialize_message(raw, LowState)
+            if self.last_tick is not None and m.tick + 1000 < self.last_tick:
+                self._restart_session(f"tick reiniciado {self.last_tick}→{m.tick}")
+            self.last_tick = m.tick
             r = self.session.row()
-            r[0], r[1], r[2], r[3] = time.time(), now_m, m.tick, m.mode_machine
+            r[0], r[1], r[2], r[3] = time.time(), time.monotonic(), m.tick, m.mode_machine
             ms = m.motor_state
             c = 4
             for i in range(len(G1_JOINTS)):
@@ -274,19 +268,20 @@ class ThermalLogger(Node):
             c += 14
             r[c:c + 8] = self.bms_row
             r[c + 8:c + 21] = self.mbs_row
-            self.n_since_status += 1
+            self.n_rows_status += 1
 
-    def on_timer(self):
+    def every_second(self):
         with self.lock:
             s = self.session
             if s is None:
                 return
             if self.last_low is not None and time.monotonic() - self.last_low > self.a.timeout_s:
-                self.get_logger().warn(f"Sin LowState hace {self.a.timeout_s:g} s -> cierro la sesión "
-                                       f"({s.rows} filas, {(time.time() - s.t0) / 3600:.2f} h). Espero al robot.")
+                log(f"Sin LowState hace {self.a.timeout_s:g} s -> cierro la sesión "
+                    f"({s.rows} filas, {(time.time() - s.t0) / 3600:.2f} h). Espero al robot.")
                 s.close(f"sin LowState {self.a.timeout_s:g} s (apagado / batería / desconexión)")
                 self.session = None
                 self.last_tick = None
+                self.low = None
                 return
             if s.n_buf:  # T máx de los brazos (1 vez por segundo, con la última fila)
                 last = s.buf[s.n_buf - 1]
@@ -301,13 +296,33 @@ class ThermalLogger(Node):
                 tm = s.meta["temp_max_arm"]
                 hot = ", ".join(f"{k.replace('left_', 'L_').replace('right_', 'R_')} {v}"
                                 for k, v in sorted(tm.items(), key=lambda kv: -kv[1])[:3])
-                self.get_logger().info(f"{(time.time() - s.t0) / 60:.0f} min, {self.n_since_status / dt:.0f} Hz, "
-                                       f"SOC {self.soc}%, T máx brazos: {hot}")
+                bms = "sí" if np.isfinite(self.bms_row[0]) else "NO"
+                mbs = "sí" if np.isfinite(self.mbs_row[0]) else "NO"
+                log(f"{(time.time() - s.t0) / 60:.0f} min, {self.n_rows_status / dt:.0f} Hz grabando, SOC {self.soc}%, "
+                    f"BMS {bms}, placa {mbs}, T máx brazos: {hot}")
                 self.last_status = time.monotonic()
-                self.n_since_status = 0
+                self.n_rows_status = 0
+
+    def run(self):
+        self._n_last = 0
+        self.n_rows_status = 0
+        self.last_status = time.monotonic()
+        period = 1.0 / self.a.rate
+        t_next = time.monotonic()
+        t_sec = t_next + 1.0
+        while not self.stop.is_set():
+            self.sample()
+            now = time.monotonic()
+            if now >= t_sec:
+                self.every_second()
+                t_sec = now + 1.0
+            t_next += period
+            if t_next < now:     # atrasado (p. ej. flush lento): no recuperar de golpe
+                t_next = now + period
+            self.stop.wait(max(0.0, t_next - time.monotonic()))
 
     def _restart_session(self, reason):
-        self.get_logger().warn(reason + " -> nueva sesión")
+        log(reason + " -> nueva sesión")
         self.session.close(reason)
         self.session = Session(self.a.out, self.a.chunk_min, self.a.gzip, reason)
         self.last_tick = None
@@ -316,12 +331,15 @@ class ThermalLogger(Node):
         with self.lock:
             if self.session is not None:
                 self.session.close("Ctrl+C / fin del logger")
-                self.get_logger().info(f"Sesión cerrada: {self.session.dir}")
+                log(f"Sesión cerrada: {self.session.dir}")
                 self.session = None
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Logger pasivo continuo del G1 (temperatura, torque, energía).")
+    ap = argparse.ArgumentParser(description="Logger pasivo continuo del G1 con unitree_sdk2py (sin ROS 2).")
+    ap.add_argument("iface", nargs="?", default=None,
+                    help="interfaz de red conectada al robot (p. ej. enp3s0, ver 'ip a'); sin ella, automática")
+    ap.add_argument("--domain", type=int, default=0, help="dominio DDS (el G1 usa 0)")
     ap.add_argument("--out", default=os.path.expanduser("~/g1_logs"))
     ap.add_argument("--rate", type=float, default=50.0, help="Hz de grabación (LowState llega a ~500 Hz)")
     ap.add_argument("--chunk-min", type=float, default=10.0, help="minutos por archivo CSV")
@@ -329,28 +347,26 @@ def main():
     ap.add_argument("--soc-jump", type=int, default=5, help="subida de SOC (%%) que se toma como batería nueva")
     ap.add_argument("--status-s", type=float, default=60.0, help="cada cuánto imprimir el estado")
     ap.add_argument("--no-gzip", dest="gzip", action="store_false", help="no comprimir los trozos cerrados")
-    ap.add_argument("--lowstate-topic", default="lowstate")
-    ap.add_argument("--bms-topic", default="lf/bmsstate")
-    ap.add_argument("--mbs-topic", default="lf/mainboardstate")
+    ap.add_argument("--lowstate-topic", default="rt/lowstate")
+    ap.add_argument("--bms-topic", default="rt/lf/bmsstate")
+    ap.add_argument("--mbs-topic", default="rt/lf/mainboardstate")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    def on_sigterm(*_):
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, on_sigterm)   # kill / apagado del PC -> cierre limpio
+    if args.iface:
+        ChannelFactoryInitialize(args.domain, args.iface)
+    else:
+        ChannelFactoryInitialize(args.domain)
+    lg = ThermalLogger(args)
 
-    rclpy.init()
-    node = ThermalLogger(args)
+    def stop(*_):
+        lg.stop.set()
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
     try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
-        pass
+        lg.run()
     finally:
-        node.shutdown()
-        node.low_node.destroy_node()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        lg.shutdown()
 
 
 if __name__ == "__main__":
