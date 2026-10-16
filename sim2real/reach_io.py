@@ -17,6 +17,9 @@ Two policy layouts (picked from the policy's input size):
   "single" (40 in / 8 out): AppleReachSingle-v1 -- the "waist" layout WITHOUT the palm
       touch input, + the hand phase LAST. Same size as "waist", so it is never picked
       by size: ReachPolicy(path, layout="single") (sim2real/toy_reach_single.py)
+  "single_tactile" (41 in / 8 out): AppleReachSingleTactile-v1 -- the "waist" layout
+      (palm touch in its slot, before the ring) + the hand phase LAST; v2's goal / hand
+      trigger / limiter (envs/apple_reach_single_tactile_env_cfg.py). Chosen by name too.
 
 Observation, in the order the policy was trained on
 (apple_grasp_env_cfg.ObservationsCfg.PolicyObs + the tree / waist terms):
@@ -121,9 +124,9 @@ STEM_HEADING_MAX_DEG = 30.0
 URDF_DEFAULT = os.path.expanduser("~/g1_fruits_picker/robot_model_urdf/g1_29dof_with_hand.urdf")
 POLICY_DEFAULT = os.path.join(REPO, "envs", "agents", "best_weights", "grasp_handoff_reach_spindle.pt")
 
-LAYOUTS = {40: "waist", 37: "tree"}
+LAYOUTS = {40: "waist", 37: "tree", 41: "single_tactile"}
 #: (inputs, outputs) of every layout; "single" is only ever chosen by name
-LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8)}
+LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8), "single_tactile": (41, 8)}
 
 #: AppleReachSingle-v1 (envs/apple_reach_single_env_cfg.py; checked by validate_single_io.py)
 #: goal: the apple centre (radius + SINGLE_STANDOFF) out from the palm point along the palm
@@ -174,8 +177,8 @@ def use_single_v2() -> None:
 def single_version_of(policy_path: str) -> int:
     """2 when the policy is an AppleReachSingle-v2 one: its path, or the .txt naming the
     checkpoint it was exported from (scripts/train_single_v2_chain.sh), says single_v2."""
-    if "single_v2" in policy_path:
-        return 2
+    if "single_v2" in policy_path or "single_tactile" in policy_path:
+        return 2                     # AppleReachSingleTactile-v1 is v2 + the palm touch input
     side = os.path.splitext(policy_path)[0] + ".txt"
     if os.path.exists(side) and "single_v2" in open(side).read():
         return 2
@@ -354,13 +357,15 @@ def build_obs(layout: str, kin: G1Kinematics, st: ReachState, prev_raw: np.ndarr
         st.arm_q - ARM_DEFAULT,
         st.arm_dq,
         st.apple - fr.palm_ref,
-        palm_quat_obs(fr, float(st.waist_q[0]), unyawed=(layout == "waist")),
+        palm_quat_obs(fr, float(st.waist_q[0]), unyawed=(layout in ("waist", "single_tactile"))),
         np.asarray(prev_raw, float)[:7],
         [float(st.touch_force)],
         ring,
     ]
-    if layout == "waist":
+    if layout in ("waist", "single_tactile"):
         parts += [[st.waist_q[0] - WAIST_DEFAULT[0]], [st.waist_dq[0]], [float(prev_raw[7])]]
+    if layout == "single_tactile":
+        parts += [[float(st.hand_phase)]]
     return np.concatenate([np.asarray(p, float).ravel() for p in parts]).astype(np.float32), fr
 
 
@@ -424,7 +429,7 @@ def make_limiters(layout: str, clip: str = "v3", dtype=np.float64) -> dict:
         lo, hi = ARM_DEFAULT - ARM_TARGET_CLIP_OLD, ARM_DEFAULT + ARM_TARGET_CLIP_OLD
     out = {"arm": RateLimiter(ARM_DEFAULT, ARM_SCALE, lo, hi, ARM_MAX_VELOCITY, ARM_MAX_ACCELERATION,
                               brake=ARM_BRAKE, dtype=dtype)}
-    if layout in ("waist", "single"):
+    if layout in ("waist", "single", "single_tactile"):
         out["waist"] = RateLimiter([WAIST_DEFAULT[0]], WAIST_SCALE, [-WAIST_YAW_LIMIT], [WAIST_YAW_LIMIT],
                                    WAIST_MAX_VELOCITY, WAIST_MAX_ACCELERATION, brake=True, dtype=dtype)
     return out
@@ -461,7 +466,7 @@ class ReachPolicy:
         if self.n_in not in LAYOUTS:
             raise ValueError(f"{path}: {self.n_in} inputs -- not a reach layout {sorted(LAYOUTS)}")
         self.layout = LAYOUTS[self.n_in]
-        want = 8 if self.layout == "waist" else 7
+        want = LAYOUT_DIMS[self.layout][1]
         if self.n_out != want:
             raise ValueError(f"{path}: {self.n_out} outputs, the {self.layout} layout has {want}")
 

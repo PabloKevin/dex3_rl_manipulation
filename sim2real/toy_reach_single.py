@@ -109,6 +109,10 @@ def parse_args():
                    help="keep the SDK's DDS config (multicast every 30 s: ~20-35 s until the daemon sees us)")
     p.add_argument("--robot_ip", default="192.168.123.164", help="unicast DDS peer (the robot's Jetson)")
     p.add_argument("--spdp_s", type=float, default=1.0, help="s between this process's DDS announcements")
+    p.add_argument("--palm_touch", choices=["virtual", "zero"], default="virtual",
+                   help="AppleReachSingleTactile-v1 only (41 inputs): its palm-touch input from the perceived "
+                        "apple's contact with the palm (virtual, as toy_reach.py feeds the spindle) or always 0 "
+                        "(the real palm reading is not used)")
     p.add_argument("--single_version", choices=["auto", "1", "2"], default="auto",
                    help="1: AppleReachSingle-v1 (2 cm short, hand closes level with the apple); 2: "
                         "AppleReachSingle-v2 (apple enclosed, hand closes within 10 cm, apple-centred envelope); "
@@ -118,7 +122,7 @@ def parse_args():
     if mine.help:
         print(__doc__)
         print("toy_reach_single.py options:\n  --hand {schedule,keep}  --hand_ramp_s S  --layout_ok  "
-              "--single_version {auto,1,2}\n"
+              "--single_version {auto,1,2}  --palm_touch {virtual,zero}\n"
               "  --dds_default  --robot_ip IP  --spdp_s S\n"
               "toy_reach.py options (all apply, except --hand / --touch / --grasp):")
         sys.argv = [sys.argv[0], "--help"]
@@ -141,6 +145,7 @@ def parse_args():
           + ("once the palm point is level with the apple" if R.SINGLE_HAND_TRIGGER == "level"
              else f"within {R.SINGLE_HAND_NEAR * 100:.0f} cm of the apple"))
     a.hand = mine.hand
+    a.palm_touch = mine.palm_touch
     a.layout_ok = mine.layout_ok
     a.dds_default, a.robot_ip, a.spdp_s = mine.dds_default, mine.robot_ip, mine.spdp_s
     a.hand_ramp_s = mine.hand_ramp_s or R.SINGLE_HAND_RAMP_S / a.speed
@@ -174,9 +179,17 @@ class ToySingle(T.Toy):
             print(f"  [time] {time.monotonic() - self.t_launch:5.1f} s  lowstate + arm daemon seen "
                   f"({time.monotonic() - t:.1f} s)", flush=True)
         self.io.connect = connect_timed
-        # toy_reach picks the layout by size ("waist" for 40 inputs): load it by name
-        self.pol = R.ReachPolicy(args.policy, layout="single")
-        self.layout = "single"
+        # toy_reach picks the layout by size ("waist" for 40 inputs): load it by name. 41 inputs =
+        # AppleReachSingleTactile-v1 (the palm touch input added back)
+        try:
+            self.pol = R.ReachPolicy(args.policy, layout="single")
+        except ValueError:
+            self.pol = R.ReachPolicy(args.policy, layout="single_tactile")
+        self.layout = self.pol.layout
+        if self.layout == "single_tactile":
+            print(f"  TACTILE single reach (41 inputs): palm touch input = "
+                  + ("the perceived apple's contact with the palm (virtual)" if args.palm_touch == "virtual"
+                     else "always 0"))
         self.sched = R.SingleHandSchedule(ramp_s=args.hand_ramp_s)
         self.hand_sent = None
         hand_set = self.io.hand_set
@@ -191,6 +204,12 @@ class ToySingle(T.Toy):
             else:
                 hand_set(kind)
         self.io.hand_set = hand_set_single
+
+    def palm_touch(self, fr) -> float:
+        """The tactile policy's palm-touch input (N); 0 for the 40-input single layout."""
+        if self.layout != "single_tactile" or self.args.palm_touch != "virtual":
+            return 0.0
+        return float(R.virtual_touch_force(fr, self.apple, self.args.apple_radius))
 
     def enter_qref(self, q_hold, timeout_s=45.0):
         t = time.monotonic()
@@ -417,8 +436,9 @@ class ToySingle(T.Toy):
                              f"over {a.hand_ramp_s:.1f} s", C_CYN)
                 if a.hand == "schedule":
                     self.send_hand()
+                touch = self.palm_touch(fr)
                 st = R.ReachState(arm_q=s.arm_q, arm_dq=s.arm_dq, waist_q=s.waist_q, waist_dq=s.waist_dq,
-                                  apple=self.apple, hand_phase=phase)
+                                  apple=self.apple, touch_force=touch, hand_phase=phase)
                 obs, _ = R.build_obs(self.layout, self.kin, st, prev_raw, fr)
                 raw = self.pol(obs)
                 slow = a.safety == "on" and level >= sm.SLOW
@@ -439,7 +459,7 @@ class ToySingle(T.Toy):
                     dur = max(0.5, 1.875 * abs(w_des - float(s.waist_q[0])) / (R.WAIST_MAX_VELOCITY * speed))
                     io.waist_to(w_des, dur)
                     waist_sent, waist_sent_t = w_des, now
-                self.ctx.update(gap=gap, seat=seat, touch=0.0, clipped=clipped, speed_now=speed)
+                self.ctx.update(gap=gap, seat=seat, touch=round(touch, 2), clipped=clipped, speed_now=speed)
                 p2 = tw()
                 prof["obs+policy"] += p2 - p1
                 level, out = W.step(s, fr, q_cmd, L["arm"].vel, a.speed, self.ctx)
@@ -558,7 +578,8 @@ class ToySingle(T.Toy):
             fr = self.frames(s)
             phase = self.sched.step(fr.palm_ref, self.apple)
             obs, _ = R.build_obs(self.layout, self.kin, R.ReachState(s.arm_q, s.arm_dq, s.waist_q, s.waist_dq,
-                                                                     self.apple, hand_phase=phase), prev_raw, fr)
+                                                                     self.apple, touch_force=self.palm_touch(fr),
+                                                                     hand_phase=phase), prev_raw, fr)
             raw = self.pol(obs)
             q_cmd = np.clip(L["arm"].step(raw[:7], s.arm_q, a.speed), self.lo, self.hi)
             self.ctx["gap"] = float(np.linalg.norm(self.apple - fr.palm_ref)) - a.apple_radius
@@ -574,10 +595,14 @@ class ToySingle(T.Toy):
             io.sleep_until(t_next)
         obs0, raw0 = first
         np.set_printoptions(precision=3, suppress=True, linewidth=140)
-        print("\n  first observation (single layout):")
-        for nm, i, j in [("arm q - default", 0, 7), ("arm dq", 7, 14), ("apple - palm", 14, 17),
-                         ("palm quat", 17, 21), ("prev raw", 21, 28), ("ring", 28, 36),
-                         ("waist q, dq, prev raw", 36, 39), ("hand phase", 39, 40)]:
+        print(f"\n  first observation ({self.layout} layout):")
+        rows = [("arm q - default", 0, 7), ("arm dq", 7, 14), ("apple - palm", 14, 17),
+                ("palm quat", 17, 21), ("prev raw", 21, 28), ("ring", 28, 36),
+                ("waist q, dq, prev raw", 36, 39), ("hand phase", 39, 40)]
+        if self.layout == "single_tactile":
+            rows = rows[:5] + [("palm touch", 28, 29), ("ring", 29, 37), ("waist q, dq, prev raw", 37, 40),
+                               ("hand phase", 40, 41)]
+        for nm, i, j in rows:
             print(f"    {nm:22s} {obs0[i:j]}")
         print(f"  first raw action {raw0}\n  -> first joint targets would move the arm toward "
               f"{np.round(np.clip(R.ARM_DEFAULT + 0.5 * raw0[:7], self.lo, self.hi), 3).tolist()} (before the limiter)")
