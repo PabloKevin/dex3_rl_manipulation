@@ -27,6 +27,10 @@ Own options (everything else goes to the toy):
                       X cm closer to the real one (the dashboard's 'closer' field overrides it)
   --strict_envelope   refuse a target outside the policy's training envelope (default: run it,
                       with a warning -- an imprecise reach beats no motion)
+  --lag_gate RAD      hold the arm command (policy limiter and scripted moves) while it is more than RAD
+                      ahead of the measured arm (default 0.12, under the daemon's 0.15 'stuck' threshold;
+                      0 = off): a delayed arm is waited for instead of run away from; after 2 s of
+                      holding it lets go (a blocked arm is the daemon's 'stuck' stop, as before)
   --calib JSON        single / calib: shift the apple fed to the policy by the fitted correction
                       (sim2real/fit_reach_calib.py; on top of --closer_cm)
   --stop_cm X         tree: freeze the arm when the palm surface is X cm from the apple surface (forward
@@ -70,6 +74,97 @@ HANDOVER_S = 1.0
 CORNER_BLEND_RAD = 0.20
 #: the paths home found by earlier runs (home_paths.json)
 HOME_PATHS = HomePaths()
+#: --lag_gate: rad the arm command may lead the measured arm (0 = off)
+LAG_GATE = 0.12
+#: s of continuous holding after which the gate lets the command go on
+LAG_GATE_MAX_S = 2.0
+
+
+class LagGate:
+    """Counts the gate's holds (one per run, read by DualToyMixin)."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.n_steps, self.n_spells, self.longest_s, self.gave_up = 0, 0, 0.0, 0
+        self._since = None
+
+    def check(self, lead: float, now: float) -> bool:
+        """-> True = hold this step."""
+        if LAG_GATE <= 0 or lead <= LAG_GATE:
+            if self._since is not None:
+                self.longest_s = max(self.longest_s, now - self._since)
+            self._since = None
+            return False
+        if self._since is None:
+            self._since = now
+            self.n_spells += 1
+        if now - self._since > LAG_GATE_MAX_S:
+            if now - self._since - R.DT <= LAG_GATE_MAX_S:
+                self.gave_up += 1
+            return False
+        self.n_steps += 1
+        return True
+
+    def summary(self):
+        if not self.n_spells:
+            return None
+        return (f"lag gate: the arm fell > {LAG_GATE:g} rad behind its command {self.n_spells}x; the command "
+                f"waited {self.n_steps * R.DT:.1f} s in all (longest {self.longest_s:.2f} s)"
+                + (f", gave up waiting {self.gave_up}x (> {LAG_GATE_MAX_S:g} s)" if self.gave_up else ""))
+
+
+GATE = LagGate()
+_limiter_step = R.RateLimiter.step
+
+
+def _gated_step(self, raw, q_meas, speed=1.0):
+    """RateLimiter.step, ARM limiters only (gate_arm): while the previous command leads the
+    measured arm by more than LAG_GATE, the command stays where it is (velocity 0)."""
+    if getattr(self, "gate_arm", False) and self.k >= self.ANCHOR_STEPS and q_meas is not None:
+        lead = float(np.max(np.abs(self.prev - np.asarray(q_meas, float))))
+        if GATE.check(lead, time.monotonic()):
+            self.desired = np.clip(np.asarray(raw, self.offset.dtype) * self.scale + self.offset, self.lo, self.hi)
+            self.vel = np.zeros_like(self.vel)
+            self.k += 1
+            return self.prev.copy()
+    return _limiter_step(self, raw, q_meas, speed)
+
+
+def _gate_arm(make):
+    def wrapped(*a, **k):
+        L = make(*a, **k)
+        if "arm" in L:
+            L["arm"].gate_arm = True
+        return L
+    return wrapped
+
+
+class _GatedTraj:
+    """A scripted joint path that waits for the arm: the next point is only given while the
+    last one sent leads the measured arm by <= LAG_GATE (toy_reach.Toy.stream plays it)."""
+
+    def __init__(self, toy, traj):
+        self.toy, self.traj = toy, list(traj)
+
+    def __len__(self):
+        return len(self.traj)
+
+    def __iter__(self):
+        io, last, i = self.toy.io, None, 0
+        while i < len(self.traj):
+            if last is not None:
+                try:
+                    lead = float(np.max(np.abs(np.asarray(last, float) - io.read().arm_q)))
+                except Exception:
+                    lead = 0.0
+                if GATE.check(lead, time.monotonic()):
+                    yield last
+                    continue
+            last = self.traj[i]
+            i += 1
+            yield last
 
 _linear_joint_path_traj = T.joint_path_traj
 
@@ -392,7 +487,9 @@ class DualToyMixin:
 
     def policy_loop(self):
         d = self.closer_m()
+        self.gate_report("before the policy")
         out = super().policy_loop()
+        self.gate_report("policy")
         o = str(out[0])
         if "Ctrl-C" in o:
             pass                                   # the easter egg waits for the lowering (finish)
@@ -417,6 +514,19 @@ class DualToyMixin:
         except Exception:
             pass
         return out
+
+    # ---- the lag gate on scripted moves ----
+    def stream(self, traj, *args, **kw):
+        if LAG_GATE > 0 and getattr(self.io, "commands", False) and len(traj) > 1 \
+                and np.ptp(np.asarray(traj, float), axis=0).max() > 1e-4:
+            traj = _GatedTraj(self, traj)
+        return super().stream(traj, *args, **kw)
+
+    def gate_report(self, what):
+        msg = GATE.summary()
+        if msg:
+            self.brief("WARN" if GATE.gave_up or GATE.n_steps * R.DT > 1.0 else "INFO", f"{what}: {msg}", fold_s=0.0)
+        GATE.reset()
 
     # ---- one GO ----
     def confirm(self, prompt) -> bool:
@@ -569,6 +679,16 @@ def main():
         i = rest.index("--closer_cm")
         CLOSER_CM = float(rest[i + 1])
         del rest[i:i + 2]
+    global LAG_GATE
+    if "--lag_gate" in rest:
+        i = rest.index("--lag_gate")
+        LAG_GATE = max(0.0, float(rest[i + 1]))
+        del rest[i:i + 2]
+    if LAG_GATE > 0:
+        R.RateLimiter.step = _gated_step
+        R.make_limiters = _gate_arm(R.make_limiters)
+        if hasattr(R, "make_grasp_limiters"):
+            R.make_grasp_limiters = _gate_arm(R.make_grasp_limiters)
     global CALIB
     if "--calib" in rest:
         i = rest.index("--calib")
