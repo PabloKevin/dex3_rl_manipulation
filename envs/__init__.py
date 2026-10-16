@@ -639,3 +639,17 @@ for _id, _env, _runner in (
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": _runner},
         disable_env_checker=True,
     )
+
+# v2 + palm touch input and the spindle reaches' touch rewards (apple_reach_single_tactile_env_cfg.py)
+
+from .apple_reach_single_tactile_env_cfg import AppleReachSingleTactileEnvCfg, AppleReachSingleTactileEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleReachSingleTactilePPORunnerCfg
+
+for _id, _env in (("AppleReachSingleTactile-v1", AppleReachSingleTactileEnvCfg),
+                  ("AppleReachSingleTactile-Play-v1", AppleReachSingleTactileEnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleReachSingleTactilePPORunnerCfg},
+        disable_env_checker=True,
+    )

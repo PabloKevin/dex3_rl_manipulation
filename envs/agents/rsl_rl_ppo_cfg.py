@@ -359,6 +359,14 @@ class AppleReachSingleV2PPORunnerCfg(AppleReachSinglePPORunnerCfg):
 
 
 @configclass
+class AppleReachSingleTactilePPORunnerCfg(AppleReachSingleV2PPORunnerCfg):
+    """AppleReachSingleTactile-v1: v2 with the palm touch input and the spindle
+    reaches' touch rewards (a teacher candidate). Own log folder
+    (logs/rsl_rl/apple_reach_single_tactile)."""
+    experiment_name = "apple_reach_single_tactile"
+
+
+@configclass
 class AppleGraspSingleV3PPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
     """AppleGraspSingle-v3: grasp only, behind AppleReachSingle-v2. Own log
     folder (logs/rsl_rl/apple_grasp_single_v3)."""
