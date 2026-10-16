@@ -15,6 +15,10 @@ imported unchanged; three of their pieces are swapped here:
   python3 sim2real/dual/run_toy.py v1 --speed 0.3            the harvest test bench's reach (reach_v1.py):
                       grasp_handoff_reach_apple.pt (default --policy), arm only (--waist hold), hand open,
                       the dashboard-clicked apple (--target detection); toy_reach.py's sequence
+  python3 sim2real/dual/run_toy.py tree --speed 0.3          AppleReachTree-v1 (apple_reach_tree 2026-10-05_01-33-22
+                      model_2000, default --policy): arm only (--waist hold), hand open, the palm-touch input
+                      always 0 N (--touch zero), the clearance ring all free; the policy is stopped (arm frozen)
+                      when the palm's surface is --stop_cm (default 1) from the apple's surface
 
 Own options (everything else goes to the toy):
   --verbose           the toy's full output in this terminal (default: only the short log here,
@@ -25,6 +29,8 @@ Own options (everything else goes to the toy):
                       with a warning -- an imprecise reach beats no motion)
   --calib JSON        single / calib: shift the apple fed to the policy by the fitted correction
                       (sim2real/fit_reach_calib.py; on top of --closer_cm)
+  --stop_cm X         tree: freeze the arm when the palm surface is X cm from the apple surface (forward
+                      kinematics: |apple - palm point| - radius - the palm's 16 mm contact height)
 The old toys (sim2real/toy_*.py) still talk to v20 directly and keep working.
 """
 from __future__ import annotations
@@ -35,6 +41,7 @@ import os
 import select
 import signal
 import sys
+import threading
 import time
 
 import numpy as np
@@ -45,6 +52,7 @@ sys.path[:0] = [HERE, SIM2REAL]
 import toy_reach as T  # noqa: E402
 from brief_log import BriefLog  # noqa: E402
 from dual_io import V20_HOLD_KD, V20_HOLD_KP, DualIO  # noqa: E402
+from home_paths import HomePaths  # noqa: E402
 from light_watch import LightWatch  # noqa: E402
 
 R = T.R
@@ -60,6 +68,8 @@ CALIB = None
 HANDOVER_S = 1.0
 #: rad: corner rounding of the scripted joint paths (smooth_joint_path_traj)
 CORNER_BLEND_RAD = 0.20
+#: the paths home found by earlier runs (home_paths.json)
+HOME_PATHS = HomePaths()
 
 _linear_joint_path_traj = T.joint_path_traj
 
@@ -209,13 +219,32 @@ class DualToyMixin:
     #   finish_my_work "I have finished my work here"                  back home, run over
     #   hasta_la_vista "Hasta la vista, baby" (sim2real/voice)         Ctrl-C, before the run ends
     def hasta_la_vista(self):
-        """Ctrl-C: the clip (sim2real/voice/hasta_la_vista_baby.wav) plays at once -- it jumps the
-        queue -- and finish() waits for it before the process ends. Once per run."""
+        """Easter egg, not a function of the run. Ctrl-C: the arm is lowered by the daemon's RESET
+        (kp 0, light kd) and the clip plays from its own thread so that it ENDS as the arm settles,
+        i.e. while it descends -- never at the Ctrl-C itself. Once per run."""
         if getattr(self, "_said_help", False):
             return
         self._said_help = True
-        self.voice("hasta_la_vista", priority=True, max_age_s=0.0)
-        self.brief("INFO", "Ctrl-C: hasta la vista, baby", fold_s=0.0)
+        io = self.io
+
+        def clip_s():
+            try:
+                import wave
+                with wave.open(os.path.join(os.path.dirname(HERE), "voice", "hasta_la_vista_baby.wav")) as w:
+                    return w.getnframes() / float(w.getframerate())
+            except Exception:
+                return 2.5
+
+        def say_it(lower_s):
+            def run():
+                time.sleep(max(0.0, lower_s - clip_s() - 0.2))
+                self.voice("hasta_la_vista", priority=True, max_age_s=0.0)
+            threading.Thread(target=run, daemon=True, name="hasta_la_vista").start()
+            self.brief("INFO", f"Ctrl-C: lowering the arm ({lower_s:g} s)", fold_s=0.0)
+        try:
+            io.lower_arm(on_descent=say_it)
+        except Exception as e:
+            self.brief("WARN", f"lowering the arm failed: {e}")
 
     def voice(self, key, **kw):
         speak = getattr(self.io, "speak", None)
@@ -223,16 +252,36 @@ class DualToyMixin:
             speak(key, **kw)
 
     def plan_home(self, q_from, s):
-        """The straight path first (one body check, ~10 ms); the toy's full search of ~120
-        candidate paths (~10 s with nothing streamed) only when the straight one collides."""
+        """The straight path first (one body check, ~10 ms); then the paths home remembered from
+        earlier runs that started near here (home_paths.py, each re-checked from where the arm
+        IS); the toy's full search of ~120 candidate paths (~10 s with nothing streamed) only
+        when none of those is clear -- and what it finds is remembered for next time."""
         traj = T.joint_path_traj([np.asarray(q_from, float), R.HOME_Q], self.args.move_speed)
         if self.path_check(traj, s)[0]:
             return (), "straight"
+        w = float(s.waist_q[0])
+        try:
+            for via, d, e in HOME_PATHS.candidates(q_from, w):
+                tr = T.joint_path_traj([np.asarray(q_from, float), *via, R.HOME_Q], self.args.move_speed)
+                if self.path_check(tr, s)[0]:
+                    HOME_PATHS.used(e)
+                    self.brief("INFO", f"path home: a remembered one (stored {e.get('t', '?')}, start "
+                                       f"{d:.2f} rad from here, used {e.get('used', 0)}x)", fold_s=0.0)
+                    return via, f"remembered ({e.get('name') or 'via'}, start {d:.2f} rad away)"
+        except Exception as ex:
+            self.brief("WARN", f"remembered paths home unusable ({ex}): searching")
         self.brief.wait("searching a path home around the body (straight one collides)")
         try:
-            return super().plan_home(q_from, s)
+            via, why = super().plan_home(q_from, s)
         finally:
             self.brief.wait(None)
+        if via:
+            try:
+                HOME_PATHS.store(q_from, w, via, str(why).split(":")[0])
+                self.brief("INFO", f"path home found and remembered ({len(HOME_PATHS.entries)} stored)", fold_s=0.0)
+            except Exception:
+                pass
+        return via, why
 
     # ---- which apple: the one clicked on the dashboard ----
     def plan_from_detections(self):
@@ -346,7 +395,7 @@ class DualToyMixin:
         out = super().policy_loop()
         o = str(out[0])
         if "Ctrl-C" in o:
-            self.hasta_la_vista()
+            pass                                   # the easter egg waits for the lowering (finish)
         elif o.startswith("REACHED"):
             self.voice("got_it")
         elif o.startswith("TIME LIMIT"):
@@ -357,9 +406,14 @@ class DualToyMixin:
         try:
             if getattr(self, "apple_true", None) is not None:
                 fr = self.frames(self.io.read())
-                gap = float(np.linalg.norm(self.apple_true - fr.palm_ref)) - self.args.apple_radius
+                v = self.apple_true - fr.palm_ref
+                gap = float(np.linalg.norm(v)) - self.args.apple_radius
+                n_gap = float(v @ fr.palm_normal) - self.args.apple_radius - R.PALM_TOUCH_HEIGHT
+                lat = float(np.linalg.norm(v - (v @ fr.palm_normal) * fr.palm_normal))
                 self.brief("INFO", f"palm {gap * 100:+.1f} cm from the REAL apple's surface"
-                                   + (f" (policy aimed {d * 100:.1f} cm past it)" if d > 0 else ""), fold_s=0.0)
+                                   + (f" (policy aimed {d * 100:.1f} cm past it)" if d > 0 else "")
+                                   + f"; along the palm normal palm surface -> apple surface {n_gap * 100:+.1f} cm, "
+                                     f"apple centre {lat * 100:.1f} cm off the normal", fold_s=0.0)
         except Exception:
             pass
         return out
@@ -447,8 +501,9 @@ class DualToyMixin:
         global FINISHING
         FINISHING = True
         o = str(outcome)
-        if "Ctrl-C" in o:
-            self.hasta_la_vista()
+        ctrl_c = "Ctrl-C" in o
+        if ctrl_c:
+            pass
         elif o.startswith(("REACHED", "TIME LIMIT", "HOME")):
             self.voice("finish_my_work", max_age_s=0.0)
         elif not getattr(self, "_said_help", False):
@@ -460,6 +515,8 @@ class DualToyMixin:
         try:
             if hasattr(self.io, "speech_done"):
                 self.io.leave_rl()                    # the robot holds the arm while the last line plays
+                if ctrl_c:
+                    self.hasta_la_vista()             # lowers the arm; the clip plays during the descent
                 self.io.speech_done(8.0)              # ... heard before the process ends
         except Exception:
             pass
@@ -493,7 +550,7 @@ def main():
     install_ctrl_c()
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "apple", "grasp", "chain", "v1",
-                                                                   "calib"):
+                                                                   "tree", "calib"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     kind, rest = argv[0], argv[1:]
@@ -515,6 +572,13 @@ def main():
             sys.exit("--calib is for the single reach (single / calib)")
         import reach_calib
         CALIB = reach_calib.ReachCalib(rest[i + 1])
+        del rest[i:i + 2]
+    stop_cm = 1.0
+    if "--stop_cm" in rest:
+        i = rest.index("--stop_cm")
+        if kind != "tree":
+            sys.exit("--stop_cm is for the tree reach (tree)")
+        stop_cm = float(rest[i + 1])
         del rest[i:i + 2]
     if not VERBOSE and not any(x in ("-h", "--help") for x in rest):
         sys.stdout = _Tee()
@@ -563,6 +627,22 @@ def main():
         # hand open: AppleGrasp-v1 holds the hand at its default (open) pose during the reach
         defaults = {"--target": ["detection"], "--waist": ["hold"], "--hand": ["open"],
                     "--policy": [reach_v1.default_policy(os.path.dirname(SIM2REAL))]}
+    if kind == "tree":
+        if "--waist" in rest and rest[rest.index("--waist") + 1] != "hold":
+            sys.exit("tree is an arm-only policy (7 outputs): --waist hold only")
+        for f in ("--touch", "--after_reach", "--reach_tol"):
+            if f in rest:
+                sys.exit(f"tree sets {f} itself (palm force 0, frozen at --stop_cm): use --stop_cm")
+        # toy_reach freezes the arm (REACHED) when gap - GRASP_STANDOFF <= reach_tol, gap = |apple - palm
+        # point| - radius; the palm's collider meets the apple at gap = PALM_TOUCH_HEIGHT, so the palm
+        # surface is stop_cm from the apple at reach_tol = stop_cm + PALM_TOUCH_HEIGHT - GRASP_STANDOFF
+        tol = stop_cm / 100.0 + R.PALM_TOUCH_HEIGHT - R.GRASP_STANDOFF
+        # AppleReachTree-v1 holds the hand at its default (open: thumb_1 0.6, the rest 0); the touch
+        # input is the palm sensor, always 0 here (no tactile on the real palm); ring = all free (reach_io)
+        defaults = {"--target": ["detection"], "--waist": ["hold"], "--hand": ["open"], "--touch": ["zero"],
+                    "--after_reach": ["freeze"], "--reach_tol": [f"{tol:.4f}"],
+                    "--policy": [os.path.join(os.path.dirname(SIM2REAL), "logs", "rsl_rl", "apple_reach_tree",
+                                              "2026-10-05_01-33-22", "exported", "policy_2000.pt")]}
     for flag, val in defaults.items():
         if flag not in rest:
             rest = rest + [flag] + val

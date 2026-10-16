@@ -36,6 +36,8 @@ HB_HZ = 20.0
 VOICE_DIR = os.path.join(os.path.dirname(HERE), "voice")
 #: speak() key -> WAV in sim2real/voice
 EXTRA_CLIPS = {"hasta_la_vista": "hasta_la_vista_baby.wav"}
+#: their volume_gain (the picker's clips play at 1.8): the easter egg is quieter
+EXTRA_GAIN = {"hasta_la_vista": 0.9}
 #: v20 grabs the arm with its own stiff hold (HOLD_KP 400 at its latch) when no target came for
 #: QREF_STALE_S = 0.25 s; at the switch back to the stream's kp 100 the arm jumps by the sag
 #: difference. Measured 2026-10-15 (session 15-27-04): 300-1474 ms gaps while the toy computed
@@ -48,6 +50,8 @@ KEEP_GAP_S = 0.06
 KEEP_MAX_S = 5.0
 #: arm_mpc_server.py (v20) HOLD_KP / HOLD_KD: the hold it latches after "bye"
 V20_HOLD_KP = 400.0
+#: dual_config.LOWER_S (the daemon's RESET lowering time; rl_mode.py)
+LOWER_S = 2.0
 V20_HOLD_KD = 12.0
 
 
@@ -73,7 +77,7 @@ class DualIO(T.PickerIO):
                         if os.path.isfile(path):
                             self.node.audio._msgs[key] = {"type": "wav", "file": path, "sample_rate_hz": 16000,
                                                           "channels": 1, "sample_width_bytes": 2,
-                                                          "volume_gain": 1.8}
+                                                          "volume_gain": EXTRA_GAIN.get(key, 1.8)}
             except Exception as e:
                 print(f"  audio: the picker's player failed ({e}): the toy stays silent")
         if not hasattr(self.node, "audio"):
@@ -91,6 +95,7 @@ class DualIO(T.PickerIO):
         self._hb_on = False
         self._entered = False
         self._estop_seen = False
+        self._lowering = False                     # this process asked the daemon for the RESET lowering
         self.go_t = None
         self.node.create_subscription(self.String, GO_TOPIC, lambda m: setattr(self, "go_t", time.monotonic()), 10)
         #: the dashboard's click on a fruit: (torso-frame position, monotonic time) or None
@@ -119,7 +124,8 @@ class DualIO(T.PickerIO):
         except Exception:
             return
         self._rl, self._rl_t = d, time.monotonic()
-        if self._entered and not self._estop_seen and d.get("mode") in ("FREEZE", "RELEASE"):
+        if self._entered and not self._estop_seen and d.get("mode") in ("FREEZE", "RELEASE", "LOWER") \
+                and not (self._lowering and d.get("mode") == "LOWER"):
             self._estop_seen = True
             e = d.get("estop") or {}
             self._on_estop(f"{e.get('why') or d.get('mode')}", str(e.get("src") or "robot"))
@@ -245,7 +251,7 @@ class DualIO(T.PickerIO):
         d = self._rl
         b("INFO", f"robot ready in {time.monotonic() - t0:.1f}s: daemon {d.get('dual')} mode {d.get('mode')}, "
                   f"remote {'seen' if (d.get('remote') or {}).get('seen') else 'NOT seen (dashboard STOP only)'}")
-        if d.get("mode") in ("FREEZE", "RELEASE"):
+        if d.get("mode") in ("FREEZE", "RELEASE", "LOWER"):
             sys.exit(f"the robot is in E-STOP ({(d.get('estop') or {}).get('why')}): press RESET on the dashboard")
 
     def read(self):
@@ -313,6 +319,32 @@ class DualIO(T.PickerIO):
             for _ in range(3):                          # one lost packet must not leave RL mode
                 self._ctl_send({"cmd": "bye"})
                 time.sleep(0.05)
+
+    def lower_arm(self, on_descent=None, timeout_s=6.0):
+        """The end of a Ctrl-C run: the daemon's RESET lowering (kp 0, light kd for LOWER_S, then held
+        where it ends -- the same sink as the shutdown's damped release). on_descent(lower_s) is called
+        once the arm starts going down (or at once when the daemon has no LOWER mode: an old deploy),
+        with the seconds the lowering lasts. Returns when the arm is held again. Idempotent."""
+        if not self.commands or getattr(self, "_lowered", False):
+            if on_descent:
+                on_descent(0.0)
+            return False
+        self._lowered = True
+        self._lowering = True
+        self._hb_on = False
+        for _ in range(3):
+            self._ctl_send({"cmd": "reset"})
+            time.sleep(0.05)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 1.5 and self._rl.get("mode") != "LOWER":
+            time.sleep(0.02)
+        went = self._rl.get("mode") == "LOWER"
+        if on_descent:
+            on_descent(LOWER_S if went else 0.0)
+        if went:
+            while time.monotonic() - t0 < timeout_s and self._rl.get("mode") == "LOWER":
+                time.sleep(0.05)
+        return went
 
     def close(self, restore_mode=True):
         self.leave_rl()

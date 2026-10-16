@@ -221,7 +221,7 @@ def check():
         ("dt", R.DT, C["dt"]), ("arm joint order", R.RIGHT_ARM_JOINTS, C["arm_joint_names"]),
         ("arm default", list(R.ARM_DEFAULT), C["arm_default"]),
         ("waist default (yaw, roll, pitch)", list(R.WAIST_DEFAULT), C["waist_default"]),
-        ("arm scale/vmax/amax/brake", [R.ARM_SCALE, R.ARM_MAX_VELOCITY, R.ARM_MAX_ACCELERATION, False],
+        ("arm scale/vmax/amax/brake", [R.ARM_SCALE, R.ARM_MAX_VELOCITY, R.ARM_MAX_ACCELERATION, R.ARM_BRAKE],
          [C["arm_scale"], C["arm_vmax"], C["arm_amax"], C["arm_brake"]]),
         ("arm target clip (v3)", [[a, b] for a, b in zip(R.ARM_TARGET_LO, R.ARM_TARGET_HI)], C["arm_clip"]),
         ("waist scale/vmax/amax/brake", [R.WAIST_SCALE, R.WAIST_MAX_VELOCITY, R.WAIST_MAX_ACCELERATION, True],

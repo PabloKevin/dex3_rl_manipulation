@@ -226,6 +226,13 @@ def penalty_elbow_out(
     """[N] the right elbow sideways OUT (torso -y) beyond the shoulder by more
     than `margin`, (excess / ref)^2, in the torso's yaw frame: keeps the arm
     close to the body (shoulder torque, and less arm in the canopy)."""
+    out = _elbow_out_dist(env, elbow_body, shoulder_body, torso_body)
+    return ((out - margin).clamp(min=0.0) / ref) ** 2
+
+
+def _elbow_out_dist(env: "ManagerBasedRLEnv", elbow_body: str, shoulder_body: str, torso_body: str) -> torch.Tensor:
+    """[N] how far (m) the right elbow sits sideways OUT (torso -y) of the
+    shoulder, in the torso's yaw frame; < 0 inward, toward the left arm."""
     robot = env.scene["robot"]
     if not hasattr(env, "_eo_ids"):
         names = robot.data.body_names
@@ -235,8 +242,24 @@ def penalty_elbow_out(
     y_torso = quat_apply(qt, torch.tensor((0.0, 1.0, 0.0), device=env.device).expand(env.num_envs, 3))
     y_torso[:, 2] = 0.0
     y_torso = y_torso / y_torso.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    out = -((robot.data.body_pos_w[:, e] - robot.data.body_pos_w[:, s]) * y_torso).sum(-1)
-    return ((out - margin).clamp(min=0.0) / ref) ** 2
+    return -((robot.data.body_pos_w[:, e] - robot.data.body_pos_w[:, s]) * y_torso).sum(-1)
+
+
+def penalty_elbow_in(
+    env: "ManagerBasedRLEnv",
+    elbow_body: str = "right_elbow_link",
+    shoulder_body: str = "right_shoulder_pitch_link",
+    torso_body: str = "torso_link",
+    margin: float = 0.0,
+    ref: float = 0.05,
+) -> torch.Tensor:
+    """[N] the right elbow sideways IN (torso +y, toward the left arm) beyond
+    the shoulder by more than `margin`, (excess / ref)^2, in the torso's yaw
+    frame -- penalty_elbow_out's mirror. User, 2026-10-16: the elbow must
+    point out of the torso (natural, away from the body: less self-collision);
+    model_1999 of the first v2 run held it up to 7 cm inward."""
+    inward = -_elbow_out_dist(env, elbow_body, shoulder_body, torso_body)
+    return ((inward - margin).clamp(min=0.0) / ref) ** 2
 
 
 # ─────────────────────────────────────────────

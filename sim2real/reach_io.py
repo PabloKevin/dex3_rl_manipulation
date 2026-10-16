@@ -74,6 +74,8 @@ ARM_KP, ARM_KD = 100.0, 10.0
 ARM_SCALE = 0.5
 ARM_MAX_VELOCITY = 2.0
 ARM_MAX_ACCELERATION = 8.0
+#: brake toward the target (no overshoot); AppleReachSingle-v2 turns it on (SINGLE_V2)
+ARM_BRAKE = False
 #: AppleReachSpindle-v3 ARM_TARGET_CLIP (soft joint limits, absolute targets)
 ARM_TARGET_LO = np.array([-2.945, -2.156, -2.487, -0.969, -1.874, -1.534, -1.534])
 ARM_TARGET_HI = np.array([2.526, 1.492, 2.487, 2.016, 1.874, 1.534, 1.534])
@@ -154,7 +156,9 @@ SINGLE_VERSION = 1
 #: 1.5 cm accepted; the hand closes once the palm point is within 10 cm of the apple. Same
 #: 40-input "single" layout. use_single_v2() switches this module's SINGLE_* to these.
 SINGLE_V2 = {"SINGLE_STANDOFF": 0.016, "SINGLE_POS_TOL": 0.015, "SINGLE_HAND_TRIGGER": "distance",
-             "SINGLE_HAND_NEAR": 0.10, "SINGLE_VERSION": 2}
+             "SINGLE_HAND_NEAR": 0.10, "SINGLE_VERSION": 2,
+             # envs/apple_reach_single_v2_env_cfg.py REACH_ARM_* (2026-10-16): slower, braking limiter
+             "ARM_MAX_VELOCITY": 1.2, "ARM_MAX_ACCELERATION": 5.0, "ARM_BRAKE": True}
 #: v2's placement: APPLE CENTRES (not grasp targets) relative to the right shoulder at waist
 #: yaw 0, on the map scripts/probe_side_reach.py --single_v2 measured (+ the old waist map)
 ENVELOPE_SINGLE_V2 = dict(reach_min=0.20, reach_max=0.70, az_center_deg=-25.0, az_span_deg=200.0,
@@ -418,7 +422,8 @@ def make_limiters(layout: str, clip: str = "v3", dtype=np.float64) -> dict:
         lo, hi = ARM_TARGET_LO, ARM_TARGET_HI
     else:
         lo, hi = ARM_DEFAULT - ARM_TARGET_CLIP_OLD, ARM_DEFAULT + ARM_TARGET_CLIP_OLD
-    out = {"arm": RateLimiter(ARM_DEFAULT, ARM_SCALE, lo, hi, ARM_MAX_VELOCITY, ARM_MAX_ACCELERATION, dtype=dtype)}
+    out = {"arm": RateLimiter(ARM_DEFAULT, ARM_SCALE, lo, hi, ARM_MAX_VELOCITY, ARM_MAX_ACCELERATION,
+                              brake=ARM_BRAKE, dtype=dtype)}
     if layout in ("waist", "single"):
         out["waist"] = RateLimiter([WAIST_DEFAULT[0]], WAIST_SCALE, [-WAIST_YAW_LIMIT], [WAIST_YAW_LIMIT],
                                    WAIST_MAX_VELOCITY, WAIST_MAX_ACCELERATION, brake=True, dtype=dtype)

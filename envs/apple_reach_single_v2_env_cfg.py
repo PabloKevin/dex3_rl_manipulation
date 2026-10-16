@@ -92,6 +92,26 @@ NEIGHBOUR_KNOCKED_COST = 10.0
 #: default lateral 100-300 N/m knocked the fruit off at a 0.5 cm push
 PENDULUM_STEM_PARAMS = {**pg.MAGNET_STEM_PARAMS, "k_lateral": (15.0, 40.0)}
 
+#: REACH-only retune (2026-10-16, model_1999 of the first run held badly and
+#: ended far from the apple, even before closing the hand): pushing up to
+#: 5 cm is cheap, so the hand can finish IN the pocket instead of hovering
+#: short of it; the stem moves as easily (same k_lateral) but needs a much
+#: harder pull / shear to come off, so a push does not end the episode. The
+#: grasp v3 task keeps the SINGLE_V2_* values / PENDULUM_STEM_PARAMS above.
+REACH_PUSH_IN = 0.05
+REACH_MAX_DISP = 0.06
+REACH_STEM_PARAMS = {**PENDULUM_STEM_PARAMS, "break_pull": (3.0, 6.0), "break_shear": (2.0, 4.0),
+                     "break_bend": (0.15, 0.30)}
+
+#: arm command limiter (2026-10-16). model_1999 ran at the 2.0 rad/s cap
+#: (palm peak ~1.2 m/s) and, without brake_to_target, the bang-bang command
+#: overshoots and rings: the hold buzzed at ~4.5 Hz (commanded_accel the
+#: largest penalty while parked). Braking + slower caps, as the waist has.
+#: sim2real/reach_io.SINGLE_V2 must carry the same three numbers.
+REACH_ARM_MAX_VELOCITY = 1.2
+REACH_ARM_MAX_ACCELERATION = 5.0
+REACH_ARM_BRAKE = True
+
 #: placement: APPLE CENTRES relative to the right shoulder (waist yaw 0) on the
 #: map scripts/probe_side_reach.py --single_v2 measured; the box is wide, the
 #: map decides
@@ -115,15 +135,15 @@ _SOFT_LINKS = ["right_hand_palm_link", "right_hand_index_0_link", "right_hand_mi
 @configclass
 class RewardsSingleV2Cfg(RewardsSingleCfg):
     # the apple in the hand
-    enclosed = RewTerm(func=sr.reward_enclosed, weight=8.0,
-                       params={**_GOAL, "touch_gap": SINGLE_V2_STANDOFF, "push_in": SINGLE_V2_PUSH_IN,
+    enclosed = RewTerm(func=sr.reward_enclosed, weight=12.0,
+                       params={**_GOAL, "touch_gap": SINGLE_V2_STANDOFF, "push_in": REACH_PUSH_IN,
                                "short_std": 0.01, "lateral_std": 0.015})
     target_contact = RewTerm(
         func=sr.penalty_target_contact_v2, weight=-4.0,
         params={"sensor_cfg": SceneEntityCfg("contact_forces"), "tip_links": _TIP_LINKS, "soft_links": _SOFT_LINKS,
                 "tip_cap": 0.5, "soft_free": 2.0, "soft_ref": 2.0})
-    target_push = RewTerm(func=pgr.penalty_target_push, weight=-8.0,
-                          params={"deadband": SINGLE_V2_PUSH_IN, "ref": 0.02})
+    target_push = RewTerm(func=pgr.penalty_target_push, weight=-3.0,
+                          params={"deadband": REACH_PUSH_IN, "ref": 0.03})
     # dropping fruit
     target_knocked = RewTerm(func=trr.penalty_target_knocked, weight=-TARGET_KNOCKED_COST / SINGLE_V2_STEP_DT)
     neighbour_knocked = RewTerm(func=trr.penalty_neighbour_knocked, weight=-NEIGHBOUR_KNOCKED_COST / SINGLE_V2_STEP_DT)
@@ -139,10 +159,20 @@ class RewardsSingleV2Cfg(RewardsSingleCfg):
         params={"robot_cfg": _PALM, "object_cfg": _APPLE, "standoff": SINGLE_V2_STANDOFF,
                 "palm_local_offset": PALM_LOCAL_OFFSET, "palm_normal_axis": PALM_NORMAL_AXIS,
                 "switch_dz": FINGER_SWITCH_DZ, "band": 0.03, "std_rad": 0.4, "gate_dist": 0.55, "roll_only": True})
-    # less torque: the arm close to the body, the load charged harder
-    elbow_out = RewTerm(func=sr.penalty_elbow_out, weight=-2.0, params={"margin": 0.05, "ref": 0.10})
+    # dense centring: enclosed's 1.5 cm lateral gaussian gave ~0 at the 5 cm
+    # off-centre model_1999 parked at, where the orientation terms (gated
+    # linearly over 55 cm) already paid ~90%
+    enclosed_coarse = RewTerm(func=sr.reward_enclosed, weight=6.0,
+                              params={**_GOAL, "touch_gap": SINGLE_V2_STANDOFF, "push_in": REACH_PUSH_IN,
+                                      "short_std": 0.03, "lateral_std": 0.04})
+    # the elbow OUT of the torso, not pointing at the left arm (user,
+    # 2026-10-16); the old elbow_out only stops an extreme chicken wing now
+    elbow_in = RewTerm(func=sr.penalty_elbow_in, weight=-3.0, params={"margin": 0.0, "ref": 0.05})
+    # energy barely charged for now: the -8 made it take odd paths and stop
+    # short; fine-tune the torque once it reaches well
+    elbow_out = RewTerm(func=sr.penalty_elbow_out, weight=-1.0, params={"margin": 0.20, "ref": 0.10})
     motor_load_arm = RewTerm(
-        func=wr.penalty_motor_load, weight=-8.0,
+        func=wr.penalty_motor_load, weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=RIGHT_ARM_JOINTS, preserve_order=True),
                 "rated_torque": ARM_RATED_TORQUE})
 
@@ -150,9 +180,9 @@ class RewardsSingleV2Cfg(RewardsSingleCfg):
 @configclass
 class EventsSingleV2Cfg(EventsSingleCfg):
     reach_goal_v2 = EventTerm(func=sr.set_reach_goal_v2, mode="startup",
-                              params={"touch_gap": SINGLE_V2_STANDOFF, "push_in": SINGLE_V2_PUSH_IN,
+                              params={"touch_gap": SINGLE_V2_STANDOFF, "push_in": REACH_PUSH_IN,
                                       "short_tol": SINGLE_V2_SHORT_TOL, "lateral_tol": SINGLE_V2_LATERAL_TOL,
-                                      "max_disp": SINGLE_V2_MAX_DISP, "heading_horizontal": True})
+                                      "max_disp": REACH_MAX_DISP, "heading_horizontal": True})
     hand_schedule = EventTerm(
         func=sr.step_hand_schedule, mode="interval", interval_range_s=(0.0, 0.0), is_global_time=True,
         params={"open_targets": HAND_OPEN, "closed_targets": HAND_CLOSED, "robot_cfg": _PALM,
@@ -193,6 +223,11 @@ class AppleReachSingleV2EnvCfg(AppleReachSingleEnvCfg):
         for t in (self.rewards.hold, self.rewards.face_apple_hold, self.terminations.reach_success):
             t.params = {**t.params, "tilt_tol_rad": SINGLE_V2_TILT_TOL}
         apply_single_v2_placement(self.events.randomize_tree)
+        self.events.randomize_tree.params["stem_params"] = dict(REACH_STEM_PARAMS)
+        arm = self.actions.right_arm
+        arm.max_velocity = REACH_ARM_MAX_VELOCITY
+        arm.max_acceleration = REACH_ARM_MAX_ACCELERATION
+        arm.brake_to_target = REACH_ARM_BRAKE
 
 
 @configclass
