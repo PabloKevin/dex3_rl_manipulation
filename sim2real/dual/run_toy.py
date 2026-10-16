@@ -472,6 +472,10 @@ class DualToyMixin:
         if (not getattr(io, "commands", False) or not getattr(io, "_entered", False) or io.estop_why is not None
                 or self.q_sent is None or not getattr(io, "rl_mine", False)):
             return
+        if getattr(io, "rl_switch", False):
+            self.brief("INFO", "ARM MODE switch on RL: the robot keeps holding the arm at the policy's gains "
+                               "(no hand-over to v20)", fold_s=0.0)
+            return
         kp0, kd0 = float(self.args.kp), float(self.args.kd)
         s = io.read()
         g = self.kin.gravity_torque(s.waist_q, s.arm_q, named=T.hand_named(s))

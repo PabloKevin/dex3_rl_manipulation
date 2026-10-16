@@ -124,6 +124,14 @@ class DualIO(T.PickerIO):
         except Exception:
             return
         self._rl, self._rl_t = d, time.monotonic()
+        if d.get("mode") == "RL" and d.get("owner") == self.src:
+            self._was_mine = True
+        if (self._entered and getattr(self, "_was_mine", False) and not getattr(self, "_left", False)
+                and not self._lowering and not self._estop_seen and d.get("mode") == "ORIGINAL"):
+            # the dashboard's ARM MODE switch went to ORIGINAL (or the link was lost, switch off)
+            self._estop_seen = True
+            self._on_estop("the robot went back to ORIGINAL (ARM MODE switch on the dashboard, or link lost)",
+                           "robot")
         if self._entered and not self._estop_seen and d.get("mode") in ("FREEZE", "RELEASE", "LOWER") \
                 and not (self._lowering and d.get("mode") == "LOWER"):
             self._estop_seen = True
@@ -155,6 +163,11 @@ class DualIO(T.PickerIO):
         d = self._rl
         return (d.get("mode") == "RL" and d.get("owner") == self.src and self._rl_t is not None
                 and time.monotonic() - self._rl_t < 1.0)
+
+    @property
+    def rl_switch(self) -> bool:
+        """The dashboard's ARM MODE switch is on RL: the daemon keeps RL after this toy ends."""
+        return self._rl.get("switch") == "rl"
 
     @property
     def qref_waist(self) -> bool:
