@@ -42,6 +42,16 @@ deg, finger roll < 30 deg, no self-collision, shoulder roll in the box. Cells
 hold the APPLE CENTRE relative to the shoulder (tree_sampler.Envelope
 apple_ref=True). Wider sweep and grid. Writes
 envs/assets/reach_workspace_single_v2.npz.
+
+--single_v2 --fixed_waist LO HI (deg): the same end pose with the waist OUT
+of the IK, held at a fixed yaw drawn per env and round in [LO, HI]
+(AppleReachVisible-v1: the scan script turns the torso, the reach runs with
+it held). The sampled apple is turned with the torso about the waist axis,
+and cells keep the UNTURNED apple centre relative to the shoulder at yaw 0
+(the frame the tree is sampled in); what still changes with the yaw is the
+legs vs the arm (self-collision). --sweep_visible samples only the front
+band the head camera can see (the camera test itself is applied at
+placement). Writes envs/assets/reach_workspace_single_v2_fixed_waist.npz.
 """
 import argparse
 import math
@@ -67,11 +77,19 @@ parser.add_argument("--waist", action="store_true",
                     help="Waist yaw in the IK (+-WAIST_YAW_LIMIT), wider sweep; writes reach_workspace_waist.npz.")
 parser.add_argument("--single_v2", action="store_true",
                     help="AppleReachSingle-v2 end pose (apple in the pocket, tilted palm, cup); implies --waist.")
+parser.add_argument("--fixed_waist", type=float, nargs=2, default=None, metavar=("LO_DEG", "HI_DEG"),
+                    help="With --single_v2: waist held at a random fixed yaw in [LO, HI] deg, not in the IK.")
+parser.add_argument("--waist_pitch", type=float, default=None,
+                    help="Hold waist_pitch_joint here (rad) instead of the env default 0.1 (the real robot: 0).")
+parser.add_argument("--sweep_visible", action="store_true",
+                    help="Sweep only the front band the head D435i can see (shoulder-relative, yaw-0 frame).")
 parser.add_argument("--union_shift", type=float, nargs=3, default=(0.0, 0.0, 0.0),
                     help="Shift (m) added to the --union map's cell centres (grasp-target map -> apple-centre map).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-if args_cli.single_v2:
+if args_cli.fixed_waist is not None and not args_cli.single_v2:
+    parser.error("--fixed_waist needs --single_v2")
+if args_cli.single_v2 and args_cli.fixed_waist is None:
     args_cli.waist = True
 app = AppLauncher(args_cli).app
 
@@ -108,6 +126,12 @@ SWEEP_WAIST = dict(reach_min=0.12, reach_max=0.55, reach_azimuth_center_deg=-25.
 SWEEP_SINGLE_V2 = dict(reach_min=0.10, reach_max=0.70, reach_azimuth_center_deg=-25.0,
                        reach_azimuth_span_deg=220.0, target_dz_range=(-0.50, 0.50),
                        reach_min_forward=-0.10, reach_min_horizontal=0.0, workspace_map=None)
+# --sweep_visible: apple centres the head camera can see at yaw 0 lie at
+# shoulder azimuth -30..+75 deg, up to ~shoulder height (scratchpad
+# fov_coverage.py, 2026-10-16), plus a margin
+SWEEP_VISIBLE = dict(reach_min=0.12, reach_max=0.70, reach_azimuth_center_deg=20.0,
+                     reach_azimuth_span_deg=140.0, target_dz_range=(-0.50, 0.15),
+                     reach_min_forward=-0.05, reach_min_horizontal=0.0, workspace_map=None)
 OK_POS, OK_FACE = 0.02, 0.30
 # --single_v2 end pose (envs/apple_reach_single_v2_env_cfg.py)
 V2_TOUCH_GAP = 0.016
@@ -129,10 +153,15 @@ MIN_SAMPLES, MIN_CLEAN_FRAC = 3, 0.8
 def main():
     cfg = AppleGraspEnvCfg()
     cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.waist_pitch is not None:
+        jp = dict(cfg.scene.robot.init_state.joint_pos)
+        jp["waist_pitch_joint"] = args_cli.waist_pitch
+        cfg.scene.robot = cfg.scene.robot.replace(init_state=cfg.scene.robot.init_state.replace(joint_pos=jp))
     cfg.episode_length_s = 1.0e6
     cfg.terminations.reach_success = None
     cfg.events.reset_arm_jitter = None
     cfg.events.randomize_tree.params.update(
+        SWEEP_VISIBLE if args_cli.sweep_visible else
         SWEEP_SINGLE_V2 if args_cli.single_v2 else SWEEP_WAIST if args_cli.waist else FOCUS if args_cli.focus else SWEEP)
     env = ManagerBasedRLEnv(cfg)
     if args_cli.single_v2:
@@ -161,6 +190,9 @@ def main():
     default = robot.data.default_joint_pos[:, ik_ids]
     shoulder_roll = RIGHT_ARM_JOINTS.index("right_shoulder_roll_joint")
     state = {"q": default.clone()}
+    fixed = args_cli.fixed_waist is not None
+    waist_id = robot.joint_names.index(WAIST_YAW_JOINT)
+    yaw = torch.zeros(env.num_envs, device=env.device)
     hand_ids, hand_q = [], None
     if args_cli.single_v2:
         from envs.apple_reach_single_env_cfg import HAND_CLOSED
@@ -175,11 +207,15 @@ def main():
         jp[:, ik_ids] = q0
         if hand_ids:
             jp[:, hand_ids] = hand_q
+        if fixed:
+            jp[:, waist_id] = yaw
         robot.write_joint_state_to_sim(jp, torch.zeros_like(jp))
         tgt = robot.data.joint_pos_target.clone()
         tgt[:, ik_ids] = q0
         if hand_ids:
             tgt[:, hand_ids] = hand_q
+        if fixed:
+            tgt[:, waist_id] = yaw
         robot.set_joint_position_target(tgt)
         term._prev_target[:, term_ids] = q0[:, :len(arm_ids)]
         term._prev_vel[:] = 0.0
@@ -256,6 +292,8 @@ def main():
         clean = reached & (coll <= 0.0) & (q[:, shoulder_roll] < 0.35)
         score = d_pos / OK_POS + face / OK_FACE + coll / 0.01 - 10.0 * clean.float() - 5.0 * reached.float()
         cols = [d_pos, face, coll, q[:, shoulder_roll]]
+        if fixed:
+            cols.append(yaw.clone())
         if args_cli.waist:
             # among clean solutions, prefer the least torso turn
             score = score + 0.5 * q[:, -1].abs() / WAIST_YAW_LIMIT
@@ -270,8 +308,23 @@ def main():
     print(f"default pose self-collision depth (max over envs): {self_collision_depth(env).max():.4f} m")
 
     rows = []
+    pel = robot.data.body_names.index("pelvis")
+    pivot = (robot.data.body_pos_w[:, pel, :2] - env.scene.env_origins[:, :2]).clone()
     for rnd in range(args_cli.rounds):
         env.reset()
+        apple0 = env.scene["apple"].data.root_pos_w.clone()      # as sampled: the torso at yaw 0
+        if fixed:
+            lo_y, hi_y = (math.radians(v) for v in args_cli.fixed_waist)
+            yaw[:] = lo_y + (hi_y - lo_y) * torch.rand_like(yaw)
+            c, s_ = torch.cos(yaw), torch.sin(yaw)
+            rel = apple0[:, :2] - env.scene.env_origins[:, :2] - pivot
+            turned = apple0.clone()
+            turned[:, 0] = env.scene.env_origins[:, 0] + pivot[:, 0] + c * rel[:, 0] - s_ * rel[:, 1]
+            turned[:, 1] = env.scene.env_origins[:, 1] + pivot[:, 1] + s_ * rel[:, 0] + c * rel[:, 1]
+            apple = env.scene["apple"]
+            pose = apple.data.root_pose_w.clone()
+            pose[:, :3] = turned
+            apple.write_root_pose_to_sim(pose)
         best_score = torch.full((env.num_envs,), float("inf"), device=env.device)
         best = None
         for seed in range(args_cli.seeds):
@@ -285,8 +338,8 @@ def main():
             best_score = torch.where(better, score, best_score)
             best = cols if best is None else [torch.where(better, c, b) for c, b in zip(cols, best)]
         sh = env.scene.env_origins + env._shoulder_local_xyz
-        if args_cli.single_v2:   # cells hold the APPLE CENTRE (Envelope apple_ref=True)
-            tgt = env.scene["apple"].data.root_pos_w - sh
+        if args_cli.single_v2:   # cells hold the APPLE CENTRE (Envelope apple_ref=True), torso at yaw 0
+            tgt = apple0 - sh
         else:
             tgt = rr._grasp_target_pos(env, apple_cfg, GRASP_STANDOFF) - sh
         rows.append(torch.cat([tgt] + [c.unsqueeze(-1) for c in best], -1).cpu().numpy())
@@ -295,7 +348,7 @@ def main():
 
     a = np.concatenate(rows)
     columns = ["x", "y", "z", "pos_err", "face_err", "collision_depth", "shoulder_roll"] \
-        + (["waist_yaw"] if args_cli.waist else []) + ["clean"]
+        + (["waist_yaw"] if (args_cli.waist or fixed) else []) + ["clean"]
     if args_cli.merge:
         a = np.concatenate([np.load(args_cli.merge)["samples"], a])
     xyz, clean = a[:, :3], a[:, -1] > 0.5
@@ -343,7 +396,8 @@ def main():
         w = a[clean, 7]
         print(f"\nwaist yaw over clean samples: median |yaw| {np.degrees(np.median(np.abs(w))):.0f} deg, "
               f"at the limit {np.mean(np.abs(w) > WAIST_YAW_LIMIT - 0.02):.2f}")
-    default_map = ("reach_workspace_single_v2.npz" if args_cli.single_v2 else
+    default_map = ("reach_workspace_single_v2_fixed_waist.npz" if fixed else
+                   "reach_workspace_single_v2.npz" if args_cli.single_v2 else
                    "reach_workspace_waist.npz" if args_cli.waist else "reach_workspace.npz")
     out = args_cli.out or os.path.join(REPO, "envs", "assets", default_map)
     np.savez(out, x_edges=edges[0], y_edges=edges[1], z_edges=edges[2], feasible=feasible,

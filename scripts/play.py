@@ -39,6 +39,9 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--no_camera_view", action="store_true", default=False,
+                    help="Tasks with a head camera model (env cfg head_camera, e.g. AppleReachVisible-v1): do not "
+                         "draw its view frustum / seen apples, nor (with --video) paste its image into the video.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -124,8 +127,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    # head camera model (AppleReachVisible-v1): its own image as a sensor, for the video
+    head_camera = None if args_cli.no_camera_view else getattr(env_cfg, "head_camera", None)
+    head_sensor = None
+    if head_camera is not None and (args_cli.video or args_cli.enable_cameras):
+        from envs.mdp.visible_reach import head_camera_sensor_cfg
+
+        head_sensor = "head_camera_image"
+        setattr(env_cfg.scene, head_sensor, head_camera_sensor_cfg(head_camera))
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # what the head camera sees: frustum + seen (green) / unseen (magenta) apples in the scene,
+    # perceived target (blue), and its image top-right in the video
+    if head_camera is not None:
+        from envs.mdp.visible_reach import camera_view_wrapper
+
+        env = camera_view_wrapper(env, head_camera, sensor_name=head_sensor, scale=1)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):

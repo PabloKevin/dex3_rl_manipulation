@@ -56,17 +56,22 @@ def set_approach_origin(env: "ManagerBasedRLEnv", env_ids: torch.Tensor | None, 
 #  Perceived apple position
 # ─────────────────────────────────────────────
 
-def _depth_frame(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg, origin_body: str):
-    """Unit vectors [N, 3] (depth: horizontal origin -> apple, lateral, up)."""
+def _depth_frame(env: "ManagerBasedRLEnv", object_cfg: SceneEntityCfg, origin_body: str, horizontal: bool = True):
+    """Unit vectors [N, 3] (depth: horizontal origin -> apple, lateral, up).
+    horizontal=False: depth along the full 3D origin -> apple ray (a camera
+    looking down at the fruit), lateral horizontal, up perpendicular to both."""
     robot = env.scene["robot"]
     if not hasattr(env, "_meas_origin_id"):
         env._meas_origin_id = robot.data.body_names.index(origin_body)
     d = env.scene[object_cfg.name].data.root_pos_w - robot.data.body_pos_w[:, env._meas_origin_id]
-    d[:, 2] = 0.0
-    d = d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     up = torch.zeros_like(d)
     up[:, 2] = 1.0
-    return d, torch.cross(up, d, dim=-1), up
+    if horizontal:
+        d[:, 2] = 0.0
+    d = d / d.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    lat = torch.cross(up, d, dim=-1)
+    lat = lat / lat.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return d, lat, torch.cross(d, lat, dim=-1)
 
 
 def reset_apple_measurement(
@@ -78,6 +83,7 @@ def reset_apple_measurement(
     depth_clip: float = 0.025,
     cross_std: float = 0.005,
     cross_clip: float = 0.015,
+    horizontal: bool = True,
 ) -> None:
     """mode="reset", after the tree / apple placement: this episode's
     perceived apple centre, env._apple_meas [N, 3] (world), fixed until the
@@ -93,7 +99,7 @@ def reset_apple_measurement(
     n = len(env_ids)
     bd = (torch.randn(n, device=dev) * depth_std).clamp(-depth_clip, depth_clip)
     bc = (torch.randn(n, 2, device=dev) * cross_std).clamp(-cross_clip, cross_clip)
-    d, lat, up = _depth_frame(env, object_cfg, origin_body)
+    d, lat, up = _depth_frame(env, object_cfg, origin_body, horizontal)
     bias = bd.unsqueeze(-1) * d[env_ids] + bc[:, :1] * lat[env_ids] + bc[:, 1:] * up[env_ids]
     env._apple_meas[env_ids] = true[env_ids] + bias
     # the neighbours, seen in the same detection: positions + hanging mask at

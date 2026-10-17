@@ -68,7 +68,8 @@ def apple_prim(k: int) -> str:
     return "Apple" if k == 0 else f"Apple_{k}"
 
 from .tree_sampler import (  # noqa: E402,F401
-    Envelope, SamplerPool, harvest_order, make_spindle_job, sample_spindle_tree, sample_tree, trunk_axis,
+    Envelope, SamplerPool, camera_sees, harvest_order, make_spindle_job, rotate_tree, sample_spindle_tree, sample_tree,
+    trunk_axis,
 )
 
 
@@ -346,6 +347,8 @@ def place_apple_tree(
     sampler_workers: int = 0,
     trees: dict | None = None,
     target_spot0: bool = False,
+    fixed_waist: bool = False,
+    target_view: dict | None = None,
 ) -> None:
     """mode="reset", in place of randomize_tree_and_apple. Per env: a NEW
     tree when env._tree.new_tree is set (the first reset, and whenever the
@@ -368,7 +371,12 @@ def place_apple_tree(
     already in flight while the current one is in use, so a reset does not
     wait for the sampler. 0: sampled here, as before.
     trees: {env index: tree dict} already sampled (pregrasp.place_tree_at_
-    pregrasp); target_spot0: with those, apple 0 of the tree is the target."""
+    pregrasp); target_spot0: with those, apple 0 of the tree is the target.
+    fixed_waist (visible_reach.place_tree_fixed_waist): every new tree is
+    sampled for the torso at yaw 0, then turned with this episode's fixed
+    waist yaw (env._fixed_waist_yaw) about the waist axis (env._waist_pivot).
+    target_view (tree_sampler.camera_sees' dict, yaw-0 frame): the target is
+    an apple the head camera sees whole (the first such in harvest order)."""
     import omni.usd
 
     stage = omni.usd.get_context().get_stage()
@@ -453,6 +461,10 @@ def place_apple_tree(
                 tree = _draw(lambda: sample_tree(
                     rng, n, r, seed_env, member_env, standoff, trunk_dist, trunk_jitter, stem_heading_max_deg,
                     stem_length_range, cluster_sizes, cluster_weights, cluster_gap, sep_min))
+            # camera view tested in the yaw-0 frame the tree was sampled in
+            vis = None if target_view is None else camera_sees(tree["apple"], target_view)
+            if fixed_waist:
+                tree = rotate_tree(tree, float(env._fixed_waist_yaw[i]), env._waist_pivot)
             T.trees[i] = tree
             T.trunk_kink[i] = float(tree.get("kink", 1.0e3))
             T.trunk_lean[i] = torch.tensor(tree.get("lean", np.zeros(2)), device=dev, dtype=torch.float32)
@@ -465,6 +477,9 @@ def place_apple_tree(
             o = harvest_order(tree, order, rng)
             if forced is not None or tree.get("stretch", False):    # the forced / stretch apple (spot 0) is the target
                 o = np.concatenate([[0], o[o != 0]])
+            elif vis is not None and vis.any():                      # a target the camera sees
+                first = next(int(k) for k in o if vis[k])
+                o = np.concatenate([[first], o[o != first]])
             if not hasattr(env, "_target_stretch"):
                 env._target_stretch = torch.zeros(N, dtype=torch.bool, device=dev)
             env._target_stretch[i] = bool(tree.get("stretch", False))

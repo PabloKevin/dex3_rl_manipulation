@@ -653,3 +653,18 @@ for _id, _env in (("AppleReachSingleTactile-v1", AppleReachSingleTactileEnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleReachSingleTactilePPORunnerCfg},
         disable_env_checker=True,
     )
+
+# reach only apples the head camera sees, waist held at a fixed yaw, staging-point approach
+# (apple_reach_visible_env_cfg.py)
+
+from .apple_reach_visible_env_cfg import AppleReachVisibleEnvCfg, AppleReachVisibleEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleReachVisiblePPORunnerCfg
+
+for _id, _env in (("AppleReachVisible-v1", AppleReachVisibleEnvCfg),
+                  ("AppleReachVisible-Play-v1", AppleReachVisibleEnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleReachVisiblePPORunnerCfg},
+        disable_env_checker=True,
+    )

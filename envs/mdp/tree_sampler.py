@@ -27,6 +27,57 @@ import numpy as np
 
 
 # ─────────────────────────────────────────────
+#  Camera view (pure numpy, env-local frame)
+# ─────────────────────────────────────────────
+
+def camera_sees(points, view: dict) -> np.ndarray:
+    """[P] bool: each apple centre (env-local [P, 3] or [3]) is seen whole by
+    the head camera, as the real detector needs it: in front of the camera
+    between view["z_range"] (m along the optical axis), and the apple's
+    image (radius view["radius"], plus view["margin_px"]) inside the
+    view["width"] x view["height"] image. view["pos"] / view["R"]: camera
+    position and rotation (columns = the optical x right, y UP, z forward
+    axes, the g1_fruits_picker object_locator convention) in the same frame
+    as the points."""
+    p = np.atleast_2d(np.asarray(points, float))
+    pc = (p - np.asarray(view["pos"], float)) @ np.asarray(view["R"], float)
+    x, y, z = pc[:, 0], pc[:, 1], pc[:, 2]
+    zz = np.maximum(z, 1e-6)
+    u = view["cx"] + view["fx"] * x / zz
+    v = view["cy"] - view["fy"] * y / zz
+    rp = view["fx"] * view["radius"] / zz + view["margin_px"]
+    return ((z >= view["z_range"][0]) & (z <= view["z_range"][1]) & (u - rp >= 0) & (u + rp <= view["width"])
+            & (v - rp >= 0) & (v + rp <= view["height"]))
+
+
+def rotate_tree(tree: dict, yaw: float, pivot) -> dict:
+    """The tree turned by `yaw` (rad) about the vertical through `pivot`
+    (env-local x, y: the waist yaw axis). A tree sampled for the torso at
+    yaw 0 is then in the same place relative to a torso turned by yaw."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    R2 = np.array([[c, -s], [s, c]])
+    pv = np.asarray(pivot, float)[:2]
+    out = dict(tree)
+
+    def pts(a):
+        a = np.array(a, float)
+        a[..., :2] = (a[..., :2] - pv) @ R2.T + pv
+        return a
+
+    def vecs(a):
+        a = np.array(a, float)
+        a[..., :2] = a[..., :2] @ R2.T
+        return a
+
+    out["apple"], out["tip"] = pts(tree["apple"]), pts(tree["tip"])
+    out["stem_dir"] = vecs(tree["stem_dir"])
+    out["trunk"] = (np.asarray(tree["trunk"], float)[:2] - pv) @ R2.T + pv
+    if "lean" in tree:
+        out["lean"] = np.asarray(tree["lean"], float) @ R2.T
+    return out
+
+
+# ─────────────────────────────────────────────
 #  Tree sampling (pure numpy, env-local frame)
 # ─────────────────────────────────────────────
 
@@ -40,11 +91,19 @@ class Envelope:
     stretch_frac: that share of sample_target draws comes from the cells
     just OUTSIDE the feasible map (not feasible, within stretch_cells cells
     of a feasible one), to see what the policy does with an apple a little
-    beyond what it can reach; last_stretch says which kind the last draw was."""
+    beyond what it can reach; last_stretch says which kind the last draw was.
+
+    view (camera_sees' dict, apple_ref only): sample_target only returns
+    apples the head camera sees whole (AppleReachVisible-v1: the tree's
+    first apple, the one the target is guaranteed among). contains() does
+    not test it: the tree's other apples may hang out of view."""
 
     def __init__(self, shoulder, reach_min, reach_max, az_center_deg, az_span_deg, dz_range,
                  min_forward=0.0, min_horizontal=0.0, workspace=None, apple_ref=False,
-                 stretch_frac=0.0, stretch_cells=1):
+                 stretch_frac=0.0, stretch_cells=1, view=None):
+        if view is not None and not apple_ref:
+            raise ValueError("Envelope: a camera view needs apple_ref (the map / box hold apple centres)")
+        self.view = view
         self.sh = np.asarray(shoulder, float)
         self.rmin, self.rmax = reach_min, reach_max
         self.az = (math.radians(az_center_deg - az_span_deg / 2), math.radians(az_center_deg + az_span_deg / 2))
@@ -103,7 +162,8 @@ class Envelope:
             rel = np.array([rxy * math.cos(az), rxy * math.sin(az), dz])
             if rel[0] < self.fwd:
                 continue
-            if self._in(rel, self.stretch) if stretch else self.feasible(rel):
+            if (self._in(rel, self.stretch) if stretch else self.feasible(rel)) and \
+                    (self.view is None or bool(camera_sees(self.sh + rel, self.view)[0])):
                 self.last_stretch = stretch
                 return self.sh + rel
         raise RuntimeError("Envelope.sample_target: envelope unsatisfiable")

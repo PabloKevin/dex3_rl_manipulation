@@ -367,6 +367,14 @@ class AppleReachSingleTactilePPORunnerCfg(AppleReachSingleV2PPORunnerCfg):
 
 
 @configclass
+class AppleReachVisiblePPORunnerCfg(AppleReachSingleV2PPORunnerCfg):
+    """AppleReachVisible-v1: apples the head camera sees, waist held at a
+    fixed yaw, staging-point approach; trained from scratch. Own log folder
+    (logs/rsl_rl/apple_reach_visible)."""
+    experiment_name = "apple_reach_visible"
+
+
+@configclass
 class AppleGraspSingleV3PPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
     """AppleGraspSingle-v3: grasp only, behind AppleReachSingle-v2. Own log
     folder (logs/rsl_rl/apple_grasp_single_v3)."""
