@@ -24,3 +24,4 @@ IEEEtran.cls
 # which reach checkpoint the local grasp hand-off export came from (scripts/train_grasp_single.sh)
 envs/agents/best_weights/grasp_handoff_reach_single.txt
 envs/agents/best_weights/grasp_handoff_reach_single_v2.txt
+logs/rsl_rl/apple_reach_visible/2026-10-17_13-43-46/events.out.tfevents.1792241472.nahuel-Alienware-Area-51-AAT2250.2995309.0
