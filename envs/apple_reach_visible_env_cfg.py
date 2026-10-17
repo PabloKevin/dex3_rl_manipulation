@@ -26,8 +26,8 @@ scratch (v2 had not learned that path). AppleReachSingle-v2
     37 inputs / 7 outputs: NOT the 37-input tree layout of sim2real/
     reach_io.py, which picks its layout by input size.
   - placement: the tree's first apple is seen whole by the D435i
-    (CAMERA_D435I: real intrinsics + calibrated torso pose, the apple's
-    image + 8 px inside the 640x480 image, 0.25-1.2 m deep) and reachable
+    (CAMERA_D435I: the live 424x240 intrinsics + calibrated torso pose, the
+    apple's image + 5 px inside the image, 0.25-1.2 m deep) and reachable
     with the waist held (REACH_VISIBLE_WORKSPACE_MAP: probe_side_reach.py
     --single_v2 --fixed_waist -45 15 --waist_pitch 0 --sweep_visible); the target is an apple the camera
     sees. The other apples (reachable) may hang out of view, above it
@@ -67,23 +67,27 @@ from .apple_reach_single_v2_env_cfg import (
 from .mdp import visible_reach as vr
 
 #: the robot's detection camera: the head D435i ("unitree" in
-#: ~/g1_fruits_picker/apple_picker). Intrinsics from its camera_info at
-#: 640x480 (camera_config.yaml: HFOV 55.7, VFOV 43.2 deg); pose = the
+#: ~/g1_fruits_picker/apple_picker). Intrinsics: the LIVE stream's
+#: camera_info, 424x240 (every robot session's live_locator.log, 31 of 31:
+#: fx 303.1 fy 303.0 cx 215.8 cy 123.3 -> HFOV 69.9, VFOV 43.2 deg; the
+#: 640x480 numbers in camera_config.yaml are only its fallback, HFOV 55.7 --
+#: used until 2026-10-17, the first long run trained on that narrower
+#: view); pose = the
 #: calibrated camera -> torso_link map (camera_extrinsics.yaml "unitree",
 #: hand-guided ArUco, 37 points, 3 mm mean error): optical axis 48.5 deg
 #: down, so it sees 27-70 deg below horizontal and nothing above its own
 #: height. A: columns = optical x right, y UP, z forward in torso_link.
 #: radius / margin_px / z_range: the apple's image (a 4 cm radius covers
-#: the +-20% sizes) plus 8 px must be inside the image, 0.25-1.2 m deep
+#: the +-20% sizes) plus 5 px must be inside the image, 0.25-1.2 m deep
 #: (D435i depth minimum ~0.2-0.3 m).
 CAMERA_D435I = {
     "A": [[0.006540266461485991, 0.7488958507804779, 0.662655438065965],
           [-0.9999219788636268, -0.002154753281066041, 0.012304195371741364],
           [-0.010642419840478354, 0.6626842096519896, -0.7488233284145578]],
     "t": [0.045963094943757415, 0.032092549991621463, 0.42729155279866415],
-    "fx": 606.2100830078125, "fy": 605.9196166992188, "cx": 327.6353454589844, "cy": 246.68521118164062,
-    "width": 640, "height": 480,
-    "radius": 0.04, "margin_px": 8.0, "z_range": (0.25, 1.2),
+    "fx": 303.1, "fy": 303.0, "cx": 215.8, "cy": 123.3,
+    "width": 424, "height": 240,
+    "radius": 0.04, "margin_px": 5.0, "z_range": (0.25, 1.2),
     "torso_body": "torso_link",
 }
 

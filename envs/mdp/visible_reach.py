@@ -213,9 +213,9 @@ def apple_pos_palm_measured_torso(env: "ManagerBasedRLEnv", object_cfg: SceneEnt
 #    than where the palm started this episode (along that line): a point
 #    next to the body for near fruit, in front of the cluster for far, and
 #    straight up / down from the start is never inside the zone.
-# The L path goes palm -> S -> G. The cluster ZONE is ahead of S along the
-# approach line: nothing up to `zone_start` past S, full from zone_start +
-# zone_ramp (measured along the line, so a hand rising next to the body for
+# The L path goes palm -> S -> G. The cluster ZONE is ahead of S (or of the
+# palm's start, if that is further out) along the approach line: nothing up
+# to `zone_start` past it, full from zone_start + zone_ramp (measured along the line, so a hand rising next to the body for
 # a near apple, where S sits at body_reach, is never in it).
 
 def _staging(env: "ManagerBasedRLEnv", robot_cfg: SceneEntityCfg, object_cfg: SceneEntityCfg, standoff: float,
@@ -232,7 +232,9 @@ def _staging(env: "ManagerBasedRLEnv", robot_cfg: SceneEntityCfg, object_cfg: Sc
     home = env._stage_home = torch.where(env.episode_length_buf <= 1, sp, home)   # the palm where the episode starts
     hS = torch.minimum(torch.maximum((hG - back).clamp(min=body_reach), home), hG)
     S = G - (hG - hS).unsqueeze(-1) * u
-    return p, G, S, u, O, hS
+    # the zone's origin: S, or the palm's start when that is already further
+    # out (fruit low beside the hip, the hand starting past the goal)
+    return p, G, S, u, O, torch.maximum(hS, home)
 
 
 def _zone(p: torch.Tensor, u: torch.Tensor, O: torch.Tensor, hS: torch.Tensor, start: float,
@@ -375,7 +377,7 @@ def camera_quat_ros(camera: dict) -> tuple[float, float, float, float]:
     return (w / n, x / n, y / n, z / n)
 
 
-def head_camera_sensor_cfg(camera: dict, robot_prim: str = "{ENV_REGEX_NS}/Robot", downscale: int = 2):
+def head_camera_sensor_cfg(camera: dict, robot_prim: str = "{ENV_REGEX_NS}/Robot", downscale: int = 1):
     """CameraCfg for the head camera's own image (play.py --video)."""
     import isaaclab.sim as sim_utils
     from isaaclab.sensors import CameraCfg
