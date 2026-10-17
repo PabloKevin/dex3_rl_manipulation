@@ -1,0 +1,417 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>G1 Picker System Overview</title>
+<style>
+ @page{size:A4;margin:12mm}
+ body{font-family:"DejaVu Sans",sans-serif;font-size:9.5pt;line-height:1.35;color:#111;background:#fff}
+ h1{font-size:17pt;margin:0 0 4pt 0} h2{font-size:12.5pt;margin:14pt 0 4pt 0;border-bottom:1px solid #888}
+ h3{font-size:10.5pt;margin:9pt 0 3pt 0}
+ pre{font-family:"DejaVu Sans Mono",monospace;font-size:6.8pt;line-height:1.15;background:#f4f4f4;
+     border:1px solid #ccc;padding:5pt;margin:4pt 0;break-inside:avoid}
+ h3{break-after:avoid} tr{break-inside:avoid}
+ table{border-collapse:collapse;font-size:8.2pt;margin:4pt 0} td,th{border:1px solid #999;padding:2pt 4pt;vertical-align:top}
+ th{background:#e6e6e6} code{font-family:"DejaVu Sans Mono",monospace;font-size:8.3pt}
+ .note{font-size:8.5pt;color:#333} .hi{background:#fff3c4} pre.w{font-size:6.1pt}
+</style></head><body>
+
+<h1>G1 Apple Picker &mdash; how the sim2real stack works</h1>
+<p class="note">Scope: <code>apple_picker/g1_launch.sh</code> and what it starts; focus on the RL (toy) path through the
+dual daemon. Written 2026-10-17 from the code in <code>~/g1_fruits_picker</code> (g1_dual, apple_picker, onboard v20 =
+<code>backup_pre_estop_2026-10-12/onboard</code>, md5 95a864ae) and <code>~/dex3_rl_manipulation/sim2real</code>.
+Items marked <b>[Unitree]</b> are about the robot's closed firmware: general knowledge, not something this repo shows.</p>
+
+<h2>1. The system in one picture (SysML block definition)</h2>
+<pre>
+                        «system» G1 Apple-Picking System
+ ┌────────────────────────────┐   one Ethernet cable, 192.168.123.0/24   ┌───────────────────────────────────┐
+ │ «block» LAPTOP (your PC)   │◄════════════════════════════════════════►│ «block» UNITREE G1 ROBOT          │
+ │ enp62s0                    │   DDS (UDP) for data + ssh for control   │                                   │
+ │ distrobox humble-box       │                                          │ ┌───────────────────────────────┐ │
+ │  ROS 2 Humble + conda env  │                                          │ │ «block» Jetson Orin NX  .164  │ │
+ │  g1_dex3_sim2real (torch)  │                                          │ │ user computer, Ubuntu, py3.8  │ │
+ │                            │                                          │ │ dual daemon + cameras         │ │
+ │ subsystems:                │                                          │ └──────────────┬────────────────┘ │
+ │  Launcher / Supervisor     │                                          │                │ DDS (internal)   │
+ │  Perception                │                                          │ ┌──────────────▼────────────────┐ │
+ │  Task logic (SM or toy)    │                                          │ │ «block» Motion-control board  │ │
+ │  RL policy inference       │                                          │ │ [Unitree] .161: loco/balance  │ │
+ │  Operator UI (dashboard)   │                                          │ │ controller, arm_sdk arbiter,  │ │
+ └─────────────▲──────────────┘                                          │ │ publishes rt/lowstate 500 Hz  │ │
+               │ browser :8765                                           │ └──────────────┬────────────────┘ │
+ ┌─────────────┴──────┐                                                  │                │ motor bus        │
+ │ «actor» Operator   │──────── Unitree wireless remote (radio) ────────►│ ┌──────────────▼────────────────┐ │
+ └────────────────────┘                                                  │ │ 29 joint motors + drivers     │ │
+                                                                         │ │ (legs 0-11, waist 12-14,      │ │
+                                                                         │ │  L arm 15-21, R arm 22-28)    │ │
+                                                                         │ │ 2 x Dex3 hands (7 DoF,tactile)│ │
+                                                                         │ │ RealSense D435i head camera   │ │
+                                                                         │ └───────────────────────────────┘ │
+                                                                         └───────────────────────────────────┘
+</pre>
+<p><b>Key idea:</b> the laptop thinks (perception, task logic, the neural network); the Jetson owns the motor stream
+(it is the only writer of <code>rt/arm_sdk</code>); the Unitree board and the motor drivers do the real-time servo.
+The laptop never writes <code>rt/arm_sdk</code> itself (PickerIO refuses to start otherwise).</p>
+
+<h2>2. What runs where (allocation)</h2>
+<table>
+<tr><th>Node</th><th>Process / firmware</th><th>Started by</th><th>Role</th></tr>
+<tr><td rowspan="6">Laptop</td><td><code>g1_launch.sh</code> &rarr; <code>g1_launch.py</code></td><td>you</td><td>enters container+conda, starts/monitors everything, one status line, clean shutdown</td></tr>
+<tr><td><code>live_locator.py</code> (RF-DETR, GPU)</td><td>launcher</td><td>camera images &rarr; fruit detections <code>/fruits_detected_raw</code></td></tr>
+<tr><td><code>fruits_to_torso.py</code></td><td>launcher</td><td>camera frame &rarr; torso frame (p = A&middot;p_cam + t) &rarr; <code>/fruits_detected_torso</code></td></tr>
+<tr><td><code>dashboard/server_dual.py</code> (FastAPI)</td><td>launcher</td><td>web UI: camera, click fruit, GO, STOP, RESET, ARM MODE switch, RUN TOY</td></tr>
+<tr><td><code>sim2real/dual/run_toy.py</code> (toy profile)</td><td>launcher</td><td>task sequence + <b>RL policy at 50 Hz</b>, Dex3 hand commands, safety watch</td></tr>
+<tr><td><code>apple_picker_sm.py</code> (original profile) [+ branch_map, voice, palm]</td><td>launcher</td><td>IK/MPC picker state machine, sends pose targets / paths to the daemon</td></tr>
+<tr><td rowspan="3">Jetson</td><td><code>arm_mpc_server_dual.py</code> (parent)</td><td>ssh script</td><td>v20 daemon (ACADOS MPC, guards, 90 Hz command loop) + RL mode layer</td></tr>
+<tr><td><code>arm_sdk_pub_proc</code> child (spawned)</td><td>daemon</td><td>steady <code>rt/arm_sdk</code> writer, SCHED_FIFO on core 7, + weight ramp</td></tr>
+<tr><td><code>start_cameras.sh</code> (realsense2_camera, jpeg_republisher, stream_throttle)</td><td>ssh script</td><td>camera ROS 2 topics, throttled to ~10 Hz colour / ~5 Hz depth</td></tr>
+<tr><td>Robot board [Unitree]</td><td>firmware</td><td>power-on</td><td>balance/locomotion, arm_sdk arbitration by weight, lowstate, remote</td></tr>
+<tr><td>Joint drivers [Unitree]</td><td>firmware</td><td>power-on</td><td>per-joint PD + current (FOC) loop, encoders, temperature</td></tr>
+</table>
+
+<h2>3. From the neural network down to the motor voltage</h2>
+<pre>
+ LVL  SUBSYSTEM              WHERE          WHAT HAPPENS                                                RATE
+ ───  ─────────────────────  ─────────────  ──────────────────────────────────────────────────────────  ────────
+  6   Operator / mission     Laptop         click apple on dashboard, GO, STOP / RESET, Ctrl-C          events
+  5   Perception             Robot→Laptop   D435i → JPEG + throttle (Jetson) → RF-DETR (laptop GPU)      ~10 Hz
+                                            → depth → fruits_to_torso → apple xyz in TORSO frame
+  4   Task logic (serial)    Laptop         run_toy phases HOME→PLAN→GO→POLICY→HOLD→RETURN               50 Hz
+                                            (original: apple_picker_sm INIT→ACQUIRE→...→DROP)
+  3   RL policy              Laptop         obs(40) = arm q-q_default, dq, apple-palm, palm quat,         50 Hz
+                                            prev action, touch, clearance ring, waist terms              (DT .02)
+                                            → TorchScript MLP → raw(8)
+                                            → q* = default + 0.5·raw → RateLimiter (v·s, a·s²)
+                                            → joint clip → lag gate (hold if cmd leads arm > 0.12 rad)
+  2   Transport              cable          LowCmd_ on rt/arm_rl/cmd (q,dq,kp=100,kd=10; waist slot 12)  50 Hz
+                                            + "hb" on rt/arm_rl/ctl 20 Hz, keep-alive repeat if gap>60 ms
+  1c  RL mode layer          Jetson parent  dds_poll (newest sample) → RlMode.submit: joint-limit clamp  2 ms poll
+                                            → writes v20's arm.qref_q/dq/kp/kd/qref_t                    100 Hz tick
+  1b  v20 command loop       Jetson parent  zero-order hold of qref; stale>0.25 s→HOLD; |q*-q|>1.2→FREEZE 90 Hz
+                                            legs kp=kd=0, waist hold kp 380 → 29-joint arrays → shm
+  1a  Stream writer          Jetson child   read shm → rt/arm_sdk (+ weight slot 29 = 1 - release)        90 Hz
+  0b  Arbitration [Unitree]  robot board    weight=1: arm/waist joints follow arm_sdk; legs stay with     ~500 Hz
+                                            the balance controller; weight→0: controller takes arms back
+  0a  Joint servo [Unitree]  motor driver   τ* = kp·(q* − q) + kd·(dq* − dq) + τ_ff                       ~kHz
+                                            current loop (FOC): τ* → i_q* → PWM duty on battery DC bus   10s kHz
+                                            (~48-54 V) → 3-phase voltages → phase currents → torque
+  ──  Sensing back           encoders, IMU  rt/lowstate: q, dq, τ_est, temperature, remote bytes          500 Hz
+                                            → Jetson daemon AND laptop (same multicast topic)
+</pre>
+<p><b>What the motor actually receives</b> is not a voltage or a torque from us but a <i>PD set-point</i> per joint:
+(q*, dq*, kp, kd, &tau;_ff). The driver closes the loop locally at high rate. Example: RL mode kp&nbsp;=&nbsp;100&nbsp;N&middot;m/rad,
+so an error of 0.1&nbsp;rad pushes 10&nbsp;N&middot;m; kd&nbsp;=&nbsp;10 adds damping. The policy was trained in Isaac with the same
+PD 100/10 and no feed-forward, which is why the real stack sends &tau;_ff&nbsp;=&nbsp;0 in RL mode (gravity makes the arm
+sag &asymp; g(q)/kp below the target, exactly as in sim). v20's own gains: arm MPC kp 390/kd 10 (set by the launch script),
+hold kp 400/kd 12, waist kp 380/kd 10.</p>
+
+<h2>4. Sensing: everything the robot knows</h2>
+<p>Three groups: <b>proprioception</b> (the body: joints, IMU), <b>exteroception</b> (the world: camera, lidar)
+and <b>touch</b> (the Dex3 pads), plus operator inputs and health data. Field names are from the SDK messages
+(<code>unitree_hg</code> IDL).</p>
+<pre class="w">
+ SOURCE (physical)                 MESSAGE . FIELDS                                  RATE    READ BY → USED FOR
+ ────────────────────────────────  ────────────────────────────────────────────────  ──────  ──────────────────────────────
+ 29 joint encoders + drivers       rt/lowstate . motor_state[35]: q, dq, ddq,         500 Hz  daemon + toy → policy obs, FK,
+                                   tau_est, temperature[2], vol, motorstate                   guards (stuck, torque, temp)
+ pelvis IMU                        rt/lowstate . imu_state: quaternion, gyroscope,    500 Hz  nobody in control (logger only)
+                                   accelerometer, rpy, temperature
+ wireless remote                   rt/lowstate . wireless_remote[40] (buttons, sticks) 500 Hz  daemon → E-STOP L1+R1
+ Dex3 right hand: 7 motors         rt/dex3/right/state . motor_state: q, dq, tau, temp  app    toy/SM → grasp obs, hand control
+ Dex3 pads: 9 sensors x 12 cells   rt/dex3/right/state . press_sensor_state[9]:         app    toy/SM → grasp obs (9 taxels)
+                                   pressure[12], temperature[12], lost
+ Dex3 IMU, power, error bits       rt/dex3/right/state . imu_state, power_v/a, error    app    SM → hand fault check → HALTED
+ D435i "unitree" camera (head)     /unitree/color/image_raw/compressed/throttled       ~10 Hz  live_locator → fruit detections
+   RGB 640x480, HFOV 56, VFOV 43   /unitree/aligned_depth_to_color/.../throttled       ~5 Hz   live_locator, branch_map
+ Livox MID-360 lidar (head)        /utlidar/cloud_livox_mid, /utlidar/imu_livox_mid    -       bag recorder only (study)
+ battery BMS, main board           BmsState_ (cell V, current, SoC, temp), MainBoard    -       nobody
+ laptop microphone                 arecord (ALSA) → voice_gated                        -       SM → fruit label by voice
+ operator                          dashboard click / GO / STOP / RESET, remote, ENTER   events  toy, SM, daemon
+</pre>
+<p class="note">Also configured: an extra D455 "head" camera (calibrated) and two wrist D435if (not calibrated);
+the launcher only starts <code>--cameras unitree</code>.</p>
+
+<h3>4.1 Visual perception pipeline</h3>
+<pre>
+ ROBOT (Jetson)                                     │ LAPTOP
+ D435i 30 fps RGB + depth (realsense2_camera)       │
+  → jpeg_republisher: RGB → JPEG                    │
+  → stream_throttle: colour ~10 Hz, depth ~5 Hz ────┼─► live_locator (ROS 2; only the NEWEST frame is processed)
+    (raw aligned depth ~37 MB/s would choke the     │    1. RF-DETR on RGB (classes red_apple, green_apple, orange;
+     link: only throttled topics leave the robot)   │       score ≥ 0.3) → bounding boxes                  [GPU]
+                                                    │    2. depth inside the box: nearest depth cluster, checked
+                                                    │       against the distance the box SIZE implies (radius)
+                                                    │       → front surface depth z
+                                                    │    3. centre = surface + radius; deproject with camera_info
+                                                    │       (fx, fy, cx, cy) → p_cam            → /fruits_detected_raw
+                                                    │  fruits_to_torso: p_torso = A·p_cam + t
+                                                    │    (ArUco calibration: 55 points, mean error 5.4 mm)
+                                                    │                                         → /fruits_detected_torso
+                                                    │  toy (arm at HOME): sample for detect_s, track (3 cm gate,
+                                                    │    mean of last 20), take the track nearest the dashboard CLICK
+                                                    │    (≤ 10 cm) → torso → pelvis by FK of the waist
+                                                    │    → apple position FIXED for the whole reach
+                                                    │  branch_map (tree runs): depth → 2 cm voxels + 7 cm shell
+                                                    │    behind each surface → /apple_picker/obstacle_map (SM paths)
+</pre>
+<p><b>Important:</b> in the RL toys vision is <b>open-loop</b>. The apple is measured once with the arm at home, then
+the policy runs closed-loop only on the joints. Reasons: the arm blocks the view, and the camera points 48&deg; down,
+so it never sees anything above its own height (only ~15% of the training targets are visible). Every calibration or
+depth error goes straight into the final palm error. <code>--closer_cm</code> and <code>--calib</code> correct a
+constant offset. The original picker does re-detect during the approach (redetect gate).</p>
+
+<h3>4.2 Tactile pipeline (Dex3 pads)</h3>
+<pre>
+ Dex3 right hand: 9 PressSensorState_ × 12 cells = 108 raw pressures (~100000 counts at rest; cells that never
+                  report sit at a sentinel ≤ 30001) + a temperature per cell + a "lost" counter
+   │ tactile_calibrate.py (once): the operator presses each named place → which of the 108 cells answer
+   │ tactile_force_calibrate.py (once): luggage-scale pulls per phalanx → counts per newton
+   ▼ logs/sim2real/tactile_calib.json        (careful: logs/ is git-ignored)
+ PadTactile (every step): baseline taken at grasp start → summed rise of a place's cells ÷ gain
+   ▼
+ 9 taxels [N] = thumb prox/dist · middle prox/dist · index prox/dist · palm ×3 (one link in the sim)
+   ▼ TactileFeatures
+ slip = d(taxel)/dt (9)  ·  balance = each finger vs the mean (3)  ·  per-finger level (3)
+   ▼
+ GRASP policy (44 inputs) → 7 hand targets (+ 7 arm outputs, the arm is held except the wrist)
+</pre>
+
+<h3>4.3 Where every policy input comes from</h3>
+<table>
+<tr><th>Policy</th><th>Input (dims)</th><th>Source on the real robot</th></tr>
+<tr><td rowspan="8">Reach<br>(40 in / 8 out,<br>"waist" layout)</td><td>arm q &minus; default (7), arm dq (7)</td><td>joint encoders, rt/lowstate (live)</td></tr>
+<tr><td>apple &minus; palm point, pelvis axes (3)</td><td>camera (<b>once</b>) &minus; forward kinematics of the encoders (live)</td></tr>
+<tr><td>palm quaternion, torso frame without waist yaw (4)</td><td>forward kinematics (live)</td></tr>
+<tr><td>previous raw action (7)</td><td>the policy's own memory</td></tr>
+<tr class="hi"><td>palm touch force (1)</td><td><b>virtual</b>: computed from the perceived apple and the FK palm (or 0). The real pads are not used.</td></tr>
+<tr class="hi"><td>clearance ring (8)</td><td><b>constant 1</b> (all free): no sensor provides it on the robot</td></tr>
+<tr><td>waist yaw, waist dq, previous waist action (3)</td><td>encoder 12 + memory</td></tr>
+<tr><td colspan="2" class="note">"single" layouts: no touch input, plus a scripted hand phase; "single_tactile" (41) puts the virtual touch back.</td></tr>
+<tr><td rowspan="5">Grasp<br>(44 in / 14 out)</td><td>hand q &minus; default (7), hand dq (7)</td><td>Dex3 motor encoders</td></tr>
+<tr><td>slip (9), balance (3), level (3)</td><td><b>real pads</b> through the calibration above</td></tr>
+<tr><td>grip command [N] (1), grasp phase (1)</td><td>constant per attempt / timer</td></tr>
+<tr><td>apple in the palm frame (3)</td><td>camera (once) + FK</td></tr>
+<tr class="hi"><td>last hand action (7), gravity in the palm frame (3)</td><td>memory; gravity from FK <b>assuming the pelvis is upright</b> (the IMU is not used)</td></tr>
+</table>
+
+<h3>4.4 Information available but not used (opportunities)</h3>
+<table>
+<tr><th>Data</th><th>Now</th><th>Could give</th></tr>
+<tr><td>Pelvis IMU (quaternion, gyro)</td><td>unused</td><td>the real pelvis tilt for gravity_in_palm and for the apple frame. The robot sways while balancing; the sim assumed a fixed upright pelvis. Cheap to add.</td></tr>
+<tr><td>Real palm pads during the reach</td><td>virtual touch</td><td>a real "I touched it" signal for the tactile reach (closed-loop contact instead of geometry)</td></tr>
+<tr><td>Camera during the approach</td><td>apple frozen at home</td><td>re-detect while visible; a wrist camera (configs exist) would see the apple all the way in</td></tr>
+<tr><td>MID-360 lidar</td><td>recorded only</td><td>tree structure above the camera's view, obstacle map, ring sectors</td></tr>
+<tr><td>tau_est (joint torque estimate)</td><td>guard, warn-only</td><td>contact / external force for the reach; the clearance or touch inputs</td></tr>
+<tr><td>BMS state of charge, motor voltages</td><td>unused</td><td>"battery low" warning (weaker, hotter motors near the end of a charge)</td></tr>
+<tr><td>Pad temperatures, "lost" counters, Dex3 error bits</td><td>partly</td><td>health check before trusting the tactile inputs</td></tr>
+</table>
+
+<h2>5. Communication: laptop &harr; robot</h2>
+<p>Two planes on the same cable. <b>Control plane = ssh</b> (sshpass, user unitree): clock sync, start/stop daemon and
+cameras, <code>tail -F</code> of the robot logs. <b>Data plane = DDS</b> (CycloneDDS, domain 0). Unitree topics (<code>rt/...</code>)
+and ROS 2 topics share the same DDS bus: ROS 2 maps <code>/foo</code> to the DDS topic <code>rt/foo</code>, which is why ROS tools can
+see Unitree messages. Laptop processes use <code>fast_dds.py</code>: the robot as a unicast peer with a 1 s announce, so
+discovery takes ~1 s instead of 20-35 s.</p>
+<table>
+<tr><th>Topic</th><th>Type</th><th>Publisher &rarr; Subscriber</th><th>Rate</th><th>Purpose</th></tr>
+<tr><td>rt/lowstate</td><td>LowState_</td><td>robot board &rarr; daemon, laptop</td><td>500 Hz</td><td>joint q/dq/&tau;, IMU, remote buttons</td></tr>
+<tr><td>rt/arm_sdk</td><td>LowCmd_</td><td>daemon child &rarr; robot board</td><td>90 Hz</td><td>the only motor command path for arms/waist</td></tr>
+<tr><td>rt/arm_rl/cmd</td><td>LowCmd_</td><td>toy &rarr; daemon</td><td>50 Hz</td><td>RL joint targets (+waist)</td></tr>
+<tr><td>rt/arm_rl/ctl</td><td>String JSON</td><td>toy, dashboard, launcher &rarr; daemon</td><td>hb 20 / 5 Hz + events</td><td>rl_enter, bye, hb, estop, reset, switch, ping</td></tr>
+<tr><td>rt/arm_rl/state</td><td>String JSON</td><td>daemon &rarr; all</td><td>10 Hz RL / 1 Hz</td><td>mode, owner, switch, contact level, why</td></tr>
+<tr><td>rt/arm_ctrl/cmd</td><td>String JSON</td><td>SM &rarr; daemon (v20)</td><td>events</td><td>zero, target, path, enable, set_waist, stop</td></tr>
+<tr><td>rt/arm_ctrl/qref</td><td>LowCmd_</td><td>old toys &rarr; v20</td><td>50 Hz</td><td>external joint refs (blocked for the RL arm in RL mode)</td></tr>
+<tr><td>rt/arm_ctrl/state</td><td>String JSON</td><td>daemon &rarr; all</td><td>10 Hz</td><td>v20 per-arm status (launcher "daemon up")</td></tr>
+<tr><td>rt/dex3/right/cmd, /state</td><td>HandCmd_/HandState_</td><td>laptop &harr; hand [Unitree]</td><td>app rate</td><td>Dex3 fingers + tactile; <b>direct from the laptop</b></td></tr>
+<tr><td>camera topics (throttled)</td><td>CompressedImage</td><td>Jetson &rarr; live_locator</td><td>~10/5 Hz</td><td>colour / depth</td></tr>
+<tr><td>/fruits_detected_raw &rarr; _torso</td><td>String JSON</td><td>live_locator &rarr; fruits_to_torso &rarr; toy/SM</td><td>~10 Hz</td><td>detections</td></tr>
+<tr><td>/apple_picker/go, select_fruit, reach_closer, target_fruit, estop</td><td>String</td><td>dashboard/launcher &rarr; toy/SM</td><td>events</td><td>operator inputs</td></tr>
+</table>
+<p>Launcher &harr; dashboard use files, not DDS: <code>logs/session_*/toy_state.json</code> and <code>toy_request</code> (RUN TOY).</p>
+
+<h3>Start-up sequence: <code>./g1_launch.sh toy -- single --policy P --speed 0.3 --target detection</code></h3>
+<pre>
+ Operator    g1_launch.py               Jetson (via ssh)                    dual daemon            run_toy
+    │ run       │                            │                                   │                    │
+    │──────────►│ distrobox + conda          │                                   │                    │
+    │           │ sync_robot_clock.sh ──────►│ date -s (RTC battery is dead)     │                    │
+    │           │ ssh_robot_launch_dual.sh ─►│ reused?  else: kill stale writers,│                    │
+    │           │                            │ stop master_service, USB check,   │                    │
+    │           │                            │ start cameras, start daemon ─────►│ build ACADOS,      │
+    │           │◄─ "ROBOT: STARTED dual" ───│                                   │ wait lowstate,     │
+    │           │ ssh tail -F robot logs     │                                   │ single-writer chk, │
+    │           │ start locator, torso, dashboard                                │ spawn pub child    │
+    │           │ DaemonWatch ◄──────── rt/arm_ctrl/state 10 Hz, rt/arm_rl/state ─│                    │
+    │           │ switch ORIGINAL ─────────── rt/arm_rl/ctl ────────────────────►│                    │
+    │           │ spawn ───────────────────────────────────────────────────────────────────────────►│
+    │           │                                                                │◄── rl_enter ───────│
+    │           │                                                                │─── state (ack) ───►│
+    │ GO (ENTER or dashboard) ─────────────────────────────────────────────────────────────────────►│
+    │           │                                                                │◄── cmd 50 Hz ──────│
+    │           │                                                                │◄── hb 20 Hz ───────│
+    │ Ctrl-C ──►│ SIGINT ─────────────────────────────────────────────────────────────────────────►│
+    │           │                                                                │◄── kp→400, bye ────│
+    │           │ switch ORIGINAL, stop laptop procs                             │                    │
+    │           │ stop_apple_picker.sh ── SIGTERM ─────────────────────────────►│ LOWER 2 s, weight  │
+    │           │                                                                │ 1→0 in 2.5 s, exit │
+</pre>
+
+<h2>6. Concurrency: what is parallel, what is serial</h2>
+<pre>
+ JETSON ─ process 1: arm_mpc_server_dual.py  (Python 3.8: ONE GIL → threads take turns)       process 2 (spawn)
+ ┌────────────────────────────────────────────────────────────────────────────────────┐   ┌──────────────────────┐
+ │ main        v20 _pub_loop 90 Hz: build 29-joint command ──► shared memory (150 f64) ├──►│ pub child 90 Hz       │
+ │ thread      _mpc_loop(left)   ACADOS SQP-RTI ~33 Hz  (ORIGINAL work)                │   │ fresh heartbeat (2 s)?│
+ │ thread      _mpc_loop(right)  ACADOS SQP-RTI ~33 Hz                                 │   │ parent pid alive?     │
+ │ thread      _state_loop 10 Hz: rt/arm_ctrl/state, temps, rx/tx writer check, gc     │   │ → rt/arm_sdk + weight │
+ │ thread      rl_mode: RlMode.loop 100 Hz (10 Hz in ORIGINAL): watchdog, remote,      │   │ SCHED_FIFO 30, core 7 │
+ │             contact guard, FREEZE/RELEASE/LOWER ramps                               │   │ own GIL, own DDS      │
+ │ thread      rl_state: rt/arm_rl/state 10 / 1 Hz                                     │   └──────────────────────┘
+ │ thread      dds_poll: every 2 ms take() newest rt/lowstate + rt/arm_rl/cmd           │
+ │ C threads   CycloneDDS receive; Python listeners only for rare JSON (ctl, arm_ctrl) │   process 3..: cameras
+ │ thread      handoff (only at shutdown)                                              │   (ROS 2 nodes, C++)
+ │ locks: arm.lock per arm, rl.lock, _waist_lock;   gc disabled (manual collect)       │
+ └────────────────────────────────────────────────────────────────────────────────────┘
+ Parent pinned to cores 0-6 (renice -10); child alone on core 7.
+
+ LAPTOP ─ separate processes (truly parallel on different cores)
+   g1_launch.py  : main loop 2 Hz (pump logs, status line, stdin) + DaemonWatch DDS callbacks
+   live_locator  : ROS 2 executor + GPU inference           fruits_to_torso: ROS 2 callback
+   dashboard     : asyncio web server + DDS (estop/switch run in executor threads), hb 5 Hz
+   run_toy       : MAIN THREAD = serial 50 Hz loop  read → obs → policy → limiter → watch → send
+                   + rl_hb (20 Hz) + rl_keep (50 Hz check) + ROS executor + DDS listeners + voice
+</pre>
+<p><b>Serial:</b> everything inside one control step (read &rarr; policy &rarr; send) and the phase sequence of the toy / SM.
+<b>Concurrent but not parallel:</b> the Python threads inside the daemon and inside the toy (one GIL; C code such as
+ACADOS, numpy, DDS can release it). <b>Truly parallel:</b> different processes (daemon parent vs publisher child, laptop
+processes, the Unitree firmware). <b>Asynchronous coupling:</b> nothing is clock-synchronised: 50 Hz policy, 2 ms poll,
+90 Hz parent loop, 90 Hz child loop, 500 Hz lowstate all run on their own timers and hand data over as "latest value"
+(zero-order hold). This is simple and robust, but adds jitter (section 9).</p>
+<pre>
+ time (ms)  0        20        40        60        80       100
+ policy     |P1-------|P2-------|P3-------|P4-------|P5-------|        50 Hz, sent over the cable
+ parent     |  .  .  .  .  .  .  .  .  .  |  ticks every 11.1 ms: each Pn is copied 1 OR 2 times
+ child      | .  .  .  .  .  .  .  .  .  .|  independent 11.1 ms timer: +0..11 ms extra delay
+ lowstate   ||||||||||||||||||||||||||||||||  every 2 ms
+</pre>
+
+<h2>7. State machines</h2>
+<h3>7.1 Dual daemon modes (g1_dual/rl_mode.py) &mdash; who owns the RL arm</h3>
+<pre>
+                         daemon start (always)
+                                 │
+                                 ▼
+     ┌──────────────────────► ORIGINAL  (v20 owns both arms; RL stream ignored; NO software E-STOP)
+     │ heartbeat lost 0.5 s      │ ▲
+     │ (switch off) / bye        │ │ switch ORIGINAL (1 s stiffness hand-over to v20's hold)
+     │                rl_enter / │ │ or no laptop heartbeat 120 s while switch=RL
+     │                switch RL  ▼ │
+     │                ┌──────────────────────┐
+     └────────────────┤ RL  owner = toy      │  toy ends / hb lost, switch=RL
+                      │     owner = none ◄───┼──── (idle hold: last target, same gains)
+                      └──────────┬───────────┘
+     E-STOP: dashboard STOP, remote L1+R1, v20 "stop"; contact "stuck"; v20 jump-freeze;
+             rt/lowstate blind > 1 s
+                                 ▼
+                              FREEZE   hold where the arm IS, at the policy's gains, STOP_HOLD_S = 1 s
+                                 │     (2nd STOP: skip to the settle at once)
+                                 ▼
+                              RELEASE  kp → 20, kd → 12 over 4 s: compliant, pushable, stays there
+                                 │
+                 RESET (dashboard, from ANY mode; also shutdown)
+                                 ▼
+                              LOWER    kp 0, kd 4 for 2 s (arm sinks), then 0.5 s stiffness ramp
+                                 │
+                                 └──► ORIGINAL (or RL idle hold if switch = RL)
+</pre>
+<h3>7.2 v20 per-arm logic (onboard arm_mpc_server.py, untouched)</h3>
+<pre>
+  DISABLED/HOLD (kp 400, kd 12 at q_hold) ── enable (needs q0 + target) ──► ENABLE RAMP 2 s ──► DRIVE
+        ▲                                                                                         │
+        │  disable · "stop" · qref stale > 0.25 s (hold_latch)                                    │ exec_mode:
+        └─────────────────────────────────────────────────────────────────────────────────────────┤  mpc | path |
+        ▲                                                                                         │  qref | traj
+        └──── FROZEN (hold q_cmd_last) ◄── |q_ref − q_meas| > 1.2 rad ◄───────────────────────────┘
+  WHOLE STREAM: rt/lowstate older than 0.2 s → enable flag = 0 → child stops writing → firmware gives
+  the arms back to its own controller (abrupt). Temperature > 105 °C → that arm rests (hold).
+</pre>
+<h3>7.3 Publisher child</h3>
+<pre>
+  START ─► WAIT_PARENT (no writes, up to 300 s) ── first fresh heartbeat ──► ARMED
+  ARMED: fresh (≤ 2 s) and flag = 1 → PUBLISH  |  stale or flag = 0 → IDLE (no writes)  |  parent pid gone → EXIT
+</pre>
+<h3>7.4 Toy run (run_toy.py + toy_reach.py) &mdash; serial phases</h3>
+<pre>
+ CONNECT ─► clear old freeze ─► HOME (scripted joint path, body-clearance checked) ─► PLAN target (click /
+ detection, torso frame, envelope check) ─► START pose ─► wait GO ─► rl_enter ─► POLICY (50 Hz)
+     POLICY ── REACHED ──► HOLD (hold_s) ──► [GRASP: hand policy, tactile] ──► RETURN home ──┐
+        │ E-STOP seen in rt/arm_rl/state · LightWatch STOP · TIME LIMIT · Ctrl-C              │
+        ▼                                                                                     ▼
+     finish: hand-over kp 100 → 400 over 1 s (target shifted by gravity so the arm stays put) → bye
+             (Ctrl-C: LOWER + "hasta la vista") → log → launcher: ENTER / RUN TOY = again, q = quit
+</pre>
+<h3>7.5 Original picker (apple_picker_sm.py)</h3>
+<pre>
+ INIT → ACQUIRE (fruit label + detection) → PREGRASP → DESCEND → CLOSE → LIFT → DROP (basket) → COOLDOWN ─┐
+          ▲                                                                                              │
+          └──────────────────────────────────────────────────────────────────────────────────────────────┘
+ side states: MANUAL (dashboard jog, only from idle) · HALTED (hand motor latched: reboot) · DONE (station)
+</pre>
+<h3>7.6 Launcher (g1_launch.py)</h3>
+<pre>
+ check env → [loopback: fake motors + daemon on lo] or start_robot (ssh, 60 s) → start laptop procs
+ → wait daemon (150 s) → switch ORIGINAL → run_original | run_toy (loop) ─ Ctrl-C/SIGTERM/SIGHUP ─►
+ shutdown: SIGINT toy (15 s) → switch ORIGINAL → SIGINT → SIGTERM → SIGKILL laptop procs → stop robot
+</pre>
+
+<h2>8. Safety stops (defence in depth)</h2>
+<table>
+<tr><th>#</th><th>Trigger</th><th>Detected in</th><th>Reaction</th><th>Mode</th></tr>
+<tr><td>1</td><td>Remote L1+R1 (debounce 20 ms)</td><td>daemon, from rt/lowstate bytes</td><td>FREEZE &rarr; RELEASE</td><td>RL only</td></tr>
+<tr><td>2</td><td>Dashboard STOP (re-sent with id)</td><td>daemon via rt/arm_rl/ctl</td><td>FREEZE; 2nd press: settle now</td><td>RL only</td></tr>
+<tr><td>3</td><td>Toy heartbeat silent 0.5 s</td><td>daemon tick</td><td>ORIGINAL (v20 stiff hold) / RL idle hold</td><td>RL</td></tr>
+<tr><td>4</td><td>No target for 0.25 s</td><td>v20 pub loop</td><td>hold_latch kp 400</td><td>qref/RL</td></tr>
+<tr><td>5</td><td>|q* &minus; q| &gt; 1.2 rad</td><td>v20 pub loop</td><td>FROZEN; dual &rarr; FREEZE</td><td>all</td></tr>
+<tr><td>6</td><td>Joint &gt;0.15 rad behind, &lt;0.05 rad/s, 0.5 s ("stuck")</td><td>contact_guard 100 Hz</td><td>FREEZE</td><td>RL</td></tr>
+<tr><td>7</td><td>|&tau;_est &minus; gravity| &gt; 0.30 rated, 0.15 s</td><td>contact_guard</td><td><b>WARN only</b> (not calibrated)</td><td>RL</td></tr>
+<tr><td>8</td><td>lowstate late/frozen &gt; 1 s</td><td>rl_mode</td><td>FREEZE</td><td>RL</td></tr>
+<tr><td>9</td><td>lowstate older than 0.2 s</td><td>v20 pub loop</td><td>stream stops &rarr; firmware takes arms</td><td>all</td></tr>
+<tr><td>10</td><td>parent heartbeat &gt; 2 s / parent dead</td><td>pub child</td><td>stream stops &rarr; firmware takes arms</td><td>all</td></tr>
+<tr><td>11</td><td>Every command</td><td>rl_mode / v20</td><td>joint-limit clamp, waist &plusmn;0.80 rad, kp/kd clipped to v20 max</td><td>all</td></tr>
+<tr><td>12</td><td>Laptop watch: lowstate age, left RL, joint speed, temperature; lag gate</td><td>toy (LightWatch)</td><td>stop sending &rarr; #3/#4 on robot</td><td>toy</td></tr>
+<tr><td>13</td><td>Second rt/arm_sdk writer</td><td>v20 start check + rx/tx ratio</td><td>abort / warn; launch script kills stale writers</td><td>all</td></tr>
+<tr><td>14</td><td>Shutdown (SIGTERM)</td><td>DualServer.handoff</td><td>LOWER 2 s, then weight 1&rarr;0 over 2.5 s (no snap)</td><td>all</td></tr>
+<tr><td>15</td><td>Overcurrent / overheat [Unitree]</td><td>drivers / board</td><td>firmware protection (not visible here)</td><td>all</td></tr>
+</table>
+<p>Design principle: <b>the stop lives on the robot</b>. A laptop that crashes or loses the cable cannot send a stop, so the
+robot must stop on <i>silence</i> (#3, #4) and on its own measurements (#5-#9). The laptop-side checks (#12) are extra.</p>
+
+<h2>9. Findings: likely problems and optimisation opportunities</h2>
+<p class="note">Ranked by risk. "Verify" = I could not check the robot itself (the cable was down).</p>
+<table>
+<tr><th>#</th><th>Finding</th><th>Why it matters</th><th>Suggestion</th></tr>
+<tr class="hi"><td>1</td><td><b>ORIGINAL mode has no robot-side watchdog or E-STOP.</b> The deployed v20 ignores <code>rt/arm_ctrl/heartbeat</code> and <code>estop</code> (that was v22, never deployed). The SM's estop_link heartbeat goes nowhere; dashboard STOP in ORIGINAL is logged "ignored".</td><td>If the laptop dies mid-move in the picker, MPC keeps driving to the last target. Only the Unitree remote's own damping / power is left.</td><td>Add an ORIGINAL watchdog in the dual layer (hold the arm when the SM heartbeat goes silent while enabled), and honour STOP in ORIGINAL (call v20's own "stop").</td></tr>
+<tr class="hi"><td>2</td><td><b>Lowstate stale &gt; 0.2 s cuts the stream</b> (v20 pub loop sets flag 0, the child stops). The firmware then grabs the arms at once &mdash; the same snap the shutdown hand-off fixed.</td><td>Any GIL stall or cable glitch over 200 ms gives a sudden arm motion. dds_poll makes it rarer, not impossible.</td><td>In the dual layer, on stale lowstate keep publishing a hold, or use the weight ramp (pub_weight) instead of a hard cut.</td></tr>
+<tr><td>3</td><td><b>Rate chain 50 &rarr; 90 &rarr; 90 Hz, unsynchronised.</b> Each policy target is held 1 or 2 parent ticks (11 or 22 ms) and the child adds 0-11 ms. Docstrings say 250 Hz, but <code>PUB_RATE_HZ</code> defaults to 90 and nothing sets it (verify on the robot).</td><td>Jitter and extra latency that Isaac never saw (sim applies each action for exactly 20 ms). A possible part of "same policy, different result".</td><td>Use an integer multiple of 50 Hz (100 or 200 Hz) for both loops; fix the docstrings.</td></tr>
+<tr><td>4</td><td><b>One Python GIL for everything on the Jetson</b>: 2 MPC threads, the 90 Hz loop, the 100 Hz RL tick, a 500 Hz poll loop, state thread, listeners.</td><td>This was the root cause of the late lowstate / "stuck" stops (2026-10-16). The 2 ms poll is itself a constant GIL user.</td><td>Poll with a DDS WaitSet (blocks in C) or 4-5 ms; pause the RL-side arm's MPC solver in RL mode; long term: C++ writer or policy onboard.</td></tr>
+<tr><td>5</td><td><b>The 50 Hz control loop crosses the cable twice</b> (lowstate &rarr; laptop &rarr; policy &rarr; command &rarr; Jetson).</td><td>Network + laptop scheduling in the loop; the lag gate and keep-alive are workarounds.</td><td>The README's plan: run the policy (small MLP, numpy) in the daemon via <code>RlMode.submit()</code>; laptop sends only the apple and GO.</td></tr>
+<tr><td>6</td><td><b>Parent&rarr;child heartbeat uses wall time</b> (<code>time.time()</code>), and <code>sync_robot_clock.sh</code> runs <code>date -s</code> on every launch, also when the daemon is reused.</td><td>A backward clock step makes a hung parent look "fresh" to the child for as long as the step; a forward step drops a publish.</td><td>Use <code>time.monotonic()</code> (system-wide clock, valid across processes); skip the clock sync when the daemon is reused.</td></tr>
+<tr><td>7</td><td><b>Contact torque guard is warn-only</b>; collision protection relies on "stuck" (0.15 rad for 0.5 s).</td><td>At kp 100 a blocked arm presses ~15 N&middot;m for half a second before the stop.</td><td>Calibrate the residual on the robot (logs exist), then enable <code>--contact-torque-stop</code>.</td></tr>
+<tr><td>8</td><td><b>Dex3 hand is commanded straight from the laptop</b> (rt/dex3/right/cmd), with no robot-side watchdog.</td><td>If the laptop dies while gripping, the hand does whatever its firmware does on silence (unknown).</td><td>Check the Dex3 timeout behaviour; consider a hand hold/open in the daemon (v22 had it).</td></tr>
+<tr><td>9</td><td><b>Gravity feed-forward differs between modes</b>: env.sh sets <code>ARM_MPC_GRAVITY_FF=1.0</code> for MPC, the qref/RL path forces &tau;_ff = 0.</td><td>Correct for RL (matches training) but makes ORIGINAL vs RL hold poses differ by the sag g/kp; confusing in comparisons.</td><td>Keep, but document it; comment in env.sh says 0.15 while the value is 1.0.</td></tr>
+<tr><td>10</td><td><b>Doc/config drift</b>: <code>RELEASE_AFTER_S</code> is unused (code goes FREEZE&rarr;RELEASE after 1 s, README says "STOP again or 5 s"); child "stale &gt; 0.5 s" in its docstring vs 2.0 s in code; "250 Hz" in several places.</td><td>Wrong mental model while debugging.</td><td>Clean up the comments and the README table.</td></tr>
+<tr><td>11</td><td><b>Sticky RL + 120 s lost-laptop watchdog</b>: the arm stays at kp 100 with no supervisor for up to 2 min.</td><td>Not dangerous at rest, but nobody watches contact during that time (the guard only runs with an owner).</td><td>Shorter timeout (e.g. 15-30 s), or keep the stuck guard on in idle hold.</td></tr>
+<tr><td>12</td><td><b>Open network</b>: password "123" in scripts, host-key checks off, DDS without authentication.</td><td>Anything on 192.168.123.0/24 can write rt/arm_rl/cmd or rt/arm_sdk.</td><td>Fine on an isolated cable; never bridge it to Wi-Fi. SSH keys instead of sshpass.</td></tr>
+<tr><td>13</td><td><b>Deployment state unknown</b>: dds_poll, pub_weight, the switch were built 2026-10-16; my notes say "not deployed yet".</td><td>Debugging the wrong version.</td><td>On the robot: md5 of <code>~/g1_arm_onboard/dual/*.py</code> vs local; check the log lines "dds_poll: polled" and "[pub-proc] arm_sdk weight follows".</td></tr>
+<tr class="hi"><td>14</td><td><b>Things that can be lost</b>: <code>~/g1_fruits_picker</code> (daemon layer, launcher, <code>camera_extrinsics.yaml</code>) is not a git repository, and <code>tactile_calib.json</code> sits in the git-ignored <code>logs/</code>.</td><td>A disk failure loses the robot-side code and both calibrations.</td><td>Put g1_fruits_picker under git (private remote); force-add the calibration files.</td></tr>
+<tr><td>15</td><td><b>Vision is open-loop during the reach</b> (section 4.1), and the virtual touch / constant ring are not sensors.</td><td>Calibration and depth errors become the reach error; there is no real contact feedback in the reach.</td><td>Re-detection or a wrist camera; real palm pads; IMU for gravity (4.4).</td></tr>
+</table>
+
+<h3>Where to look when something goes wrong</h3>
+<pre>
+ laptop  logs/session_&lt;time&gt;_&lt;profile&gt;/   one log per process (+ robot_daemon.log = tail of the robot logs)
+         &lt;toy run dir&gt;/toy_full.log, brief log   policy rows: obs, raw, q_cmd, q, age, compute time
+ robot   /tmp/arm_daemon.log   v20 + dual prints        /tmp/arm_dual.log   mode changes, 5 s RL summaries
+         /tmp/arm_telemetry.csv(.cmd/.events)  truncated at every daemon start: PULL BEFORE RESTARTING
+ key RL summary line:  "RL 5s: N cmd (50 Hz), gap max .. ms, clamped .., torque peak .., lowstate age max .. ms"
+</pre>
+</body></html>
