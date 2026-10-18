@@ -668,3 +668,17 @@ for _id, _env in (("AppleReachVisible-v1", AppleReachVisibleEnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleReachVisiblePPORunnerCfg},
         disable_env_checker=True,
     )
+
+# tactile grasp behind the visible-apple reach (apple_grasp_visible_env_cfg.py)
+
+from .apple_grasp_visible_env_cfg import AppleGraspVisibleEnvCfg, AppleGraspVisibleEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspVisiblePPORunnerCfg
+
+for _id, _env in (("AppleGraspVisible-v1", AppleGraspVisibleEnvCfg),
+                  ("AppleGraspVisible-Play-v1", AppleGraspVisibleEnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspVisiblePPORunnerCfg},
+        disable_env_checker=True,
+    )

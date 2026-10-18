@@ -1,0 +1,1 @@
+logs/rsl_rl/apple_reach_visible/2026-10-17_20-53-39/exported/policy.pt (AppleReachVisible-v1, exported by play.py on the fast PC, commit 5ad8acf "export reach policy"; 37 in / 7 out)

@@ -164,6 +164,24 @@ def _reach_obs(
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
 
+    if layout == "visible":
+        # AppleReachVisible-v1 (envs/apple_reach_visible_env_cfg.py): waist held,
+        # 37 = arm pos (7), vel (7), the PERCEIVED apple - palm in the torso's yaw
+        # frame (3), palm orientation in the torso frame (4), previous raw action
+        # (7), the perceived ring with the unseen neighbours masked (8), hand phase
+        from .single_reach import hand_phase_obs, neighbour_ring_measured
+        from .visible_reach import apple_pos_palm_measured_torso
+
+        return torch.cat([
+            joint_pos_selected(env, arm_cfg),
+            joint_vel_selected(env, arm_cfg),
+            apple_pos_palm_measured_torso(env, object_cfg, robot_body_cfg, local_offset=palm_local_offset),
+            body_quat_relative_to_body(env, robot_body_cfg, env._autoplay_torso_cfg),
+            prev_raw_action,
+            neighbour_ring_measured(env, max_range=waist["ring_range"]),
+            hand_phase_obs(env),
+        ], dim=-1)
+
     if layout == "single":
         # AppleReachSingle-v1 (envs/apple_reach_single_env_cfg.py): the
         # "waist" vector without the touch slot, the PERCEIVED apple
@@ -651,7 +669,7 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         waist_raw = None
         if self.cfg.drive_with_reach_policy and not bool(phase.all()):
             policy = _load_reach_policy(self.cfg.reach_policy_path, self.device)
-            waist = None if self._waist_id is None else \
+            waist = {"ring_range": self.cfg.reach_ring_range} if self._waist_id is None else \
                 {"joint_cfg": self._waist_cfg, "prev_raw": self._waist_prev_raw, "ring_range": self.cfg.reach_ring_range}
             obs = _reach_obs(
                 self._env, self._reach_arm_cfg, self._palm_cfg, self._apple_cfg,
@@ -687,10 +705,28 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         self._prev_vel = torch.where(needs_reset, torch.zeros_like(self._prev_vel), self._prev_vel)
 
         dt = self._env.step_dt
-        vmax = self.cfg.max_velocity * self.speed_scale             # speed factor (see the parent class)
+        # caps: the trainee's in the grasp phase; the reach phase may have the
+        # frozen reach's own (reach_max_velocity / _acceleration / _brake_to_target)
+        c = self.cfg
+        vcap = torch.where(phase, c.max_velocity,
+                           c.max_velocity if c.reach_max_velocity is None else c.reach_max_velocity)
+        acap = torch.where(phase, c.max_acceleration,
+                           c.max_acceleration if c.reach_max_acceleration is None else c.reach_max_acceleration)
+        vmax = vcap * self.speed_scale                              # speed factor (see the parent class)
+        amax = acap * self.speed_scale ** 2
         v_desired = (target_desired - self._prev_target) / dt
         v_cmd = torch.maximum(torch.minimum(v_desired, vmax), -vmax)
-        max_dv = self.cfg.max_acceleration * self.speed_scale ** 2 * dt
+        brake_reach = c.brake_to_target if c.reach_brake_to_target is None else c.reach_brake_to_target
+        if c.brake_to_target or brake_reach:
+            # as RateLimitedJointPositionAction: the fastest speed that still stops at the target
+            err = (target_desired - self._prev_target).abs()
+            v_stop = -0.5 * amax * dt + torch.sqrt((0.5 * amax * dt) ** 2 + 2.0 * amax * err)
+            braked = torch.maximum(torch.minimum(v_cmd, v_stop), -v_stop)
+            if c.brake_to_target and brake_reach:
+                v_cmd = braked
+            else:
+                v_cmd = torch.where(~phase if brake_reach else phase, braked, v_cmd)
+        max_dv = amax * dt
         v_cmd = torch.clamp(v_cmd, self._prev_vel - max_dv, self._prev_vel + max_dv)
 
         target_cmd = self._prev_target + v_cmd * dt
@@ -805,6 +841,12 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     AppleReachTree-v1 one (any-contact palm force + clearance ring) -- must
     match the policy at reach_policy_path."""
     reach_scale: float = 0.5
+    reach_max_velocity: float | None = None
+    reach_max_acceleration: float | None = None
+    reach_brake_to_target: bool | None = None
+    """The rate limiter's caps / braking during the REACH phase only (None: the
+    trainee's max_velocity / max_acceleration / brake_to_target, as before):
+    set them to the frozen reach's own training values."""
     reach_waist_joint: str | None = None
     """Waist yaw joint driven by the reach policy's extra output (layout
     "waist"), held after the hand-off; None: the waist is not touched."""

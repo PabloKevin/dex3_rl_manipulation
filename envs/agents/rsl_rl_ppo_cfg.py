@@ -375,6 +375,14 @@ class AppleReachVisiblePPORunnerCfg(AppleReachSingleV2PPORunnerCfg):
 
 
 @configclass
+class AppleGraspVisiblePPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
+    """AppleGraspVisible-v1: the tactile grasp (single v2 layout) behind the
+    frozen AppleReachVisible-v1 reach. Own log folder
+    (logs/rsl_rl/apple_grasp_visible); warm start warmstart_spindle_v3/model_0.pt."""
+    experiment_name = "apple_grasp_visible"
+
+
+@configclass
 class AppleGraspSingleV3PPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
     """AppleGraspSingle-v3: grasp only, behind AppleReachSingle-v2. Own log
     folder (logs/rsl_rl/apple_grasp_single_v3)."""
