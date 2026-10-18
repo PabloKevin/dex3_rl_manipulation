@@ -24,6 +24,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 import toy_reach as T  # noqa: E402
+sys.path.insert(0, HERE)
+from record_signal import RecordSignal  # noqa: E402
 
 R = T.R
 RL_CMD_TOPIC = "rt/arm_rl/cmd"
@@ -84,6 +86,8 @@ class DualIO(T.PickerIO):
             self.node.audio = type("NoAudio", (), {"say": lambda *_a, **_k: None,
                                                    "__getattr__": lambda _s, _n: (lambda *_a, **_k: None)})()
         self.brief = None                          # set by run_toy (BriefLog)
+        #: the laptop's camera recorder (frame_recorder.py in live_locator): activity times only
+        self.rec = RecordSignal()
         from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_ as LowCmdMsg
         from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
@@ -149,6 +153,7 @@ class DualIO(T.PickerIO):
             self.click = None
         elif all(k in d for k in ("x", "y", "z")):
             self.click = (np.array([float(d["x"]), float(d["y"]), float(d["z"])]), time.monotonic())
+            self.rec.poke()
             if self.brief is not None:
                 self.brief("INFO", f"apple clicked on the dashboard at {np.round(self.click[0], 3).tolist()} (torso)")
 
@@ -302,7 +307,9 @@ class DualIO(T.PickerIO):
         kp = float(self.args.kp if kp is None else kp)
         kd = float(self.args.kd if kd is None else kd)
         self._main_t = time.monotonic()
-        self._write(np.asarray(q, float).copy(), dq, waist, waist_dq, kp, kd)
+        q = np.asarray(q, float).copy()
+        self.rec.arm_target(q)
+        self._write(q, dq, waist, waist_dq, kp, kd)
 
     def _write(self, q, dq, waist, waist_dq, kp, kd):
         with self._tx_lock:

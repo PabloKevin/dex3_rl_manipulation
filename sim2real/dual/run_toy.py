@@ -284,6 +284,11 @@ class DualToyMixin:
             sys.__stdout__.write(f"  full toy output: {os.path.join(self.log_dir, 'toy_full.log')}\n")
         self.io.brief = self.brief
         self.watch.brief = self.brief
+        # camera frames of this run -> <log_dir>/camera/NN (frame_recorder.py in live_locator)
+        rec = getattr(self.io, "rec", None)
+        if rec is not None and rec.enabled:
+            rec.start(self.log_dir, type(self).__mro__[2].__name__)
+            self.brief("INFO", f"camera recording while the arm moves -> {os.path.join(self.log_dir, 'camera')}")
         self.brief("INFO", f"{type(self).__mro__[2].__name__} [{self.io.name}] policy "
                            f"{os.path.basename(args.policy)} speed {args.speed}")
         if getattr(self, "_envelope_note", False):
