@@ -682,3 +682,15 @@ for _id, _env in (("AppleGraspVisible-v1", AppleGraspVisibleEnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspVisiblePPORunnerCfg},
         disable_env_checker=True,
     )
+
+from .apple_grasp_visible_env_cfg import AppleGraspVisibleV2EnvCfg, AppleGraspVisibleV2EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspVisibleV2PPORunnerCfg
+
+for _id, _env in (("AppleGraspVisible-v2", AppleGraspVisibleV2EnvCfg),
+                  ("AppleGraspVisible-Play-v2", AppleGraspVisibleV2EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspVisibleV2PPORunnerCfg},
+        disable_env_checker=True,
+    )

@@ -511,3 +511,18 @@ def camera_view_wrapper(env, camera: dict, sensor_name: str | None = None, scale
             return frame
 
     return _CameraView(env)
+
+
+# ─────────────────────────────────────────────
+#  Grasp (AppleGraspVisible-v2)
+# ─────────────────────────────────────────────
+
+def penalty_self_collision_grasp(env: "ManagerBasedRLEnv", margin: float = 0.015, ref: float = 0.05) -> torch.Tensor:
+    """[N] self_collision.penalty_self_collision during the GRASP phase only
+    (the frozen reach is not the trainee's): the right arm / hand inside the
+    rest of the body. The robot has no physical self-collision in the sim, so
+    without this the grasp's arm passed through the torso."""
+    from .grasp_autoplay import grasp_phase_active
+    from .self_collision import penalty_self_collision
+
+    return penalty_self_collision(env, margin=margin, ref=ref) * grasp_phase_active(env).float()

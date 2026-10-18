@@ -36,10 +36,11 @@ file AppleGraspSingle-v2 starts from).
 
 import os
 
-from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import EventTermCfg as EventTerm, RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
-from .apple_grasp_single_v2_env_cfg import SINGLE_V2_GRASP_WINDOW_S, AppleGraspSingleV2EnvCfg
+from .apple_grasp_grasp_env_cfg import GRASP_PPO_STEPS_PER_ITER
+from .apple_grasp_single_v2_env_cfg import SINGLE_V2_GRASP_WINDOW_S, SINGLE_V2_RELEASE_S, AppleGraspSingleV2EnvCfg
 from .apple_grasp_single_v3_env_cfg import SINGLE_V3_STEM_PARAMS
 from .apple_reach_single_v2_env_cfg import (
     REACH_ARM_BRAKE,
@@ -131,6 +132,61 @@ class AppleGraspVisibleEnvCfg(AppleGraspSingleV2EnvCfg):
 
 @configclass
 class AppleGraspVisibleEnvCfg_PLAY(AppleGraspVisibleEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.events.reset_arm_jitter = None
+
+
+# ─────────────────────────────────────────────
+#  v2: small arm adjustments, no arm through the body, later stem release
+# ─────────────────────────────────────────────
+# User, 2026-10-18: v1 after ~1000 iterations was very bad (run
+# 2026-10-18_19-13-07): 97.5% of the episodes ended with the fruit lost, the
+# grip terms peaked at it ~260 and died, the noise std grew 0.68 -> 0.88,
+# and the arm swept through the torso although the reach had ended well.
+# Measured with the warm start (deterministic, 64 envs): its raw arm outputs
+# are large (median 1.5-2.4, p95 3-4: harmless at the 0.05 rad/unit it was
+# trained with), so v1's 0.15 rad/unit moved the arm off the hand-off pose
+# by 0.2-0.35 rad median (0.5-0.65 p95) on shoulder pitch / elbow / wrist
+# pitch -- the hand 10-20 cm off the enclosed apple -- with no penalty for
+# entering the body (no physical self-collision in the sim). The grasp is
+# to adjust a little and close:
+#   - arm 0.15 -> 0.05 rad per unit (the warm start's own), still all 7
+#     joints free before the grip; posture_from_handoff on shoulder / elbow
+#     2 -> 10 (as AppleGraspSingle-v3);
+#   - + self_collision in the grasp phase (-8, as the reach);
+#   - stem release curriculum 300..1000 -> 800..2000 iterations, twist / pull
+#     load 400..1000 -> 900..2000: hold the fruit before the stem lets go;
+#   - PPO entropy 0.005 -> 0.002 (AppleGraspVisibleV2PPORunnerCfg).
+VISIBLE_V2_ARM_SCALE = 0.05
+VISIBLE_V2_RELEASE_CURRICULUM = (800, 2000)
+VISIBLE_V2_LOAD_CURRICULUM = (900, 2000)
+
+
+@configclass
+class AppleGraspVisibleV2EnvCfg(AppleGraspVisibleEnvCfg):
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actions.right_arm.scale = VISIBLE_V2_ARM_SCALE
+
+        ev = self.events
+        it0, it1 = VISIBLE_V2_RELEASE_CURRICULUM
+        ev.reset_reach_grasp_phase.params["stem_release_schedule"] = (
+            SINGLE_V2_GRASP_WINDOW_S + 1.0, SINGLE_V2_RELEASE_S[0],
+            it0 * GRASP_PPO_STEPS_PER_ITER, it1 * GRASP_PPO_STEPS_PER_ITER,
+            SINGLE_V2_RELEASE_S[1] - SINGLE_V2_RELEASE_S[0])
+        ev.release_stem_and_load.params["curriculum"] = VISIBLE_V2_LOAD_CURRICULUM
+
+        rw = self.rewards
+        rw.posture_from_handoff.params["weights"] = [10.0, 10.0, 10.0, 10.0, 1.0, 1.0, 1.0]
+        rw.self_collision = RewTerm(func=vr.penalty_self_collision_grasp, weight=-8.0,
+                                    params={"margin": 0.015, "ref": 0.05})
+
+
+@configclass
+class AppleGraspVisibleV2EnvCfg_PLAY(AppleGraspVisibleV2EnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 1
