@@ -43,6 +43,13 @@ TRACK = dict(pos_tol=0.02, ang_tol_deg=15.0, finger_tol_deg=25.0, speed_tol=0.08
 STAGE_RADIUS = 0.15
 MIN_STAGE_BACK = 0.08
 WAYPOINT_TIMEOUT_S = 4.0
+#: the STAGING point is only there to make the approach (or the way back) better: no hold there. The next
+#: goal comes once the pocket is within STAGE_ADVANCE_D and the palm normal within STAGE_ADVANCE_DEG
+#: (robot runs 2026-10-19: the pocket was within 5 cm at 2.6-3.2 s with the palm still 125-134 deg off,
+#: within 30 deg too at 6.5-6.7 s, then held to the 13 s timeout), or after STAGE_ADVANCE_S / speed
+STAGE_ADVANCE_D = 0.05
+STAGE_ADVANCE_DEG = 30.0
+STAGE_ADVANCE_S = 2.4
 #: the hand during the arm-pose policy: the reach's cup (the policy trained with it)
 HAND_CUP = dict(R.REACH_HAND_PRESHAPE)
 
@@ -61,6 +68,26 @@ class Goal:
     finger: np.ndarray          # finger direction goal (unit)
     finger_on: bool = False
     via: bool = False
+    #: pass to the next goal once within advance_d (m) and advance_deg (palm normal), or after advance_s
+    advance_d: float = 0.0
+    advance_deg: float = 180.0
+    advance_s: float = 0.0
+    #: s before the next goal comes anyway (0 = the caller's waypoint timeout)
+    timeout_s: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "target": np.asarray(self.target, float).tolist(),
+                "normal": np.asarray(self.normal, float).tolist(), "finger": np.asarray(self.finger, float).tolist(),
+                "finger_on": bool(self.finger_on), "via": bool(self.via), "advance_d": float(self.advance_d),
+                "advance_deg": float(self.advance_deg), "advance_s": float(self.advance_s),
+                "timeout_s": float(self.timeout_s)}
+
+    @staticmethod
+    def from_dict(d: dict) -> "Goal":
+        return Goal(str(d["name"]), np.asarray(d["target"], float), np.asarray(d["normal"], float),
+                    np.asarray(d["finger"], float), bool(d.get("finger_on", False)), bool(d.get("via", False)),
+                    float(d.get("advance_d", 0.0)), float(d.get("advance_deg", 180.0)), float(d.get("advance_s", 0.0)),
+                    float(d.get("timeout_s", 0.0)))
 
 
 def hand_frame(fr: "R.Frames"):
@@ -118,6 +145,38 @@ class Tracker:
             self.arrived = True
             return True
         return False
+
+
+def goal_event(g: Goal, trk: Tracker, fr: "R.Frames", t_wp: float, timeout_s: float) -> str:
+    """This step's outcome for goal g, t_wp s after it was set: "" (go on), "passed" (an advance goal is
+    close enough), "timer" (its advance time is up), "reached" (the trained stop test), "timeout"."""
+    d, ang, _ = errors(fr, g)
+    reached = trk.step(fr, g)
+    if g.advance_d > 0.0 and d < g.advance_d and ang < math.radians(g.advance_deg):
+        return "passed"
+    if g.advance_s > 0.0 and t_wp >= g.advance_s:
+        return "timer"
+    if reached:
+        return "reached"
+    if t_wp >= (g.timeout_s or timeout_s):
+        return "timeout"
+    return ""
+
+
+def set_stage_advance(g: Goal, speed: float, d: float = STAGE_ADVANCE_D, deg: float = STAGE_ADVANCE_DEG,
+                      s: float = STAGE_ADVANCE_S) -> Goal:
+    g.advance_d, g.advance_deg, g.advance_s = float(d), float(deg), float(s) / max(float(speed), 1e-3)
+    return g
+
+
+def make_return_plan(approach, home: Goal, speed: float):
+    """Back the way it came: the approach's staging point (same advance rule), then home (a stop goal)."""
+    st = approach[0]
+    stage = set_stage_advance(Goal("staging back", st.target.copy(), st.normal.copy(), st.finger.copy(),
+                                   st.finger_on, st.via), speed, st.advance_d or STAGE_ADVANCE_D,
+                              st.advance_deg if st.advance_d else STAGE_ADVANCE_DEG,
+                              st.advance_s * speed if st.advance_s else STAGE_ADVANCE_S)
+    return [stage, Goal("home", home.target.copy(), home.normal.copy(), home.finger.copy(), True, False)]
 
 
 def make_plan(fr: "R.Frames", apple: np.ndarray, stage_radius: float = STAGE_RADIUS,

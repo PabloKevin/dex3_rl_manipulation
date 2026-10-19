@@ -68,6 +68,11 @@ def parse_args():
 
 
 class ToyArmPose(S.ToySingle):
+    """The single toy's flow with the arm-pose policy step: APPROACH (staging -> apple), GRASP (the picker's
+    own close: HandController.hand_close_start + settle_and_hold, the arm held where it reached), RETURN
+    (the same staging point -> home, the hand closed on the fruit), RELEASE at home (the picker's open for the
+    next grasp). The base flow then holds and moves home; ENTER / RUN TOY in the launcher = the next apple."""
+
     def stage_radius_now(self) -> float:
         v = getattr(self.io, "stage_radius", None)
         return float(v) if v is not None else float(self.args.stage_radius)
@@ -76,33 +81,146 @@ class ToyArmPose(S.ToySingle):
         if getattr(self.io, "commands", False) and self.args.hand != "keep":
             self.io.hand_cmd(np.array([AP.HAND_CUP[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER]))
 
-    def make_plan(self, fr):
-        a = self.args
-        plan, desc = AP.make_plan(fr, self.apple, self.stage_radius_now(), a.min_stage_back, a.apple_offset,
-                                  a.stage_via, a.fingers)
-        self.say(f"  plan: {desc}", C_CYN)
-        return plan
-
     def _brief(self, kind, msg):
         """run_toy's short log, when there is one (run_toy.DualToyMixin)."""
         b = getattr(self, "brief", None)
         if b is not None:
             b(kind, msg, fold_s=0.0)
 
-    def policy_loop(self):
-        """The arm-pose policy through the plan's goals (laptop loop; run_toy --onboard runs it on the Jetson)."""
+    # ---------- the thumb: re-seated at home ----------
+    def reseat_thumb(self):
+        """thumb_0 (the thumb's rotation) is held by the picker at its 30 deg rest with kp 0.5, too weak for
+        its friction: robot logs 2026-10-16 read it anywhere from 19 to 49 deg, never moving in a run --
+        wherever the power-on left it. With the hand open at home, its gain is raised THUMB_RESEAT_KP_X times
+        for at most THUMB_RESEAT_S (until it is within THUMB_TOL_DEG), then restored."""
+        io = self.io
+        app = getattr(io, "app", None)
+        if not getattr(io, "commands", False) or app is None or self.args.hand == "keep":
+            return
+        target = math.radians(THUMB_REST_DEG)
+        q = io.hand.hand_finger_q("right") if hasattr(io, "hand") else None
+        if q is None:
+            return
+        err0 = math.degrees(float(q[0]) - target)
+        if abs(err0) <= THUMB_SKIP_DEG:
+            self._brief("INFO", f"thumb_0 at {math.degrees(float(q[0])):.0f} deg (rest {THUMB_REST_DEG:.0f}): fine")
+            return
+        kp0 = list(getattr(app, "hand_kp_vec", None) or [float(getattr(app, "hand_kp", 0.5))] * 7)
+        kp = list(kp0)
+        kp[0] = kp0[0] * THUMB_RESEAT_KP_X
+        app.hand_kp_vec = kp
+        t0 = time.monotonic()
+        try:
+            while time.monotonic() - t0 < THUMB_RESEAT_S:
+                self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.1)
+                q = io.hand.hand_finger_q("right")
+                if q is not None and abs(math.degrees(float(q[0]) - target)) <= THUMB_TOL_DEG:
+                    break
+        finally:
+            app.hand_kp_vec = kp0
+        q = io.hand.hand_finger_q("right")
+        now = float("nan") if q is None else math.degrees(float(q[0]))
+        self._brief("INFO", f"thumb_0 re-seated: {THUMB_REST_DEG + err0:.0f} -> {now:.0f} deg (rest "
+                            f"{THUMB_REST_DEG:.0f}; its kp x{THUMB_RESEAT_KP_X:g} for {time.monotonic() - t0:.1f} s)")
+
+    def at_home(self):
+        """run_toy calls it at home, before looking for the fruit."""
+        if not getattr(self, "_reseated", False):
+            self._reseated = True
+            self.reseat_thumb()
+
+    def plan(self, s, apple_pelvis=None):
+        if self.args.target != ["detection"]:     # a given target: no detection step, the thumb here
+            self.at_home()
+        return super().plan(s, apple_pelvis)
+
+    # ---------- the plan ----------
+    def make_plans(self, fr):
+        a = self.args
+        plan, desc = AP.make_plan(fr, self.apple, self.stage_radius_now(), a.min_stage_back, a.apple_offset,
+                                  a.stage_via, a.fingers)
+        AP.set_stage_advance(plan[0], a.speed)
+        back = AP.make_return_plan(plan, AP.home_goal(fr), a.speed)
+        self.say(f"  plan: {desc}; staging passed at {AP.STAGE_ADVANCE_D * 100:.0f} cm / {AP.STAGE_ADVANCE_DEG:.0f} deg "
+                 f"or after {plan[0].advance_s:.1f} s", C_CYN)
+        return plan, back
+
+    # ---------- the grasp: the picker's traditional close ----------
+    def grasp_close(self):
+        """HandController.hand_close_start (the configured close, thumb_0 at its rest), the arm held where it
+        is, settle_and_hold polled while the fingers travel (the picker's CLOSE + LIFT), CLOSE_HOLD_S."""
+        io = self.io
+        hand = getattr(io, "hand", None)
+        if not getattr(io, "commands", False) or hand is None or self.args.hand == "keep":
+            return "grasp skipped (no hand output)"
+        node = getattr(io, "node", None)
+        try:
+            if node is not None and hasattr(node, "_capture_grasp_tactile_baseline"):
+                node._capture_grasp_tactile_baseline("right")
+        except Exception:
+            pass
+        self.set_phase("GRASP")
+        self.ctx["doing"] = "closing the hand (the picker's close)"
+        if not hand.hand_close_start("right"):
+            return "grasp: the hand cannot be commanded"
+        hold_s = float(getattr(node, "close_hold_s_right", 0.0) or 0.0)
+        hold_s = max(hold_s, CLOSE_HOLD_S)
+        t0 = time.monotonic()
+        q_hold = self.q_sent if self.q_sent is not None else self.gravity_hold(io.read())
+        while time.monotonic() - t0 < hold_s:
+            if io.estop_why is not None:
+                return f"E-STOP: {io.estop_why}"
+            self.hold(q_hold, 0.1)
+            try:
+                hand.settle_and_hold("right")
+            except Exception:
+                pass
+        tv = None
+        try:
+            tv = hand.grasp_travel_frac("right")
+        except Exception:
+            pass
+        return "grasp closed" + (f" (fingers {tv * 100:.0f}% of the way)" if tv is not None else "")
+
+    def release_at_home(self):
+        """At home with the fruit: the picker's open for the next grasp (HandController.open_hands_for_new_grasp:
+        the fitted hold dropped, the configured close targets back, the hand opened), the arm held while the
+        fingers open (RELEASE_S); the next run puts the reach's cup back at GO."""
+        io = self.io
+        hand = getattr(io, "hand", None)
+        self._carrying = False
+        if not getattr(io, "commands", False) or hand is None or self.args.hand == "keep":
+            return ""
+        self.set_phase("RELEASE")
+        self.ctx["doing"] = "opening the hand at home (the fruit is released)"
+        try:
+            hand.open_hands_for_new_grasp()
+        except Exception as e:
+            return f"release failed ({e})"
+        q_hold = self.q_sent if self.q_sent is not None else self.gravity_hold(io.read())
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < RELEASE_S:
+            if io.estop_why is not None:
+                return f"E-STOP: {io.estop_why}"
+            self.hold(q_hold, 0.1)
+        return "released at home"
+
+    def settle_tick(self):
+        """While the arm carries the fruit: the picker keeps re-fitting the hold (its LIFT)."""
+        hand = getattr(self.io, "hand", None)
+        if hand is not None and getattr(self, "_carrying", False):
+            try:
+                hand.settle_and_hold("right")
+            except Exception:
+                pass
+
+    # ---------- the policy over a list of goals (laptop) ----------
+    def run_goals(self, goals, leg):
         a, io, W = self.args, self.io, self.watch
         sm = W.sm
         L = R.make_limiters("arm_pose")
         prev_raw = np.zeros(AP.N_OUT)
-        s = io.read()
-        fr = self.frames(s)
-        plan = self.make_plan(fr)
-        self.ctx.update(segment=(fr.palm_ref.copy(), self.apple.copy()), lo=self.lo, hi=self.hi, commanding=True)
         W.reset()
-        self.set_phase("POLICY")
-        self.ctx["doing"] = "arm-pose policy: staging, then the apple"
-        self.hand_cup()
         wi, trk, t_wp = 0, AP.Tracker(), 0.0
         outcome, stopped = None, False
         t_start = io.now()
@@ -118,7 +236,7 @@ class ToyArmPose(S.ToySingle):
                     break
                 s = io.read()
                 fr = self.frames(s)
-                g = plan[wi]
+                g = goals[wi]
                 d, ang, _ = AP.errors(fr, g)
                 obs = AP.build_obs(s.arm_q, s.arm_dq, fr, g, prev_raw)
                 raw = self.pol(obs)
@@ -141,28 +259,27 @@ class ToyArmPose(S.ToySingle):
                 io.send_arm(q_cmd)
                 self.q_sent = q_cmd.copy()
                 prev_raw = raw
+                self.settle_tick()
                 self.rows.append(dict(t=t, obs=obs, raw=raw, q_cmd=q_cmd, q=s.arm_q, dq=s.arm_dq, waist=s.waist_q,
-                                      palm=fr.palm_ref, goal=g.target, wp=wi, d=d, ang=ang, gap=gap, age=s.age,
-                                      compute=io.now() - t_tick))
+                                      palm=fr.palm_ref, goal=g.target, wp=wi, leg=0 if leg == "approach" else 1,
+                                      d=d, ang=ang, gap=gap, age=s.age, compute=io.now() - t_tick))
                 t_wp += R.DT
-                reached = trk.step(fr, g)
-                if reached or t_wp >= a.waypoint_timeout:
-                    msg = (f"  {g.name} {'reached' if reached else 'TIMEOUT'} after {t_wp:.2f} s: pocket "
-                           f"{d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg")
-                    self.say(msg, C_GRN if reached else C_YEL)
-                    if g.name == "apple":
-                        if reached:
+                ev = AP.goal_event(g, trk, fr, t_wp, a.waypoint_timeout)
+                if ev:
+                    msg = f"{g.name} {ev} after {t_wp:.2f} s: pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg"
+                    self.say("  " + msg, C_YEL if ev == "timeout" else C_GRN)
+                    if wi == len(goals) - 1:
+                        if g.name == "apple" and ev == "reached":
                             self.reach_info = dict(t=t, pocket_err_mm=d * 1000, normal_err_deg=math.degrees(ang),
                                                    palm=fr.palm_ref.tolist(), q=s.arm_q.tolist())
-                            outcome = f"REACHED in {t:.2f} s (pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg)"
-                        else:
-                            outcome = f"TIME LIMIT at the apple (pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg)"
+                        outcome = f"{g.name.upper()} {'REACHED' if ev == 'reached' else 'TIMEOUT'} in {t:.2f} s " \
+                                  f"(pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg)"
                         break
                     wi, t_wp = wi + 1, 0.0
                     trk.reset()
                 if t - t_print >= 0.5:
                     t_print = t
-                    print(f"  t={t:5.2f}s {g.name:8s} pocket {d * 100:5.1f} cm  normal {math.degrees(ang):4.0f} deg  "
+                    print(f"  t={t:5.2f}s {g.name:12s} pocket {d * 100:5.1f} cm  normal {math.degrees(ang):4.0f} deg  "
                           f"palm v {W.palm_v:.2f} m/s  [{sm.LEVEL_NAMES[level]}]", flush=True)
                 self.status(s)
                 if t >= a.time_limit:
@@ -175,9 +292,79 @@ class ToyArmPose(S.ToySingle):
         except KeyboardInterrupt:
             stopped, outcome = True, "OPERATOR STOP (Ctrl-C)"
             self.halted = outcome
+        return outcome, stopped
+
+    def _start_policy(self):
+        s = self.io.read()
+        fr = self.frames(s)
+        plan, back = self.make_plans(fr)
+        self.ctx.update(segment=(fr.palm_ref.copy(), self.apple.copy()), lo=self.lo, hi=self.hi, commanding=True)
+        self.set_phase("POLICY")
+        self.ctx["doing"] = "arm-pose policy: staging, then the apple"
+        self.hand_cup()
+        return plan, back
+
+    def _release_if_home(self, out_g, out_b, stopped):
+        """The fruit is let go only at home: after a return that reached home or ran out its time there."""
+        if out_g.startswith("grasp closed") and not stopped and str(out_b).startswith("HOME") \
+                and self.io.estop_why is None:
+            return self.release_at_home()
+        return ""
+
+    def _finish_policy(self, out_a, out_g, out_b, stopped, out_r=""):
         self.ctx["commanding"] = False
+        self._carrying = False
+        parts = [out_a] + ([out_g] if out_g else []) + ([f"return: {out_b}"] if out_b else []) + \
+            ([out_r] if out_r else [])
+        outcome = "; ".join(parts)
+        # REACHED (the base flow then holds and moves home) when the apple was reached or held to its timeout
+        if not stopped and out_a.startswith("APPLE"):
+            outcome = "REACHED " + outcome
         self.say(f"  policy: {outcome}", C_GRN if outcome.startswith("REACHED") else C_RED if stopped else C_YEL)
         return outcome, stopped
+
+    def policy_loop(self):
+        """APPROACH -> GRASP -> RETURN with the policy on the laptop (run_toy --onboard: policy_loop_onboard)."""
+        plan, back = self._start_policy()
+        out_a, stopped = self.run_goals(plan, "approach")
+        out_g = out_b = ""
+        if not stopped and out_a.startswith("APPLE") and self.io.estop_why is None:
+            out_g = self.grasp_close()
+            if not out_g.startswith("E-STOP"):
+                self.set_phase("RETURN")
+                self.ctx["doing"] = "arm-pose policy: back through the staging point to home"
+                self._carrying = True
+                out_b, stopped = self.run_goals(back, "return")
+        out_r = self._release_if_home(out_g, out_b, stopped)
+        return self._finish_policy(out_a, out_g, out_b, stopped, out_r)
+
+    def policy_loop_onboard(self):
+        """The same three steps with the two policy legs on the Jetson (dual/onboard_link.py)."""
+        from onboard_link import run_policy_onboard
+        plan, back = self._start_policy()
+        out_a, stopped = run_policy_onboard(self, extra={"goals": [g.to_dict() for g in plan]})
+        out_g = out_b = ""
+        if not stopped and str(out_a).startswith("APPLE") and self.io.estop_why is None:
+            out_g = self.grasp_close()
+            if not out_g.startswith("E-STOP"):
+                self.set_phase("RETURN")
+                self._carrying = True
+                out_b, stopped = run_policy_onboard(self, extra={"goals": [g.to_dict() for g in back]},
+                                                    tick=self.settle_tick)
+        out_r = self._release_if_home(out_g, str(out_b), stopped)
+        return self._finish_policy(str(out_a), out_g, str(out_b), stopped, out_r)
+
+
+#: the picker's thumb_0 rest (full_move2.HAND_REST_THUMB_DEG) and its re-seat at home
+THUMB_REST_DEG = 30.0
+THUMB_SKIP_DEG = 5.0
+THUMB_TOL_DEG = 3.0
+THUMB_RESEAT_KP_X = 3.0
+THUMB_RESEAT_S = 1.5
+#: s the closed hand is held (with the picker's settle) before the arm goes back
+CLOSE_HOLD_S = 1.5
+#: s the arm stays still at home while the hand opens and the fruit falls out
+RELEASE_S = 1.5
 
 
 def main():

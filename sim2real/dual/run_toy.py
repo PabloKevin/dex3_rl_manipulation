@@ -429,6 +429,8 @@ class DualToyMixin:
         """Sample the tracked fruit at home (as the toys do), then take the one nearest to the
         dashboard click. No click yet: wait for one (ENTER = the nearest fruit instead)."""
         a, io = self.args, self.io
+        if hasattr(self, "at_home"):              # a toy's own step at home (toy_arm_pose: the thumb)
+            self.at_home()
         tracks, n = [], 0
         t_start = io.now()
         self.brief("STEP", f"looking at the fruit for {a.detect_s:.0f} s (arm at home)")
@@ -534,7 +536,9 @@ class DualToyMixin:
     def policy_loop(self):
         d = self.closer_m()
         self.gate_report("before the policy")
-        if ONBOARD:
+        if ONBOARD and hasattr(self, "policy_loop_onboard"):
+            out = self.policy_loop_onboard()          # the toy runs its own legs on the Jetson (toy_arm_pose)
+        elif ONBOARD:
             from onboard_link import run_policy_onboard
             out = run_policy_onboard(self)
         else:

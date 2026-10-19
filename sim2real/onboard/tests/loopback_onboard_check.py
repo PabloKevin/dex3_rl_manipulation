@@ -160,7 +160,10 @@ try:
     apple = fr.palm_ref + np.array([0.20, -0.03, 0.05])
     req = {"id": "loop1", "layout": a.layout, "policy": NPZ, "version": a.version,
            "apple": apple.tolist(), "apple_radius": 0.04, "speed": 0.3, "time_limit": 8.0, "waist": "follow",
-           "after_reach": "freeze"}
+           "after_reach": "freeze",
+           # the robot's right-arm limits (picker THETA_LIMITS), as the toy sends them: the daemon clamps to these
+           "q_lo": [-3.0892, -2.2515, -2.618, -1.0472, -1.9722, -1.6144, -1.6144],
+           "q_hi": [2.6704, 0.0524, 2.618, 2.0944, 1.9722, 1.6144, 1.6144]}
     q_before = S["q"].copy()
     link.start(req)
     check("runner owns the arm", wait(lambda: S["rl"].get("owner") == "rl_onboard", 3.0), str(S["rl"].get("owner")))

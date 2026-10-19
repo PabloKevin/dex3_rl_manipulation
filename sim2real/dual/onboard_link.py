@@ -137,8 +137,9 @@ def check_runner(toy, timeout_s: float = 20.0) -> str:
     return ""
 
 
-def run_policy_onboard(toy):
-    """The POLICY phase of the single reach on the Jetson. -> (outcome, stopped), as policy_loop."""
+def run_policy_onboard(toy, extra=None, tick=None):
+    """The POLICY phase on the Jetson -> (outcome, stopped), as policy_loop. extra: more request fields (the
+    arm-pose toy's goals); tick: called every 20 ms while the runner drives (the arm-pose toy's grip settle)."""
     a, io = toy.args, toy.io
     say = toy.brief
     if toy.layout not in ("single", "single_tactile", "visible", "arm_pose"):
@@ -179,13 +180,14 @@ def run_policy_onboard(toy):
            "q_lo": np.asarray(toy.lo).tolist(), "q_hi": np.asarray(toy.hi).tolist(),
            "joint_speed_stop": a.joint_speed_stop, "temp_stop": a.temp_stop, "hand_ramp_s": a.hand_ramp_s}
     arm_pose = toy.layout == "arm_pose"
-    if arm_pose:                              # toy_arm_pose.py: the plan is made on the robot from these
+    if arm_pose:                              # toy_arm_pose.py: its goals (or the plan made on the robot from these)
         req.update(stage_radius=toy.stage_radius_now(), min_stage_back=a.min_stage_back, apple_offset=a.apple_offset,
                    stage_via=bool(a.stage_via), fingers=a.fingers, waypoint_timeout=a.waypoint_timeout)
+    req.update(extra or {})
     toy.set_phase("POLICY")
     toy.ctx["doing"] = "single reach policy ON THE JETSON"
     say("STEP", f"policy on the Jetson (episode {ep_id}, {name})")
-    if arm_pose:
+    if arm_pose and not req.get("goals"):
         toy.hand_cup()                        # the policy trained with the hand in the reach's cup
         say("INFO", f"staging radius {req['stage_radius']:.2f} m", fold_s=0.0)
     link.start(req)
@@ -195,6 +197,8 @@ def run_policy_onboard(toy):
     try:
         while True:
             time.sleep(0.02)
+            if tick is not None:
+                tick()
             d = link.done
             if d is not None and (d.get("id") == ep_id or d.get("reply_to") == ep_id):
                 res = d

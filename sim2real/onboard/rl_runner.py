@@ -489,7 +489,11 @@ class Episode:
         dt = R.DT
         q, dq, wq, wdq, temp, age = self.read()
         fr = rn.kin.frames(wq, q)
-        plan, desc = AP.make_plan(fr, self.apple, **self.plan_args)
+        if self.d.get("goals"):                       # the laptop's plan (toy_arm_pose: approach / return legs)
+            plan = [AP.Goal.from_dict(x) for x in self.d["goals"]]
+            desc = "goals from the laptop: " + " -> ".join(g.name for g in plan)
+        else:
+            plan, desc = AP.make_plan(fr, self.apple, **self.plan_args)
         rn.publish({"phase": "PLAN", "id": self.id, "plan": desc,
                     "goals": [[g.name] + g.target.round(4).tolist() for g in plan]})
         prev_raw = np.zeros(AP.N_OUT)
@@ -531,19 +535,17 @@ class Episode:
                 compute_max = max(compute_max, compute)
                 self.rows.append((t, obs, raw, q_cmd, q, dq, wq, fr.palm_ref, d, ang, wi, age, compute))
                 t_wp += dt
-                reached = trk.step(fr, g)
-                if reached or t_wp >= self.waypoint_timeout:
-                    events.append(f"{g.name} {'reached' if reached else 'TIMEOUT'} after {t_wp:.2f} s: pocket "
-                                  f"{d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg")
-                    if g.name == "apple":
-                        if reached:
+                ev = AP.goal_event(g, trk, fr, t_wp, self.waypoint_timeout)
+                if ev:
+                    events.append(f"{g.name} {ev} after {t_wp:.2f} s: pocket {d * 100:.1f} cm, normal "
+                                  f"{math.degrees(ang):.0f} deg")
+                    if wi == len(plan) - 1:
+                        if ev == "reached":
                             self.reach_info = {"t": round(t, 3), "pocket_err_mm": round(d * 1000, 1),
                                                "normal_err_deg": round(math.degrees(ang), 1),
                                                "palm": fr.palm_ref.round(4).tolist(), "q": q.round(4).tolist()}
-                            outcome = f"REACHED in {t:.2f} s (pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg)"
-                        else:
-                            outcome = (f"TIME LIMIT at the apple (pocket {d * 100:.1f} cm, normal "
-                                       f"{math.degrees(ang):.0f} deg)")
+                        outcome = (f"{g.name.upper()} {'REACHED' if ev == 'reached' else 'TIMEOUT'} in {t:.2f} s "
+                                   f"(pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg)")
                     else:
                         wi, t_wp = wi + 1, 0.0
                         trk.reset()
