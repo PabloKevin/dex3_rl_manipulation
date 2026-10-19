@@ -28,6 +28,8 @@ import runner_config as RC  # noqa: E402
 
 HB_HZ = 20.0
 ROBOT = "unitree@192.168.123.164"
+#: the runner's stdout on the robot (rl_onboard_robot.sh start)
+RUNNER_LOG = "/tmp/rl_onboard.log"
 
 
 def npz_name(policy_path: str) -> str:
@@ -115,6 +117,26 @@ def fetch_log(remote: str, local_dir: str) -> str:
         return ""
 
 
+def check_runner(toy, timeout_s: float = 20.0) -> str:
+    """Right after the robot connects (before the arm moves): the runner answers and has the policy.
+    -> '' or why not. The link is built here, so DDS discovery has the whole home phase too."""
+    link = getattr(toy, "_onboard", None)
+    if link is None:
+        link = toy._onboard = OnboardLink()
+    t0 = time.monotonic()
+    st = link.wait_idle(timeout_s)
+    if not st:
+        return (f"the onboard runner does not answer in {timeout_s:.0f} s (DDS discovery, or it is not running: "
+                f"sim2real/onboard/rl_onboard_robot.sh status)")
+    name = npz_name(toy.args.policy)
+    if name not in st.get("policies", []):
+        return (f"{name} is not on the robot: sim2real/export_policy_npz.py --policy {toy.args.policy} --layout "
+                f"{toy.layout}, then sim2real/onboard/deploy_rl_onboard.sh <that .npz>")
+    toy.brief("INFO", f"onboard runner answers ({time.monotonic() - t0:.1f} s, {st.get('fk')} kinematics), "
+                      f"policy {name} on the robot", fold_s=0.0)
+    return ""
+
+
 def run_policy_onboard(toy):
     """The POLICY phase of the single reach on the Jetson. -> (outcome, stopped), as policy_loop."""
     a, io = toy.args, toy.io
@@ -124,9 +146,9 @@ def run_policy_onboard(toy):
     link = getattr(toy, "_onboard", None)
     if link is None:
         link = toy._onboard = OnboardLink()
-    st = link.wait_idle(3.0)
+    st = link.wait_idle(15.0)
     if not st:
-        return "NOT STARTED: the onboard runner does not answer (sim2real/onboard/rl_onboard_robot.sh start)", True
+        return "NOT STARTED: the onboard runner does not answer (DDS discovery, or it stopped)", True
     name = npz_name(a.policy)
     if name not in st.get("policies", []):
         return (f"NOT STARTED: {name} is not on the robot: sim2real/export_policy_npz.py --policy {a.policy} "
@@ -210,6 +232,8 @@ def run_policy_onboard(toy):
             got = fetch_log(res["log"], toy.log_dir)
             if got:
                 say("INFO", f"onboard log: {got}", fold_s=0.0)
+    # the runner's own text log (robot /tmp/rl_onboard.log) beside the run's logs, every episode
+    fetch_log(RUNNER_LOG, toy.log_dir)
     if stopped and "OPERATOR" not in str(outcome):
         toy.halted = outcome
     # 5. the toy takes the arm back from the daemon's hold (same gains) for what follows
