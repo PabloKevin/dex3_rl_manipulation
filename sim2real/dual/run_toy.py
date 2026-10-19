@@ -10,6 +10,9 @@ imported unchanged; three of their pieces are swapped here:
   python3 sim2real/dual/run_toy.py reach  --policy P --speed 0.3 --target X Y Z
   python3 sim2real/dual/run_toy.py visible --policy P --speed 0.3 --target detection [--onboard]
                       an AppleReachVisible policy (37 in / 7 out, waist held) through the single toy
+  python3 sim2real/dual/run_toy.py pose --policy P --speed 0.3 --target detection [--onboard]
+                      the AppleArmPose policy through staging -> apple waypoints (toy_arm_pose.py; the
+                      dashboard's "stage" field = the staging radius, 0.15 m by default)
   python3 sim2real/dual/run_toy.py apple|grasp|chain ...     (as toy_apple / toy_grasp / toy_chain)
   python3 sim2real/dual/run_toy.py calib --policy P --speed 0.3 --target detection
                       the single toy + a calibration session after the policy stops: jog / float the
@@ -220,11 +223,18 @@ def install_ctrl_c():
     Restore the handler: the first Ctrl-C raises KeyboardInterrupt in the main thread; during
     finish() (hand-over, last voice line) it is ignored so the arm is handed back cleanly."""
     def handler(signum, frame):
+        global CTRL_C
+        CTRL_C = True
         if FINISHING:
             sys.__stderr__.write("  (Ctrl-C ignored: the run is already ending)\n")
             return
         raise KeyboardInterrupt
     signal.signal(signal.SIGINT, handler)
+
+
+#: the operator pressed Ctrl-C: the toy exits with EXIT_CTRL_C and g1_launch.py quits too (one Ctrl-C ends all)
+CTRL_C = False
+EXIT_CTRL_C = 130
 
 
 class _Tee:
@@ -700,11 +710,20 @@ def mix(cls):
 
 
 def main():
+    try:
+        return _main()
+    except SystemExit as e:
+        if CTRL_C:
+            sys.exit(EXIT_CTRL_C)
+        raise
+
+
+def _main():
     global STRICT, VERBOSE
     install_ctrl_c()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "apple", "grasp",
-                                                                   "chain", "v1", "tree", "calib"):
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "pose", "apple",
+                                                                   "grasp", "chain", "v1", "tree", "calib"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     kind, rest = argv[0], argv[1:]
@@ -741,8 +760,8 @@ def main():
         del rest[i:i + 2]
     global ONBOARD
     if "--onboard" in rest:
-        if kind != "single":
-            sys.exit("--onboard runs the single reach only (single)")
+        if kind not in ("single", "pose"):
+            sys.exit("--onboard runs the single / visible reach and the arm-pose toy only (single, visible, pose)")
         ONBOARD = True
         rest.remove("--onboard")
     stop_cm = 1.0
@@ -770,7 +789,7 @@ def main():
     T.PickerIO = DualIO
     T.Watch = LightWatch
     T.joint_path_traj = smooth_joint_path_traj
-    if kind not in ("single", "calib") and "--dds_default" in rest:      # the launcher adds it in --loopback
+    if kind not in ("single", "calib", "pose") and "--dds_default" in rest:   # the launcher adds it in --loopback
         global DDS_DEFAULT
         DDS_DEFAULT = True
         rest.remove("--dds_default")
@@ -779,6 +798,11 @@ def main():
         S.ToySingle = mix(S.ToySingle)
         sys.argv = [sys.argv[0]] + rest
         return S.main()
+    if kind == "pose":
+        import toy_arm_pose as P
+        P.ToyArmPose = mix(P.ToyArmPose)
+        sys.argv = [sys.argv[0]] + rest
+        return P.main()
     if kind == "calib":
         import calib_reach as CR
         CR.CalibToy = mix(CR.CalibToy)

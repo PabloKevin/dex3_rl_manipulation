@@ -31,10 +31,17 @@ Python 3.8 (the Jetson): numpy, pinocchio, unitree_sdk2py; no torch.
 """
 from __future__ import annotations
 
+import os
+# numpy's BLAS ONE thread, before numpy loads: by default OpenBLAS starts a thread per core that spins
+# between calls -- next to the daemon and the cameras that made one policy call take up to 50 ms and
+# starved the daemon's own lowstate reader (robot runs 2026-10-19: 32-37 Hz instead of 50, the daemon
+# "rt/lowstate late 50-147 ms" only while this runner drove; Jetson benchmark: p99 36 ms -> 0.02 ms)
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import argparse
 import json
 import math
-import os
 import signal
 import sys
 import threading
@@ -46,6 +53,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [HERE, os.path.dirname(HERE)]      # deployed: beside this file; in the repo: sim2real/
 import reach_io as R  # noqa: E402  (dex3_rl_manipulation/sim2real/reach_io.py)
+import arm_pose_io as AP  # noqa: E402  (the AppleArmPose policy: inputs, waypoint plan, goal tracker)
 import runner_config as C  # noqa: E402
 from np_policy import NumpyPolicy  # noqa: E402
 
@@ -291,8 +299,19 @@ class Episode:
         self.sched = R.SingleHandSchedule(ramp_s=float(g("hand_ramp_s", R.SINGLE_HAND_RAMP_S / self.speed)))
         self.L = R.make_limiters(self.layout)
         self.rows = []
+        self.row_keys = ("t", "obs", "raw", "q_cmd", "q", "dq", "waist", "waist_cmd", "palm", "seat", "gap",
+                         "hand_phase", "age", "compute")
         self.result = {"id": self.id, "outcome": None}
         self.reach_info = None
+        if self.layout == "arm_pose":
+            # toy_arm_pose.py's plan (scripts/play_arm_pose_reach.py): staging, then the apple
+            self.plan_args = dict(stage_radius=float(g("stage_radius", AP.STAGE_RADIUS)),
+                                  min_stage_back=float(g("min_stage_back", AP.MIN_STAGE_BACK)),
+                                  apple_offset=float(g("apple_offset", 0.0)), stage_via=bool(d.get("stage_via", False)),
+                                  fingers=str(g("fingers", "free")))
+            self.waypoint_timeout = float(g("waypoint_timeout", AP.WAYPOINT_TIMEOUT_S / self.speed))
+            self.row_keys = ("t", "obs", "raw", "q_cmd", "q", "dq", "waist", "palm", "pocket_err", "normal_err",
+                             "waypoint", "age", "compute")
 
     # ---- robot state ----
     def read(self):
@@ -349,6 +368,8 @@ class Episode:
         except StopEpisode as e:
             self.finish(f"NOT STARTED: {e}", stopped=True)
             return
+        if self.layout == "arm_pose":
+            return self.run_arm_pose()
         dt = R.DT
         prev_raw = np.zeros(self.pol.n_out)
         self.sched.reset()
@@ -462,6 +483,97 @@ class Episode:
             outcome, stopped = str(e), True
         self.finish(outcome, stopped, q_cmd=q_cmd, n_late=n_late, compute_max=compute_max)
 
+    # ---- the arm-pose policy through its waypoints (toy_arm_pose.ToyArmPose.policy_loop) ----
+    def run_arm_pose(self):
+        rn = self.rn
+        dt = R.DT
+        q, dq, wq, wdq, temp, age = self.read()
+        fr = rn.kin.frames(wq, q)
+        plan, desc = AP.make_plan(fr, self.apple, **self.plan_args)
+        rn.publish({"phase": "PLAN", "id": self.id, "plan": desc,
+                    "goals": [[g.name] + g.target.round(4).tolist() for g in plan]})
+        prev_raw = np.zeros(AP.N_OUT)
+        wi, trk, t_wp = 0, AP.Tracker(), 0.0
+        t_start = time.monotonic()
+        t_next, t_state, t_hb = t_start, 0.0, 0.0
+        n_late, compute_max = 0, 0.0
+        q_cmd, outcome, stopped = None, None, False
+        events = []
+        try:
+            while True:
+                t_tick = time.monotonic()
+                t = t_tick - t_start
+                if rn.stop_req is not None:
+                    raise StopEpisode(f"OPERATOR STOP: {rn.stop_req}")
+                if rn.laptop_t is None or t_tick - rn.laptop_t > C.LAPTOP_TIMEOUT_S:
+                    raise StopEpisode(f"the laptop went silent ({t_tick - (rn.laptop_t or 0):.2f} s)")
+                self.check_daemon()
+                q, dq, wq, wdq, temp, age = self.read()
+                fr = rn.kin.frames(wq, q)
+                g = plan[wi]
+                d, ang, _ = AP.errors(fr, g)
+                obs = AP.build_obs(q, dq, fr, g, prev_raw)
+                raw = self.pol(obs)
+                tgt = self.L["arm"].step(raw[:7], q, self.speed)
+                q_cmd = np.clip(tgt, self.lo, self.hi)
+                hit = np.abs(q_cmd - tgt) > 1e-6
+                if hit.any():
+                    self.L["arm"].prev = q_cmd.copy()
+                    self.L["arm"].vel[hit] = 0.0
+                jv = float(np.max(np.abs(dq)))
+                if jv > self.joint_speed_stop:
+                    raise StopEpisode(f"SAFETY STOP: joint speed {jv:.2f} rad/s > {self.joint_speed_stop:.2f}")
+                if np.isfinite(temp).any() and float(np.nanmax(temp)) > self.temp_stop:
+                    raise StopEpisode(f"SAFETY STOP: motor temperature {float(np.nanmax(temp)):.0f} C")
+                rn.send_arm(q_cmd, self.kp, self.kd)
+                prev_raw = raw
+                compute = time.monotonic() - t_tick
+                compute_max = max(compute_max, compute)
+                self.rows.append((t, obs, raw, q_cmd, q, dq, wq, fr.palm_ref, d, ang, wi, age, compute))
+                t_wp += dt
+                reached = trk.step(fr, g)
+                if reached or t_wp >= self.waypoint_timeout:
+                    events.append(f"{g.name} {'reached' if reached else 'TIMEOUT'} after {t_wp:.2f} s: pocket "
+                                  f"{d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg")
+                    if g.name == "apple":
+                        if reached:
+                            self.reach_info = {"t": round(t, 3), "pocket_err_mm": round(d * 1000, 1),
+                                               "normal_err_deg": round(math.degrees(ang), 1),
+                                               "palm": fr.palm_ref.round(4).tolist(), "q": q.round(4).tolist()}
+                            outcome = f"REACHED in {t:.2f} s (pocket {d * 100:.1f} cm, normal {math.degrees(ang):.0f} deg)"
+                        else:
+                            outcome = (f"TIME LIMIT at the apple (pocket {d * 100:.1f} cm, normal "
+                                       f"{math.degrees(ang):.0f} deg)")
+                    else:
+                        wi, t_wp = wi + 1, 0.0
+                        trk.reset()
+                now = time.monotonic()
+                if now - t_hb >= 1.0 / C.DAEMON_HB_HZ:
+                    t_hb = now
+                    rn.rl_send({"cmd": "hb"})
+                if now - t_state >= 1.0 / C.STATE_HZ_RUN or outcome is not None:
+                    t_state = now
+                    rn.publish({"phase": "POLICY", "id": self.id, "t": round(t, 3), "goal": g.name,
+                                "pocket_cm": round(d * 100, 2), "normal_deg": round(math.degrees(ang), 1),
+                                "q": q.round(4).tolist(), "q_cmd": q_cmd.round(4).tolist(),
+                                "palm": fr.palm_ref.round(4).tolist(), "lowstate_age_ms": round(age * 1000, 1),
+                                "late": n_late, "compute_ms_max": round(compute_max * 1000, 2),
+                                "events": events[-3:], "reach": self.reach_info})
+                if outcome is not None:
+                    break
+                if t >= self.time_limit:
+                    outcome = f"TIME LIMIT {self.time_limit:.0f} s at the {g.name} (pocket {d * 100:.1f} cm)"
+                    break
+                t_next += dt
+                if time.monotonic() - t_next > dt:
+                    n_late += 1
+                    t_next = time.monotonic()
+                time.sleep(max(0.0, t_next - time.monotonic()))
+        except StopEpisode as e:
+            outcome, stopped = str(e), True
+        self.finish(outcome, stopped, q_cmd=q_cmd, n_late=n_late, compute_max=compute_max)
+        self.result["events"] = events
+
     def finish(self, outcome, stopped, q_cmd=None, n_late=0, compute_max=0.0):
         n = len(self.rows)
         dur = self.rows[-1][0] if n else 0.0
@@ -476,8 +588,7 @@ class Episode:
             return
         try:
             os.makedirs(C.LOG_DIR, exist_ok=True)
-            keys = ("t", "obs", "raw", "q_cmd", "q", "dq", "waist", "waist_cmd", "palm", "seat", "gap",
-                    "hand_phase", "age", "compute")
+            keys = self.row_keys
             cols = list(zip(*self.rows))
             np.savez_compressed(self.result["log"], meta=json.dumps({"start": self.d, "result": self.result}),
                                 **{k: np.asarray(v) for k, v in zip(keys, cols)})

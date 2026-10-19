@@ -177,8 +177,14 @@ try:
     check("bye: daemon idle hold", wait(lambda: S["rl"].get("owner") is None and S["rl"].get("mode") == "RL", 2.0))
     q_end = S["q"].copy()
     time.sleep(0.5)
-    drift = float(np.max(np.abs(S["q"] - q_end)))
-    check("hand-back: arm stays", drift < 0.02, f"{drift:.4f} rad in 0.5 s")
+    q_half = S["q"].copy()
+    time.sleep(0.5)
+    # the daemon holds the LAST command: an arm still moving at the end settles onto it, nothing jumps
+    q_last = np.asarray(res.get("q_cmd") or q_end, float)
+    drift = float(np.max(np.abs(S["q"] - q_half)))
+    off = float(np.max(np.abs(S["q"] - q_last)))
+    check("hand-back: arm settles on the last command", drift < 0.01 and off < 0.03,
+          f"{drift:.4f} rad in the 2nd half second, {off:.4f} rad from the last command")
     moved = float(np.max(np.abs(q_end - q_toy)))
     check("the policy moved the arm", moved > 0.05, f"{moved:.3f} rad")
 
@@ -190,7 +196,16 @@ try:
     sched = R.SingleHandSchedule(ramp_s=R.SINGLE_HAND_RAMP_S / 0.3)
     d_obs = d_raw = 0.0
     prev = np.zeros(log["raw"].shape[1])
-    for k in range(len(log["t"])):
+    if a.layout == "arm_pose":                     # the plan as the runner made it, from the first step's pose
+        import arm_pose_io as APIO
+        APIO.use_constants()
+        plan, _ = APIO.make_plan(kin.frames(log["waist"][0], log["q"][0]), apple)
+        for k in range(len(log["t"])):
+            frk = kin.frames(log["waist"][k], log["q"][k])
+            obs = APIO.build_obs(log["q"][k], log["dq"][k], frk, plan[int(log["waypoint"][k])], prev)
+            d_obs = max(d_obs, float(np.max(np.abs(obs - log["obs"][k]))))
+            prev = log["raw"][k]
+    for k in range(len(log["t"]) if a.layout != "arm_pose" else 0):
         w3 = log["waist"][k]
         frk = kin.frames(w3, log["q"][k])
         ph = sched.step(frk.palm_ref, apple)
@@ -203,10 +218,11 @@ try:
         if a.layout in ("single", "single_tactile"):
             mask[-3] = False
         d_obs = max(d_obs, float(np.max(np.abs((obs - log["obs"][k])[mask]))))
+        prev = log["raw"][k]
+    for k in range(len(log["t"])):
         with torch.no_grad():
             raw = net(torch.as_tensor(log["obs"][k:k + 1].astype(np.float32)))[0].numpy()
         d_raw = max(d_raw, float(np.max(np.abs(raw - log["raw"][k]))))
-        prev = log["raw"][k]
     check("onboard obs = laptop obs", d_obs < 1e-4, f"max |diff| {d_obs:.1e} over {len(log['t'])} steps")
     check("onboard action = TorchScript", d_raw < 1e-4, f"max |diff| {d_raw:.1e}")
 

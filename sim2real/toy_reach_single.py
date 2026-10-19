@@ -196,7 +196,9 @@ class ToySingle(T.Toy):
         self.io.connect = connect_timed
         # toy_reach picks the layout by size ("waist" for 40 inputs): load it by name. 41 inputs =
         # AppleReachSingleTactile-v1 (the palm touch input added back)
-        if getattr(args, "visible", False):
+        if getattr(args, "layout_name", None):
+            pass                                   # loaded by name in toy_reach.Toy (toy_arm_pose.py)
+        elif getattr(args, "visible", False):
             self.pol = R.ReachPolicy(args.policy, layout="visible")
         else:
             try:

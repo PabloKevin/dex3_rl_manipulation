@@ -1115,7 +1115,8 @@ class Toy:
     def __init__(self, args):
         self.args = args
         self.kin = R.G1Kinematics(args.urdf)
-        self.pol = R.ReachPolicy(args.policy)
+        # args.layout_name: a layout chosen by name (toy_arm_pose.py), else picked by the input size
+        self.pol = R.ReachPolicy(args.policy, layout=getattr(args, "layout_name", None))
         self.layout = self.pol.layout
         self.gpol = R.GraspPolicy(args.grasp_policy) if args.grasp else None
         self.grasp_rows = []

@@ -141,8 +141,8 @@ def run_policy_onboard(toy):
     """The POLICY phase of the single reach on the Jetson. -> (outcome, stopped), as policy_loop."""
     a, io = toy.args, toy.io
     say = toy.brief
-    if toy.layout not in ("single", "single_tactile", "visible"):
-        return f"NOT STARTED: --onboard runs the single / visible reach only (layout {toy.layout})", True
+    if toy.layout not in ("single", "single_tactile", "visible", "arm_pose"):
+        return f"NOT STARTED: --onboard runs the single / visible reach and the arm-pose toy (layout {toy.layout})", True
     link = getattr(toy, "_onboard", None)
     if link is None:
         link = toy._onboard = OnboardLink()
@@ -178,9 +178,16 @@ def run_policy_onboard(toy):
            "waist_lim": toy.waist_lim, "palm_touch": getattr(a, "palm_touch", "virtual"),
            "q_lo": np.asarray(toy.lo).tolist(), "q_hi": np.asarray(toy.hi).tolist(),
            "joint_speed_stop": a.joint_speed_stop, "temp_stop": a.temp_stop, "hand_ramp_s": a.hand_ramp_s}
+    arm_pose = toy.layout == "arm_pose"
+    if arm_pose:                              # toy_arm_pose.py: the plan is made on the robot from these
+        req.update(stage_radius=toy.stage_radius_now(), min_stage_back=a.min_stage_back, apple_offset=a.apple_offset,
+                   stage_via=bool(a.stage_via), fingers=a.fingers, waypoint_timeout=a.waypoint_timeout)
     toy.set_phase("POLICY")
     toy.ctx["doing"] = "single reach policy ON THE JETSON"
     say("STEP", f"policy on the Jetson (episode {ep_id}, {name})")
+    if arm_pose:
+        toy.hand_cup()                        # the policy trained with the hand in the reach's cup
+        say("INFO", f"staging radius {req['stage_radius']:.2f} m", fold_s=0.0)
     link.start(req)
     toy.sched.reset()
     outcome, stopped, res = None, False, None
@@ -195,7 +202,17 @@ def run_policy_onboard(toy):
             if io.estop_why is not None:
                 link.stop(f"E-STOP: {io.estop_why}")
             s = link.state
-            if s.get("id") == ep_id and "hand_phase" in s:
+            if arm_pose and s.get("id") == ep_id:
+                if s.get("phase") == "PLAN" and not getattr(toy, "_plan_said", None) == ep_id:
+                    toy._plan_said = ep_id
+                    say("INFO", f"plan (robot): {s.get('plan')}", fold_s=0.0)
+                for ev in s.get("events") or []:
+                    if ev not in getattr(toy, "_events_said", set()):
+                        toy._events_said = getattr(toy, "_events_said", set()) | {ev}
+                        say("STEP", ev, fold_s=0.0)
+                if s.get("pocket_cm") is not None:
+                    toy.ctx.update(gap=float(s["pocket_cm"]) / 100.0)
+            elif s.get("id") == ep_id and "hand_phase" in s:
                 toy.sched.phase = float(s["hand_phase"])
                 toy.sched.latched = toy.sched.phase > 0.0
                 if a.hand == "schedule":

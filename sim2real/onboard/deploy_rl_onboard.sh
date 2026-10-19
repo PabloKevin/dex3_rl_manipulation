@@ -21,7 +21,7 @@ if [[ "${1:-}" != "--check" ]]; then
   for p in "$@"; do [[ -f "$p" && "$p" == *.npz ]] || { echo "not a policy .npz: $p" >&2; exit 2; }; done
   "${SSH[@]}" "mkdir -p ~/$DEST/policies"
   "${SCP[@]}" "$here/rl_runner.py" "$here/runner_config.py" "$here/np_policy.py" "$here/np_fk.py" \
-              "$sim2real/reach_io.py" "$URDF" "$ROBOT:~/$DEST/"
+              "$sim2real/reach_io.py" "$sim2real/arm_pose_io.py" "$URDF" "$ROBOT:~/$DEST/"
   for p in "$@"; do "${SCP[@]}" "$p" "$ROBOT:~/$DEST/policies/"; done
   echo "[deploy] copied to $ROBOT:~/$DEST (+ $# policies)"
 fi

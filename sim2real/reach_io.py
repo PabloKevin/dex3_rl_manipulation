@@ -126,7 +126,8 @@ POLICY_DEFAULT = os.path.join(REPO, "envs", "agents", "best_weights", "grasp_han
 
 LAYOUTS = {40: "waist", 37: "tree", 41: "single_tactile"}
 #: (inputs, outputs) of every layout; "single" is only ever chosen by name
-LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8), "single_tactile": (41, 8), "visible": (37, 7)}
+LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8), "single_tactile": (41, 8), "visible": (37, 7),
+               "arm_pose": (35, 7)}      # arm_pose: AppleArmPose (sim2real/arm_pose_io.py builds its inputs)
 
 #: AppleReachSingle-v1 (envs/apple_reach_single_env_cfg.py; checked by validate_single_io.py)
 #: goal: the apple centre (radius + SINGLE_STANDOFF) out from the palm point along the palm
@@ -207,6 +208,11 @@ def use_layout_constants(layout: str, version: int = 1) -> None:
     globals().update({k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in _LAYOUT_BASE.items()})
     if layout == "visible":
         use_visible(version)
+    elif layout == "arm_pose":
+        # AppleArmPose-v1: AppleReachSingle-v2's arm action (1.2 rad/s, 5 rad/s^2, braking), the v3 clip,
+        # the torso upright (validate_arm_pose_io.py)
+        use_single_v2()
+        globals()["WAIST_DEFAULT"] = VISIBLE_WAIST_DEFAULT.copy()
     elif version == 2:
         use_single_v2()
 

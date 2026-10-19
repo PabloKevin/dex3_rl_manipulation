@@ -21,7 +21,7 @@ case "$ACTION" in
     [ -f "$D/rl_runner.py" ] || { echo "ONBOARD: FAILED not deployed (sim2real/onboard/deploy_rl_onboard.sh)"; exit 1; }
     if [ -n "$pid" ]; then echo "ONBOARD: REUSED pid $pid"; exit 0; fi
     cd "$D" && source ../onboard/env.sh >/dev/null 2>&1
-    setsid nohup python3 -u rl_runner.py --net-if "$NETIF" > /tmp/rl_onboard.log 2>&1 < /dev/null &
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 setsid nohup python3 -u rl_runner.py --net-if "$NETIF" > /tmp/rl_onboard.log 2>&1 < /dev/null &
     sleep 1.5
     pid=$(pgrep -f "$PAT" | head -1)
     if [ -z "$pid" ]; then echo "ONBOARD: FAILED (exited at once):"; tail -5 /tmp/rl_onboard.log; exit 1; fi
