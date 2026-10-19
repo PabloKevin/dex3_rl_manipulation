@@ -26,5 +26,8 @@ ACQUIRE_TIMEOUT_S = 1.5
 DAEMON_STATE_STALE_S = 0.6
 TEMP_STOP_C = 95.0
 POLL_S = 0.002
+#: DDS discovery of this process: announce every SPDP_S, a lease of LEASE_S (rl_runner.main)
+SPDP_S = 1.0
+LEASE_S = 30.0
 
 LOG_DIR = "/tmp/rl_onboard"

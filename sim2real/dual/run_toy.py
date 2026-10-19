@@ -85,6 +85,8 @@ LAG_GATE = 0.12
 LAG_GATE_MAX_S = 2.0
 #: --onboard: the policy phase runs on the Jetson (dual/onboard_link.py)
 ONBOARD = False
+#: s the toy waits for the dual daemon to take its rl_enter (DualToyMixin.enter_qref)
+ENTER_TIMEOUT_S = 15.0
 
 
 class LagGate:
@@ -300,6 +302,28 @@ class DualToyMixin:
                            f"{os.path.basename(args.policy)} speed {args.speed}")
         if getattr(self, "_envelope_note", False):
             self.brief("INFO", "targets outside the training envelope run anyway (--strict_envelope to refuse)")
+        if ONBOARD and getattr(self.io, "commands", False):
+            # the onboard runner must answer BEFORE the arm moves (not only at GO)
+            from onboard_link import check_runner
+            connect = self.io.connect
+
+            def connect_and_check():
+                connect()
+                err = check_runner(self)
+                if err:
+                    self.brief("STOP", err, fold_s=0.0)
+                    sys.exit(f"--onboard: {err}")
+            self.io.connect = connect_and_check
+
+    def enter_qref(self, q_hold, timeout_s=45.0):
+        """The dual daemon answers in < 1 s once it hears this process (fast DDS discovery); 45 s of an arm
+        that does not move helped nobody (robot runs 2026-10-19: twice the daemon never heard a fresh toy,
+        while the next toy process was heard at once). 15 s, then a message that says what to do."""
+        err = super().enter_qref(q_hold, timeout_s=min(timeout_s, ENTER_TIMEOUT_S))
+        if err and "did not confirm" in err:
+            err = (f"the arm daemon did not hear this toy in {ENTER_TIMEOUT_S:.0f} s (DDS discovery: nothing of ours "
+                   f"reached it). ENTER in the launcher starts a new toy process, which is discovered again")
+        return err
 
     # ---- the short log ----
     def say(self, msg, col=""):

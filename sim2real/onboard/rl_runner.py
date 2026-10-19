@@ -493,8 +493,14 @@ def main():
     ap.add_argument("--policy_dir", default=os.path.join(HERE, "policies"))
     ap.add_argument("--fk", choices=["auto", "pinocchio", "numpy"], default="auto")
     a = ap.parse_args()
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-    ChannelFactoryInitialize(a.domain_id, a.net_if)
+    import unitree_sdk2py.core.channel as ch
+    # announce every SPDP_S with a long lease: idle, the runner sends nothing to the laptop, and the
+    # SDK default (announce every 30 s, 10 s lease) let the laptop forget it between announcements --
+    # the toy's "start" then went nowhere (robot runs 2026-10-19)
+    ch.ChannelConfigHasInterface = ch.ChannelConfigHasInterface.replace(
+        "</General>", "</General><Discovery><SPDPInterval>%gs</SPDPInterval><LeaseDuration>%gs</LeaseDuration>"
+                      "</Discovery>" % (C.SPDP_S, C.LEASE_S), 1)
+    ch.ChannelFactoryInitialize(a.domain_id, a.net_if)
     rn = Runner(a.urdf, a.policy_dir, a.fk)
 
     def _stop(signum, _frame):
