@@ -117,6 +117,9 @@ def parse_args():
                    help="1: AppleReachSingle-v1 (2 cm short, hand closes level with the apple); 2: "
                         "AppleReachSingle-v2 (apple enclosed, hand closes within 10 cm, apple-centred envelope); "
                         "auto (default): 2 when the policy path (or its .txt) says single_v2")
+    p.add_argument("--visible", action="store_true",
+                   help="an AppleReachVisible policy (37 in / 7 out, waist held): auto when the path says "
+                        "apple_reach_visible")
     p.add_argument("-h", "--help", action="store_true")
     mine, rest = p.parse_known_args()
     if mine.help:
@@ -136,8 +139,20 @@ def parse_args():
     user_tol = "--reach_tol" in rest or any(x.startswith("--reach_tol=") for x in rest)
     sys.argv = [sys.argv[0]] + rest + ["--hand", "keep", "--touch", "zero"]
     a = T.parse_args()
+    a.visible = mine.visible or "apple_reach_visible" in os.path.abspath(a.policy)
+    a.visible_version = R.visible_version_of(a.policy) if a.visible else 0
     a.single_version = R.single_version_of(a.policy) if mine.single_version == "auto" else int(mine.single_version)
-    if a.single_version == 2:
+    if a.visible:
+        # single v2's goal / hand / limiter, waist pitch 0, v2's clip (reach_io.use_visible)
+        a.single_version = 2
+        R.use_layout_constants("visible", a.visible_version)
+        R.ENVELOPE_WAIST = R.ENVELOPE_SINGLE_V2
+        if a.waist != "hold":
+            print("  visible reach: the policy has no waist output -> --waist hold (the torso stays where it is)")
+            a.waist = "hold"
+        print(f"  AppleReachVisible-v{a.visible_version} policy: 37 inputs / 7 outputs, the apple in the torso's yaw "
+              f"frame (the waist may be turned), the apple measured once at home (no live tracking yet)")
+    elif a.single_version == 2:
         R.use_single_v2()
         R.ENVELOPE_WAIST = R.ENVELOPE_SINGLE_V2     # apple centres, not grasp targets (ToySingle.check_apple)
     print(f"  single reach v{a.single_version}: goal {R.SINGLE_STANDOFF * 100:.1f} cm off the surface "
@@ -152,7 +167,7 @@ def parse_args():
     if not user_tol:
         a.reach_tol = R.SINGLE_POS_TOL
     if "single" not in os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(a.policy)))) \
-            and "single" not in a.policy and not a.layout_ok:
+            and "single" not in a.policy and not a.layout_ok and not a.visible:
         sys.exit(f"{a.policy}: the path does not say 'single'. Only an AppleReachSingle-v1 policy may run here "
                  "(--layout_ok if it is one)")
     if a.log_dir is None:
@@ -181,10 +196,13 @@ class ToySingle(T.Toy):
         self.io.connect = connect_timed
         # toy_reach picks the layout by size ("waist" for 40 inputs): load it by name. 41 inputs =
         # AppleReachSingleTactile-v1 (the palm touch input added back)
-        try:
-            self.pol = R.ReachPolicy(args.policy, layout="single")
-        except ValueError:
-            self.pol = R.ReachPolicy(args.policy, layout="single_tactile")
+        if getattr(args, "visible", False):
+            self.pol = R.ReachPolicy(args.policy, layout="visible")
+        else:
+            try:
+                self.pol = R.ReachPolicy(args.policy, layout="single")
+            except ValueError:
+                self.pol = R.ReachPolicy(args.policy, layout="single_tactile")
         self.layout = self.pol.layout
         if self.layout == "single_tactile":
             print(f"  TACTILE single reach (41 inputs): palm touch input = "
@@ -450,11 +468,13 @@ class ToySingle(T.Toy):
                     L["arm"].prev = q_cmd.copy()
                     L["arm"].vel[hit] = 0.0
                 clipped = [R.RIGHT_ARM_JOINTS[j][6:-6] for j in np.flatnonzero(hit)]
-                w_cmd = float(np.clip(L["waist"].step(raw[7:8], s.waist_q[:1], speed)[0],
-                                      -self.waist_lim, self.waist_lim))
-                w_des = float(np.clip(L["waist"].desired[0], -self.waist_lim, self.waist_lim))
+                w_cmd = w_des = float("nan")
+                if "waist" in L:                       # the visible layout has no waist output
+                    w_cmd = float(np.clip(L["waist"].step(raw[7:8], s.waist_q[:1], speed)[0],
+                                          -self.waist_lim, self.waist_lim))
+                    w_des = float(np.clip(L["waist"].desired[0], -self.waist_lim, self.waist_lim))
                 now = io.now()
-                if (a.waist == "follow" and not io.qref_waist and abs(w_des - waist_sent) > math.radians(2.0)
+                if ("waist" in L and a.waist == "follow" and not io.qref_waist and abs(w_des - waist_sent) > math.radians(2.0)
                         and now - waist_sent_t > 0.3):
                     dur = max(0.5, 1.875 * abs(w_des - float(s.waist_q[0])) / (R.WAIST_MAX_VELOCITY * speed))
                     io.waist_to(w_des, dur)
@@ -479,7 +499,7 @@ class ToySingle(T.Toy):
                         stopped, outcome = True, "STOP: " + "; ".join(hard)
                         self.halted = outcome
                         break
-                stream_waist = a.waist == "follow" and io.qref_waist
+                stream_waist = "waist" in L and a.waist == "follow" and io.qref_waist
                 p4 = tw()
                 io.send_arm(q_cmd, waist=w_cmd if stream_waist else None,
                             waist_dq=float(L["waist"].vel[0]) if stream_waist else 0.0)
@@ -602,6 +622,8 @@ class ToySingle(T.Toy):
         if self.layout == "single_tactile":
             rows = rows[:5] + [("palm touch", 28, 29), ("ring", 29, 37), ("waist q, dq, prev raw", 37, 40),
                                ("hand phase", 40, 41)]
+        if self.layout == "visible":
+            rows = rows[:6] + [("hand phase", 36, 37)]
         for nm, i, j in rows:
             print(f"    {nm:22s} {obs0[i:j]}")
         print(f"  first raw action {raw0}\n  -> first joint targets would move the arm toward "

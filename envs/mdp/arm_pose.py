@@ -32,6 +32,16 @@ from rest. Goal flags:
   via        a pass-through waypoint: reached at a looser tolerance, no stop
              and no hold, then the next goal follows at once -- so a chain
              of waypoints is flown through rather than stop-and-go.
+
+Hold phase (AppleArmPose-v2; off in v1, where the next goal came 0.2 s after
+arriving): a stop goal stays for a random extra time after it is reached
+(hold_s_range, or for the rest of the episode with hold_forever_prob), paid
+by reward_hold for staying inside the tolerance AND still, with the palm's
+speed and the commanded acceleration charged while holding; and in some
+holds a steady force pushes on the hand (apply_hold_push: mostly back along
+the palm normal, as an apple / stem pressed by the cup would). Measured on
+the v1 policy (no contact): the position held (0.8 cm, 98% inside 2 cm /
+15 deg after 8 s), but the palm never stopped (4.6 cm/s median, 11 p90).
 """
 
 from __future__ import annotations
@@ -67,6 +77,13 @@ class _Pose:
         self.bracket = torch.zeros(N, dtype=torch.long, device=d)
         self.goal_idx = torch.zeros(N, dtype=torch.long, device=d)       # library row of the goal
         self.prev_d = torch.zeros(N, device=d)                            # progress shaping
+        # hold phase: reached (and since when), extra time left, the push while holding
+        self.arrived, self.in_tol = zb(), zb()
+        self.hold_left = torch.zeros(N, device=d)
+        self.push = z3()
+        self.hold_steps = torch.zeros(N, device=d)
+        self.hold_in = torch.zeros(N, device=d)
+        self.hold_speed = torch.zeros(N, device=d)
         self.prev_ang = torch.zeros(N, device=d)
         self.yaw = torch.zeros(N, device=d)
         # per-episode counters (metrics)
@@ -232,8 +249,11 @@ def reset_arm_pose(
     P.t_goal[ids] = 0.0
     P.success[ids] = False
     P.timed_out[ids] = False
-    for t in (P.n_goals, P.n_reached, P.err_sum, P.ang_sum, P.n_timeout):
+    for t in (P.n_goals, P.n_reached, P.err_sum, P.ang_sum, P.n_timeout, P.hold_steps, P.hold_in, P.hold_speed,
+              P.hold_left):
         t[ids] = 0.0
+    P.arrived[ids] = False
+    P.push[ids] = 0.0
 
 
 def _straight_clear(env, ids, a, b, hand_radius: float, margin: float, samples: int = 12) -> torch.Tensor:
@@ -260,19 +280,29 @@ def advance_goals(
     goal_timeout_s: float = 4.0,
     straight_hand_radius: float = 0.06,
     straight_margin: float = 0.02,
+    hold_s_range: tuple[float, float] = (0.0, 0.0),
+    hold_forever_prob: float = 0.0,
+    push_prob: float = 0.0,
+    push_max_n: float = 0.0,
 ) -> None:
     """mode="interval" (every step, after the rewards): a new goal where the
     episode just started (first step), the goal was reached this step, or it
     timed out. Goal = a library pose clear at the episode's yaw (task-like
     -- in front of the shoulder, palm near horizontal, facing forward-ish --
     with task_prob, else anywhere), put in the world through the torso pose.
-    The goal pose must differ from where the arm is (> 5 cm or > 30 deg)."""
+    The goal pose must differ from where the arm is (> 5 cm or > 30 deg).
+    A reached stop goal stays a further hold time (hold_s_range, or the rest
+    of the episode with hold_forever_prob; 0 = the next goal at once, v1); a
+    stop goal gets a push for its hold with push_prob (apply_hold_push), up
+    to push_max_n newtons. The timeout only runs until the goal is reached."""
     P = pose_state(env)
     dt = env.step_dt
     live = ~P.pending
     P.t_goal = P.t_goal + dt * live.float()
-    P.timed_out = live & ~P.success & (P.t_goal >= goal_timeout_s)
-    new = (P.pending & (env.episode_length_buf >= 1)) | (live & (P.success | P.timed_out))
+    P.hold_left = P.hold_left - dt * P.arrived.float()
+    P.timed_out = live & ~P.arrived & ~P.success & (P.t_goal >= goal_timeout_s)
+    done = (P.success & P.via) | (P.arrived & (P.hold_left <= 0.0))
+    new = (P.pending & (env.episode_length_buf >= 1)) | (live & (done | P.timed_out))
     if not bool(new.any()):
         return
     ids = new.nonzero(as_tuple=True)[0]
@@ -299,7 +329,7 @@ def advance_goals(
     d_old = (P.target[ids] - pocket[ids]).norm(dim=-1)
     a_old = torch.acos((P.normal[ids] * normal[ids]).sum(-1).clamp(-1, 1))
     P.n_goals[ids] += old.float()
-    P.n_reached[ids] += (old & P.success[ids]).float()
+    P.n_reached[ids] += (old & (P.arrived[ids] | (P.success[ids] & P.via[ids]))).float()
     P.n_timeout[ids] += (old & P.timed_out[ids]).float()
     P.err_sum[ids] += torch.where(old & P.timed_out[ids], d_old, torch.zeros_like(d_old))
     P.ang_sum[ids] += torch.where(old & P.timed_out[ids], a_old, torch.zeros_like(a_old))
@@ -319,6 +349,16 @@ def advance_goals(
     P.pending[ids] = False
     P.success[ids] = False
     P.timed_out[ids] = False
+    P.arrived[ids] = False
+    stop = ~P.via[ids]
+    extra = hold_s_range[0] + (hold_s_range[1] - hold_s_range[0]) * torch.rand(n, device=dev)
+    extra = torch.where(torch.rand(n, device=dev) < hold_forever_prob, torch.full_like(extra, 1.0e9), extra)
+    P.hold_left[ids] = torch.where(stop, extra, torch.zeros_like(extra))
+    # the push while holding: mostly back along the palm normal (the apple pressing on the cup)
+    pdir = -P.normal[ids] + 0.5 * torch.randn(n, 3, device=dev)
+    pdir = pdir / pdir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    mag = push_max_n * torch.rand(n, device=dev) * ((torch.rand(n, device=dev) < push_prob) & stop).float()
+    P.push[ids] = pdir * mag.unsqueeze(-1)
 
 
 # ─────────────────────────────────────────────
@@ -410,7 +450,15 @@ def track_goal(
     stop_ok = live & (d < pos_tol) & (ang < math.radians(ang_tol_deg)) & fin_ok & (v < speed_tol)
     P.hold = torch.where(stop_ok & ~P.via, P.hold + env.step_dt, torch.zeros_like(P.hold))
     via_ok = live & P.via & (d < via_pos_tol) & (ang < math.radians(via_ang_tol_deg)) & fin_ok
-    P.success = (P.hold >= hold_time) | via_ok
+    arrive = (P.hold >= hold_time) & ~P.arrived & ~P.via
+    P.arrived = P.arrived | arrive
+    P.success = arrive | via_ok                      # the event: one step per goal
+    P.in_tol = live & (d < pos_tol) & (ang < math.radians(ang_tol_deg)) & fin_ok
+    # hold-phase metrics (the step a goal is replaced excluded)
+    h = P.arrived & ~arrive
+    P.hold_steps += h.float()
+    P.hold_in += (h & P.in_tol).float()
+    P.hold_speed += v * h.float()
     return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
 
@@ -451,6 +499,65 @@ def reward_progress(env: "ManagerBasedRLEnv", pocket_local, max_speed: float = 1
     P.prev_d = torch.where(live, d, P.prev_d)
     P.prev_ang = torch.where(live, ang, P.prev_ang)
     return (v + ang_scale * w) * live.float()
+
+
+def _palm_speed(env):
+    return env.scene["robot"].data.body_lin_vel_w[:, _bid(env, PALM)].norm(dim=-1)
+
+
+def reward_hold(env: "ManagerBasedRLEnv", speed_ref: float = 0.02) -> torch.Tensor:
+    """[N] holding a reached stop goal: inside the goal tolerance (track_goal's
+    position / normal / finger test, any speed) x exp(-(v / speed_ref)^2 / 2)
+    -- still, not buzzing around the goal."""
+    P = pose_state(env)
+    v = _palm_speed(env)
+    return (P.arrived & P.in_tol & ~P.via).float() * torch.exp(-0.5 * (v / speed_ref) ** 2)
+
+
+def _near_stop_goal(env, pocket_local, near: float) -> torch.Tensor:
+    """[N] bool: within `near` of a live stop goal, reached or not. The hold
+    penalties are gated on this, NOT on arrival: gated on arrival, the first
+    v2 fine-tune learned to stop arriving (under exploration noise the hand
+    moves anyway, and only an arrived goal was charged for it: -1.3/s of
+    penalties against +0.13/s of hold reward; reached goals 62% -> 37%)."""
+    P = pose_state(env)
+    d, _, _, live = errors(env, pocket_local)
+    return live & ~P.via & (d < near)
+
+
+def penalty_hold_motion(env: "ManagerBasedRLEnv", pocket_local, near: float = 0.05, ref: float = 0.05,
+                        cap: float = 4.0) -> torch.Tensor:
+    """[N] (palm speed / ref)^2, capped, within `near` of a stop goal."""
+    return ((_palm_speed(env) / ref) ** 2).clamp(max=cap) * _near_stop_goal(env, pocket_local, near).float()
+
+
+def penalty_hold_commanded_accel(env: "ManagerBasedRLEnv", pocket_local, near: float = 0.05,
+                                 action_name: str = "right_arm") -> torch.Tensor:
+    """[N] tree_reach.penalty_commanded_accel within `near` of a stop goal
+    (its own previous-velocity cache: calling that function twice a step
+    would zero its acceleration)."""
+    term = env.action_manager.get_term(action_name)
+    v = term._prev_vel
+    prev = getattr(env, "_arm_pose_cmd_prev", None)
+    if prev is None or prev.shape != v.shape:
+        prev = v.clone()
+    fresh = (env.episode_length_buf <= 1).unsqueeze(-1)
+    acc = torch.where(fresh, torch.zeros_like(v), (v - prev) / env.step_dt)
+    env._arm_pose_cmd_prev = v.clone()
+    return ((acc / term.cfg.max_acceleration) ** 2).mean(-1) * _near_stop_goal(env, pocket_local, near).float()
+
+
+def apply_hold_push(env: "ManagerBasedRLEnv", env_ids, pocket_local) -> None:
+    """mode="interval" (every step, after advance_goals): the hold's push
+    (advance_goals) at the pocket, on the palm link, only while the goal is
+    held -- zero otherwise."""
+    P = pose_state(env)
+    robot = env.scene["robot"]
+    pocket, _, _ = hand_frame(env, pocket_local)
+    f = (P.push * P.arrived.float().unsqueeze(-1)).unsqueeze(1)
+    robot.permanent_wrench_composer.set_forces_and_torques(
+        forces=f, torques=torch.zeros_like(f), positions=pocket.unsqueeze(1),
+        body_ids=torch.tensor([_bid(env, PALM)], device=env.device), is_global=True)
 
 
 def reward_goal_reached(env: "ManagerBasedRLEnv", via_value: float = 0.5) -> torch.Tensor:
@@ -520,6 +627,8 @@ def arm_pose_metrics(env: "ManagerBasedRLEnv", env_ids: Sequence[int], ema: floa
         "reached_share": float(P.n_reached[ids].sum() / goals),
         "timeout_err_cm": float(P.err_sum[ids].sum() / tout.clamp(min=1.0) * 100.0) if tout > 0 else st.get("timeout_err_cm", 0.0),
         "timeout_ang_deg": float(torch.rad2deg(P.ang_sum[ids].sum() / tout.clamp(min=1.0))) if tout > 0 else st.get("timeout_ang_deg", 0.0),
+        "hold_in_tol_share": float(P.hold_in[ids].sum() / P.hold_steps[ids].sum().clamp(min=1.0)),
+        "hold_speed_cms": float(P.hold_speed[ids].sum() / P.hold_steps[ids].sum().clamp(min=1.0) * 100.0),
         "collision_share": float(getattr(env, "_arm_pose_hit", torch.zeros(env.num_envs, dtype=torch.bool,
                                                                             device=env.device))[ids].float().mean()),
     }

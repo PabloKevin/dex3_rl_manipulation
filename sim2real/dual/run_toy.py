@@ -8,6 +8,8 @@ imported unchanged; three of their pieces are swapped here:
 
   python3 sim2real/dual/run_toy.py single --policy P --speed 0.3 --target detection
   python3 sim2real/dual/run_toy.py reach  --policy P --speed 0.3 --target X Y Z
+  python3 sim2real/dual/run_toy.py visible --policy P --speed 0.3 --target detection [--onboard]
+                      an AppleReachVisible policy (37 in / 7 out, waist held) through the single toy
   python3 sim2real/dual/run_toy.py apple|grasp|chain ...     (as toy_apple / toy_grasp / toy_chain)
   python3 sim2real/dual/run_toy.py calib --policy P --speed 0.3 --target detection
                       the single toy + a calibration session after the policy stops: jog / float the
@@ -677,11 +679,13 @@ def main():
     global STRICT, VERBOSE
     install_ctrl_c()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "apple", "grasp", "chain", "v1",
-                                                                   "tree", "calib"):
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "apple", "grasp",
+                                                                   "chain", "v1", "tree", "calib"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     kind, rest = argv[0], argv[1:]
+    if kind == "visible":                       # an AppleReachVisible policy through the single toy
+        kind, rest = "single", rest + ["--visible"]
     if "--strict_envelope" in rest:
         STRICT = True
         rest.remove("--strict_envelope")

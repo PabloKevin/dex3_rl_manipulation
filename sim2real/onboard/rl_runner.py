@@ -49,8 +49,6 @@ import reach_io as R  # noqa: E402  (dex3_rl_manipulation/sim2real/reach_io.py)
 import runner_config as C  # noqa: E402
 from np_policy import NumpyPolicy  # noqa: E402
 
-#: reach_io's AppleReachSingle-v1 constants, to switch back after a v2 episode (use_single_v2 overwrites them)
-SINGLE_V1 = {k: getattr(R, k) for k in R.SINGLE_V2}
 ARM_IDX = [R.MOTOR_IDX[n] for n in R.RIGHT_ARM_JOINTS]
 WAIST_IDX = [R.MOTOR_IDX[n] for n in R.WAIST_JOINTS]
 
@@ -244,9 +242,9 @@ class Runner:
             for _ in range(3):                            # one lost packet must not keep the arm
                 self.rl_send({"cmd": "bye"})
                 time.sleep(0.02)
+            ep.save()                                     # before DONE: the laptop copies the log on DONE
             self.last = ep.result
             self.publish(dict(ep.result, phase="DONE"))
-            ep.save()
             with self.lock:
                 self.episode = None
             print(f"[rl_onboard] episode {ep.id}: {ep.result.get('outcome')}", flush=True)
@@ -267,7 +265,8 @@ class Episode:
         if (self.pol.n_in, self.pol.n_out) != R.LAYOUT_DIMS[self.layout]:
             raise ValueError(f"{name}: {self.pol.n_in}/{self.pol.n_out}, layout {self.layout} needs "
                              f"{R.LAYOUT_DIMS[self.layout]}")
-        R.__dict__.update(R.SINGLE_V2 if int(d.get("single_version", 1)) == 2 else SINGLE_V1)
+        # the layout's constants (single v1 / v2, visible v1 / v2), from this module's defaults every episode
+        R.use_layout_constants(self.layout, int(d.get("version", d.get("single_version", 1))))
         self.apple = np.asarray(d["apple"], float).reshape(3)
         if not np.all(np.isfinite(self.apple)):
             raise ValueError("apple not finite")
@@ -284,6 +283,7 @@ class Episode:
         self.waist = str(g("waist", "hold"))
         self.waist_lim = float(g("waist_lim", R.WAIST_YAW_LIMIT))
         self.palm_touch = str(g("palm_touch", "virtual"))
+        # the robot's joint limits (the laptop sends its picker limits; the policy's own clip is in the limiter)
         self.lo = np.asarray(g("q_lo", R.ARM_TARGET_LO), float)
         self.hi = np.asarray(g("q_hi", R.ARM_TARGET_HI), float)
         self.joint_speed_stop = float(g("joint_speed_stop", 1.8 * R.ARM_MAX_VELOCITY * self.speed + 0.5))

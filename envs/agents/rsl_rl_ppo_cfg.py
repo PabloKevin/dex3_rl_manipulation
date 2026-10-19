@@ -436,3 +436,31 @@ class AppleArmPosePPORunnerCfg(AppleArmGoalPPORunnerCfg):
         critic_hidden_dims=[256, 256, 128],
         activation="elu",
     )
+
+
+@configclass
+class AppleArmPoseV2PPORunnerCfg(AppleArmPosePPORunnerCfg):
+    """AppleArmPose-v2: v1 + the hold phase, fine-tuned from v1 (same inputs /
+    outputs; warm start logs/rsl_rl/apple_arm_pose_v2/warmstart_v1/model_0.pt
+    from v1's exported policy, scripts/warmstart_from_jit.py). Own log folder
+    (logs/rsl_rl/apple_arm_pose_v2)."""
+    experiment_name = "apple_arm_pose_v2"
+    max_iterations = 1500
+    # fine-tune: entropy 0.005 -> 0.001. Measured 2026-10-19: from v1's export
+    # at std 0.3 / entropy 0.005, even the UNCHANGED v1 task fell apart in 200
+    # its (goals reached 65% -> 18%, std growing 0.30 -> 0.36); warm start at
+    # std 0.15 (warmstart_from_jit.py --std 0.15)
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.001,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=3.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )

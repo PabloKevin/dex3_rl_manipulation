@@ -119,8 +119,8 @@ def run_policy_onboard(toy):
     """The POLICY phase of the single reach on the Jetson. -> (outcome, stopped), as policy_loop."""
     a, io = toy.args, toy.io
     say = toy.brief
-    if toy.layout not in ("single", "single_tactile"):
-        return f"NOT STARTED: --onboard runs the single reach only (layout {toy.layout})", True
+    if toy.layout not in ("single", "single_tactile", "visible"):
+        return f"NOT STARTED: --onboard runs the single / visible reach only (layout {toy.layout})", True
     link = getattr(toy, "_onboard", None)
     if link is None:
         link = toy._onboard = OnboardLink()
@@ -147,7 +147,9 @@ def run_policy_onboard(toy):
         time.sleep(0.02)
     # 3. start the runner
     ep_id = time.strftime("%Y%m%d_%H%M%S")
-    req = {"id": ep_id, "layout": toy.layout, "policy": name, "single_version": int(getattr(a, "single_version", 1)),
+    version = int(getattr(a, "visible_version", 0) or 0) if toy.layout == "visible" \
+        else int(getattr(a, "single_version", 1))
+    req = {"id": ep_id, "layout": toy.layout, "policy": name, "version": version,
            "apple": np.asarray(toy.apple, float).tolist(), "apple_radius": a.apple_radius, "speed": a.speed,
            "kp": a.kp, "kd": a.kd, "time_limit": a.time_limit, "reach_tol": a.reach_tol,
            "after_reach": a.after_reach, "settle_s": a.settle_s, "hold_s": a.hold_s, "waist": a.waist,

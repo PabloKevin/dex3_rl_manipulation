@@ -223,3 +223,73 @@ class AppleArmPoseEnvCfg_PLAY(AppleArmPoseEnvCfg):
         self.viewer.eye = (1.3, -1.0, 1.45)
         self.viewer.lookat = (0.15, -0.15, 1.0)
         self.events.draw_goal = EventTerm(func=ap.draw_goal, mode="interval", interval_range_s=(0.0, 0.0))
+
+
+# ─────────────────────────────────────────────
+#  v2: holding the goal (AppleArmPose-v2)
+# ─────────────────────────────────────────────
+# User, 2026-10-19: the policy must be rewarded for HOLDING the target. v1
+# gave the next goal 0.2 s after arriving, so it never practised staying.
+# Measured on the v1 policy (robot only, one goal held 8 s): the position
+# holds (0.8 cm / 2.5 deg median, 98% inside 2 cm / 15 deg), but the palm
+# keeps moving at 4.6 cm/s median (11 p90) -- it buzzes around the goal; in
+# the waypoint reach the apple pushing on the cup also moved it 1-2 cm off.
+# Same inputs / outputs as v1 (fine-tuned from it).
+
+#: extra time a reached stop goal stays (s), and the share kept to the end of the episode
+HOLD_S_RANGE = (0.5, 3.0)
+HOLD_FOREVER_PROB = 0.15
+#: share of holds with a steady push on the hand, and its maximum (N): mostly
+#: back along the palm normal (the stem's lateral stiffness is 15-40 N/m, so
+#: a 2-5 cm press of the cup on an apple is ~0.3-2 N)
+PUSH_PROB = 0.5
+PUSH_MAX_N = 3.0
+
+
+@configclass
+class RewardsV2Cfg(RewardsCfg):
+    # inside the tolerance and still (speed ref 4 cm/s, so it still pays under
+    # the exploration noise): up to 4 per second held. Arriving must always pay:
+    # the first try (ref 2 cm/s, weight 3, the penalties below gated on
+    # arrival, -0.5 at ref 3 cm/s and -2) paid +0.13/s against -1.3/s and the
+    # policy stopped arriving (reached goals 62% -> 37% in 200 its)
+    hold = RewTerm(func=ap.reward_hold, weight=4.0, params={"speed_ref": 0.04})
+    # within 5 cm of any stop goal, reached or not: 5 cm/s costs 0.5 per second
+    hold_motion = RewTerm(func=ap.penalty_hold_motion, weight=-0.5,
+                          params={"pocket_local": POCKET, "near": 0.05, "ref": 0.05, "cap": 4.0})
+    hold_commanded_accel = RewTerm(func=ap.penalty_hold_commanded_accel, weight=-1.0,
+                                   params={"pocket_local": POCKET, "near": 0.05})
+
+
+@configclass
+class EventsV2Cfg(EventsCfg):
+    # after advance_goals (declaration order): the push of the goal being held
+    hold_push = EventTerm(func=ap.apply_hold_push, mode="interval", interval_range_s=(0.0, 0.0),
+                          params={"pocket_local": POCKET})
+
+
+@configclass
+class AppleArmPoseV2EnvCfg(AppleArmPoseEnvCfg):
+    rewards: RewardsV2Cfg = RewardsV2Cfg()
+    events: EventsV2Cfg = EventsV2Cfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 15.0        # holds make goals longer: still ~3-4 per episode
+        self.events.advance_goals.params.update({
+            "hold_s_range": HOLD_S_RANGE, "hold_forever_prob": HOLD_FOREVER_PROB,
+            "push_prob": PUSH_PROB, "push_max_n": PUSH_MAX_N})
+
+
+@configclass
+class AppleArmPoseV2EnvCfg_PLAY(AppleArmPoseV2EnvCfg):
+    """A few envs, the goal drawn (env 0), for watching a policy (play.py)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.viewer.origin_type = "env"
+        self.viewer.env_index = 0
+        self.viewer.eye = (1.3, -1.0, 1.45)
+        self.viewer.lookat = (0.15, -0.15, 1.0)
+        self.events.draw_goal = EventTerm(func=ap.draw_goal, mode="interval", interval_range_s=(0.0, 0.0))

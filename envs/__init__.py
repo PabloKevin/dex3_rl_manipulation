@@ -739,3 +739,17 @@ for _id, _env in (("AppleArmPose-v1", AppleArmPoseEnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPosePPORunnerCfg},
         disable_env_checker=True,
     )
+
+# v2: + holding the goal (hold phase, stillness, push while holding)
+
+from .apple_arm_pose_env_cfg import AppleArmPoseV2EnvCfg, AppleArmPoseV2EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleArmPoseV2PPORunnerCfg
+
+for _id, _env in (("AppleArmPose-v2", AppleArmPoseV2EnvCfg),
+                  ("AppleArmPose-Play-v2", AppleArmPoseV2EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPoseV2PPORunnerCfg},
+        disable_env_checker=True,
+    )

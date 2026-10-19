@@ -31,7 +31,7 @@ sys.path[:0] = [ONB, SIM2REAL, os.path.join(SIM2REAL, "dual")]
 ap = argparse.ArgumentParser()
 ap.add_argument("--policy", required=True, help="TorchScript policy.pt (exported to .npz here)")
 ap.add_argument("--layout", default="single_tactile")
-ap.add_argument("--single_version", type=int, default=2)
+ap.add_argument("--version", type=int, default=2, help="the layout's version (single v1/v2, visible v1/v2)")
 ap.add_argument("--fk", default="auto", choices=["auto", "pinocchio", "numpy"], help="the runner's kinematics")
 a = ap.parse_args()
 
@@ -158,7 +158,7 @@ try:
     kin = R.G1Kinematics(os.path.join(PICKER, "robot_model_urdf", "g1_29dof_with_hand.urdf"))
     fr = kin.frames(S["w"], S["q"])
     apple = fr.palm_ref + np.array([0.20, -0.03, 0.05])
-    req = {"id": "loop1", "layout": a.layout, "policy": NPZ, "single_version": a.single_version,
+    req = {"id": "loop1", "layout": a.layout, "policy": NPZ, "version": a.version,
            "apple": apple.tolist(), "apple_radius": 0.04, "speed": 0.3, "time_limit": 8.0, "waist": "follow",
            "after_reach": "freeze"}
     q_before = S["q"].copy()
@@ -186,7 +186,7 @@ try:
     log = np.load(os.path.join("/tmp/rl_onboard", "loop1.npz"), allow_pickle=False)
     import torch
     net = torch.jit.load(a.policy, map_location="cpu").eval()
-    R.__dict__.update(R.SINGLE_V2 if a.single_version == 2 else {})
+    R.use_layout_constants(a.layout, a.version)
     sched = R.SingleHandSchedule(ramp_s=R.SINGLE_HAND_RAMP_S / 0.3)
     d_obs = d_raw = 0.0
     prev = np.zeros(log["raw"].shape[1])

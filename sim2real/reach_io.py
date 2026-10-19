@@ -126,7 +126,7 @@ POLICY_DEFAULT = os.path.join(REPO, "envs", "agents", "best_weights", "grasp_han
 
 LAYOUTS = {40: "waist", 37: "tree", 41: "single_tactile"}
 #: (inputs, outputs) of every layout; "single" is only ever chosen by name
-LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8), "single_tactile": (41, 8)}
+LAYOUT_DIMS = {"waist": (40, 8), "tree": (37, 7), "single": (40, 8), "single_tactile": (41, 8), "visible": (37, 7)}
 
 #: AppleReachSingle-v1 (envs/apple_reach_single_env_cfg.py; checked by validate_single_io.py)
 #: goal: the apple centre (radius + SINGLE_STANDOFF) out from the palm point along the palm
@@ -172,6 +172,43 @@ ENVELOPE_SINGLE_V2 = dict(reach_min=0.20, reach_max=0.70, az_center_deg=-25.0, a
 def use_single_v2() -> None:
     """AppleReachSingle-v2's goal, tolerance, hand trigger (this process only)."""
     globals().update(SINGLE_V2)
+
+
+#: AppleReachVisible-v1 / -v2 (envs/apple_reach_visible[_v2]_env_cfg.py; checked by validate_visible_io.py):
+#: AppleReachSingle-v2's goal, hand schedule and limiter, the waist HELD (no waist action, no waist
+#: inputs), the torso upright (waist pitch 0), the apple input in the torso's YAW frame, the palm
+#: orientation relative to the torso; 37 inputs / 7 outputs, NOT the "tree" layout of the same size
+#: (chosen by name only). v2 clips the shoulder-roll target at the robot's limit (THETA_LIMITS).
+VISIBLE_WAIST_DEFAULT = np.array([0.0, 0.0, 0.0])
+VISIBLE_V2_SHOULDER_ROLL_MAX = 0.0524
+VISIBLE_V2_CLIP = 3.0
+
+
+def visible_version_of(policy_path: str) -> int:
+    """2 for an AppleReachVisible-v2 run (run_name v2: '<date>_v2' in the path), else 1."""
+    return 2 if "_v2" in os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(policy_path)))) else 1
+
+
+def use_visible(version: int = 2) -> None:
+    """AppleReachVisible's constants (this process only): single v2 + waist pitch 0 (+ the v2 clip)."""
+    use_single_v2()
+    globals()["WAIST_DEFAULT"] = VISIBLE_WAIST_DEFAULT.copy()
+    if version >= 2:
+        # AppleReachVisible-v2's action clip: +-3 rad (not v1's soft limits) and the shoulder roll at the
+        # robot's limit; the joints' own limits bound the motion (here: the toy's / runner's robot clip)
+        lo, hi = np.full(7, -VISIBLE_V2_CLIP), np.full(7, VISIBLE_V2_CLIP)
+        hi[RIGHT_ARM_JOINTS.index("right_shoulder_roll_joint")] = VISIBLE_V2_SHOULDER_ROLL_MAX
+        globals()["ARM_TARGET_LO"], globals()["ARM_TARGET_HI"] = lo, hi
+
+
+def use_layout_constants(layout: str, version: int = 1) -> None:
+    """Back to this module's defaults, then the layout's (a long-running process, e.g. the onboard
+    runner, switches between policies)."""
+    globals().update({k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in _LAYOUT_BASE.items()})
+    if layout == "visible":
+        use_visible(version)
+    elif version == 2:
+        use_single_v2()
 
 
 def single_version_of(policy_path: str) -> int:
@@ -341,6 +378,20 @@ def build_obs(layout: str, kin: G1Kinematics, st: ReachState, prev_raw: np.ndarr
     """(obs, frames). prev_raw: [7] or [8] previous raw action (zeros at the start)."""
     fr = fr or kin.frames(st.waist_q, st.arm_q)
     ring = np.ones(RING_SECTORS) if st.ring is None else np.asarray(st.ring, float)
+    if layout == "visible":
+        # visible_reach.apple_pos_palm_measured_torso: apple - palm point turned into the torso's yaw
+        # frame; observations.body_quat_relative_to_body: palm relative to the torso
+        yaw = math.atan2(float(fr.torso_R[1, 0]), float(fr.torso_R[0, 0]))
+        parts = [
+            st.arm_q - ARM_DEFAULT,
+            st.arm_dq,
+            rot_z(yaw).T @ (st.apple - fr.palm_ref),
+            palm_quat_obs(fr, 0.0, unyawed=False),
+            np.asarray(prev_raw, float)[:7],
+            ring,
+            [float(st.hand_phase)],
+        ]
+        return np.concatenate([np.asarray(p, float).ravel() for p in parts]).astype(np.float32), fr
     if layout == "single":
         parts = [
             st.arm_q - ARM_DEFAULT,
@@ -744,3 +795,8 @@ class GraspPolicy:
         with self.torch.no_grad():
             x = self.torch.as_tensor(np.asarray(obs, np.float32)).view(1, -1)
             return self.net(x)[0].numpy().astype(float)
+
+
+#: the constants use_single_v2 / use_visible change, as defined above (use_layout_constants restores them)
+_LAYOUT_BASE = {k: (globals()[k].copy() if isinstance(globals()[k], np.ndarray) else globals()[k])
+                for k in set(SINGLE_V2) | {"ARM_TARGET_LO", "ARM_TARGET_HI", "WAIST_DEFAULT"}}
