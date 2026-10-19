@@ -100,10 +100,15 @@ class Envelope:
 
     def __init__(self, shoulder, reach_min, reach_max, az_center_deg, az_span_deg, dz_range,
                  min_forward=0.0, min_horizontal=0.0, workspace=None, apple_ref=False,
-                 stretch_frac=0.0, stretch_cells=1, view=None):
+                 stretch_frac=0.0, stretch_cells=1, view=None, dz_focus=None, dz_focus_prob=0.0):
         if view is not None and not apple_ref:
             raise ValueError("Envelope: a camera view needs apple_ref (the map / box hold apple centres)")
         self.view = view
+        #: dz_focus (lo, hi), shoulder-relative: that share of sample_target draws
+        #: takes its height from this band (AppleReachVisiblePrecise-v1: the hard
+        #: band near shoulder height); None / prob 0 = uniform over dz_range
+        self.dz_focus = None if dz_focus is None else (max(dz_focus[0], dz_range[0]), min(dz_focus[1], dz_range[1]))
+        self.dz_focus_prob = float(dz_focus_prob)
         self.sh = np.asarray(shoulder, float)
         self.rmin, self.rmax = reach_min, reach_max
         self.az = (math.radians(az_center_deg - az_span_deg / 2), math.radians(az_center_deg + az_span_deg / 2))
@@ -153,7 +158,8 @@ class Envelope:
         for attempt in range(1000 if stretch else 500):
             if stretch and attempt == 500:     # nothing beyond the map inside the box: a normal draw
                 stretch = False
-            dz = rng.uniform(*self.dz)
+            dz = rng.uniform(*self.dz_focus) if (self.dz_focus is not None and self.dz_focus_prob > 0.0
+                                                 and rng.random() < self.dz_focus_prob) else rng.uniform(*self.dz)
             rxy_max = math.sqrt(max(self.rmax ** 2 - dz ** 2, 1e-4))
             rxy_min = max(math.sqrt(max(self.rmin ** 2 - dz ** 2, 0.0)), self.hor)
             if rxy_min >= rxy_max:

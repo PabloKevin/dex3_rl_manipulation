@@ -684,6 +684,21 @@ for _id, _env in (("AppleReachVisible-v2", AppleReachVisibleV2EnvCfg),
         disable_env_checker=True,
     )
 
+# "v1.5": the visible reach, sharper at the goal (apple_reach_visible_precise_env_cfg.py)
+
+from .apple_reach_visible_precise_env_cfg import (
+    AppleReachVisiblePreciseEnvCfg, AppleReachVisiblePreciseEnvCfg_PLAY, AppleReachVisiblePrecisePPORunnerCfg,
+)
+
+for _id, _env in (("AppleReachVisiblePrecise-v1", AppleReachVisiblePreciseEnvCfg),
+                  ("AppleReachVisiblePrecise-Play-v1", AppleReachVisiblePreciseEnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleReachVisiblePrecisePPORunnerCfg},
+        disable_env_checker=True,
+    )
+
 # tactile grasp behind the visible-apple reach (apple_grasp_visible_env_cfg.py)
 
 from .apple_grasp_visible_env_cfg import AppleGraspVisibleEnvCfg, AppleGraspVisibleEnvCfg_PLAY
