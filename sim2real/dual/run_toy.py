@@ -35,6 +35,9 @@ Own options (everything else goes to the toy):
                       (sim2real/fit_reach_calib.py; on top of --closer_cm)
   --stop_cm X         tree: freeze the arm when the palm surface is X cm from the apple surface (forward
                       kinematics: |apple - palm point| - radius - the palm's 16 mm contact height)
+  --onboard           single: the POLICY phase runs on the Jetson (sim2real/onboard/rl_runner.py, its own
+                      process beside the daemon; dual/onboard_link.py); the rest of the toy stays here.
+                      Needs the runner deployed + started and the policy exported to .npz (onboard_link.py)
 The old toys (sim2real/toy_*.py) still talk to v20 directly and keep working.
 """
 from __future__ import annotations
@@ -78,6 +81,8 @@ HOME_PATHS = HomePaths()
 LAG_GATE = 0.12
 #: s of continuous holding after which the gate lets the command go on
 LAG_GATE_MAX_S = 2.0
+#: --onboard: the policy phase runs on the Jetson (dual/onboard_link.py)
+ONBOARD = False
 
 
 class LagGate:
@@ -493,7 +498,11 @@ class DualToyMixin:
     def policy_loop(self):
         d = self.closer_m()
         self.gate_report("before the policy")
-        out = super().policy_loop()
+        if ONBOARD:
+            from onboard_link import run_policy_onboard
+            out = run_policy_onboard(self)
+        else:
+            out = super().policy_loop()
         self.gate_report("policy")
         o = str(out[0])
         if "Ctrl-C" in o:
@@ -702,6 +711,12 @@ def main():
         import reach_calib
         CALIB = reach_calib.ReachCalib(rest[i + 1])
         del rest[i:i + 2]
+    global ONBOARD
+    if "--onboard" in rest:
+        if kind != "single":
+            sys.exit("--onboard runs the single reach only (single)")
+        ONBOARD = True
+        rest.remove("--onboard")
     stop_cm = 1.0
     if "--stop_cm" in rest:
         i = rest.index("--stop_cm")
