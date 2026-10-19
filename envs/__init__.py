@@ -669,6 +669,21 @@ for _id, _env in (("AppleReachVisible-v1", AppleReachVisibleEnvCfg),
         disable_env_checker=True,
     )
 
+# v1 + camera tracking during the reach, wide starts, command delay, the robot's shoulder-roll
+# limit (apple_reach_visible_v2_env_cfg.py); same layout and log folder as v1 (warm start)
+
+from .apple_reach_visible_v2_env_cfg import AppleReachVisibleV2EnvCfg, AppleReachVisibleV2EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleReachVisibleV2PPORunnerCfg
+
+for _id, _env in (("AppleReachVisible-v2", AppleReachVisibleV2EnvCfg),
+                  ("AppleReachVisible-Play-v2", AppleReachVisibleV2EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleReachVisibleV2PPORunnerCfg},
+        disable_env_checker=True,
+    )
+
 # tactile grasp behind the visible-apple reach (apple_grasp_visible_env_cfg.py)
 
 from .apple_grasp_visible_env_cfg import AppleGraspVisibleEnvCfg, AppleGraspVisibleEnvCfg_PLAY

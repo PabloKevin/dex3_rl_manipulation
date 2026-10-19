@@ -107,7 +107,32 @@ class RateLimitedJointPositionAction(JointPositionAction):
 
         self._prev_target = target_cmd
         self._prev_vel = v_cmd
-        self._processed_actions = target_cmd
+        self._processed_actions = self._delayed(target_cmd, current_pos, needs_reset.squeeze(-1))
+
+    def _delayed(self, target_cmd: torch.Tensor, current_pos: torch.Tensor, starting: torch.Tensor) -> torch.Tensor:
+        """The target the joint PD gets: target_cmd itself, or (cfg.delay_steps_range / hiccup_prob) the one
+        from d policy steps ago (d per episode) and, at random steps, the last delivered one again -- the
+        robot's command path (network, the daemon's zero-order hold, late threads). The limiter above keeps
+        its own undelayed state, as the laptop / onboard limiter does."""
+        lo, hi = self.cfg.delay_steps_range
+        if hi <= 0 and self.cfg.hiccup_prob <= 0.0:
+            return target_cmd
+        if not hasattr(self, "_delay_hist"):
+            self._delay_hist = target_cmd.unsqueeze(0).repeat(hi + 1, 1, 1)
+            self._delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self._delivered = target_cmd.clone()
+        if starting.any():
+            self._delay_hist[:, starting] = current_pos[starting]
+            self._delivered[starting] = current_pos[starting]
+            self._delay_steps[starting] = torch.randint(lo, hi + 1, (int(starting.sum()),), device=self.device)
+        self._delay_hist = torch.roll(self._delay_hist, 1, dims=0)
+        self._delay_hist[0] = target_cmd
+        late = self._delay_hist[self._delay_steps, torch.arange(self.num_envs, device=self.device)]
+        if self.cfg.hiccup_prob > 0.0:
+            keep = (torch.rand(self.num_envs, device=self.device) < self.cfg.hiccup_prob) & ~starting
+            late = torch.where(keep.unsqueeze(-1), self._delivered, late)
+        self._delivered = late
+        return late
 
     def reset(self, env_ids=None) -> None:
         super().reset(env_ids)
@@ -149,3 +174,7 @@ class RateLimitedJointPositionActionCfg(JointPositionActionCfg):
     # distance (v^2 / 2a) overshoots and rings, and the trained arm policies
     # were all trained that way.
     brake_to_target: bool = False
+    #: (min, max) policy steps the joint PD gets the target late, drawn per episode (0, 0 = off)
+    delay_steps_range: tuple[int, int] = (0, 0)
+    #: per step: the PD keeps the last delivered target instead (a late thread / lost packet)
+    hiccup_prob: float = 0.0

@@ -375,6 +375,15 @@ class AppleReachVisiblePPORunnerCfg(AppleReachSingleV2PPORunnerCfg):
 
 
 @configclass
+class AppleReachVisibleV2PPORunnerCfg(AppleReachVisiblePPORunnerCfg):
+    """AppleReachVisible-v2: v1 + camera tracking, wide starts, command delay.
+    Same log folder as v1 (logs/rsl_rl/apple_reach_visible), so it warm-starts
+    from a v1 run with --resume --load_run <v1 run>; tell the runs apart with
+    --run_name v2."""
+    run_name = "v2"
+
+
+@configclass
 class AppleGraspVisiblePPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
     """AppleGraspVisible-v1: the tactile grasp (single v2 layout) behind the
     frozen AppleReachVisible-v1 reach. Own log folder
