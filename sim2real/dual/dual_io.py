@@ -35,6 +35,7 @@ GO_TOPIC = "/apple_picker/go"
 SELECT_TOPIC = "/apple_picker/select_fruit"      # the dashboard's click (torso frame), as the picker uses it
 CLOSER_TOPIC = "/apple_picker/reach_closer"      # {"cm": x} from the dashboard
 STAGE_TOPIC = "/apple_picker/stage_radius"       # {"m": x} from the dashboard (the arm-pose toy's staging radius)
+OFFSET_TOPIC = "/apple_picker/apple_offset"      # {"cm": [x, y, z]} from the dashboard (the arm-pose toy's goal offset)
 HB_HZ = 20.0
 VOICE_DIR = os.path.join(os.path.dirname(HERE), "voice")
 #: speak() key -> WAV in sim2real/voice
@@ -112,6 +113,9 @@ class DualIO(T.PickerIO):
         #: the dashboard's staging radius for the arm-pose toy, m (None = not set there)
         self.stage_radius = None
         self.node.create_subscription(self.String, STAGE_TOPIC, self._on_stage, 10)
+        #: the dashboard's apple goal offset for the arm-pose toy, cm in the torso frame (None = not set there)
+        self.apple_offset_cm = None
+        self.node.create_subscription(self.String, OFFSET_TOPIC, self._on_offset, 10)
         self._tx_lock = threading.Lock()
         self._tx_t = self._main_t = 0.0
         self._tx_last = None                       # the last send_arm arguments (keep-alive repeats them)
@@ -160,6 +164,14 @@ class DualIO(T.PickerIO):
             self.rec.poke()
             if self.brief is not None:
                 self.brief("INFO", f"apple clicked on the dashboard at {np.round(self.click[0], 3).tolist()} (torso)")
+
+    def _on_offset(self, msg):
+        try:
+            v = np.asarray(json.loads(msg.data)["cm"], float).reshape(3)
+            if np.all(np.isfinite(v)):
+                self.apple_offset_cm = v
+        except Exception:
+            pass
 
     def _on_stage(self, msg):
         try:

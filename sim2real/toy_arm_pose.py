@@ -3,7 +3,7 @@
 """
 toy_arm_pose.py -- the point-to-point arm policy (AppleArmPose-v1) on the real robot, steered by the
 waypoints of scripts/play_arm_pose_reach.py: a STAGING point at the apple's height, --stage_radius from
-the torso axis (the dashboard's "stage" field overrides it, 0.15 m by default), then the APPLE (the
+the torso axis (the dashboard's "stage" field overrides it, 0.24 m by default), then the APPLE (the
 grasp pocket on the apple centre), the palm normal along the horizontal torso -> apple line.
 
 Everything else is the single toy's flow (toy_reach_single.ToySingle: home, detection / dashboard click,
@@ -13,7 +13,7 @@ the policy (the policy trained with it). arm_pose_io.py builds the inputs (valid
 Through run_toy.py (kind "pose", dual daemon, --onboard to run the policy step on the Jetson):
   apple_picker/g1_launch.sh toy -- pose --policy logs/rsl_rl/apple_arm_pose/<run>/exported/policy.pt \\
       --speed 0.3 --target detection [--onboard]
-Own options: --stage_radius M (0.15)  --min_stage_back M (0.08)  --apple_offset M (0: the pocket on the
+Own options: --stage_radius M (0.24)  --apple_offset_xyz X Y Z (cm, torso frame; the dashboard's "offset" fields)  --min_stage_back M (0.08)  --apple_offset M (0: the pocket on the
 apple centre; negative = stop short)  --stage_via (fly through the staging point)  --fingers {free,home}
 --waypoint_timeout S (4 / --speed)
 """
@@ -41,6 +41,9 @@ def parse_args():
     p.add_argument("--stage_radius", type=float, default=AP.STAGE_RADIUS)
     p.add_argument("--min_stage_back", type=float, default=AP.MIN_STAGE_BACK)
     p.add_argument("--apple_offset", type=float, default=0.0)
+    p.add_argument("--apple_offset_xyz", type=float, nargs=3, default=(0.0, 0.0, 0.0), metavar=("X", "Y", "Z"),
+                   help="cm, torso frame (x forward, y left, z up): the apple goal moved by this; the dashboard's "
+                        "'offset' fields override it")
     p.add_argument("--stage_via", action="store_true")
     p.add_argument("--fingers", choices=["free", "home"], default="free")
     p.add_argument("--waypoint_timeout", type=float, default=None,
@@ -76,6 +79,11 @@ class ToyArmPose(S.ToySingle):
     def stage_radius_now(self) -> float:
         v = getattr(self.io, "stage_radius", None)
         return float(v) if v is not None else float(self.args.stage_radius)
+
+    def apple_offset_now(self) -> np.ndarray:
+        """cm, torso frame: the dashboard's offset fields, else --apple_offset_xyz."""
+        v = getattr(self.io, "apple_offset_cm", None)
+        return np.asarray(v if v is not None else self.args.apple_offset_xyz, float)
 
     def hand_cup(self):
         if getattr(self.io, "commands", False) and self.args.hand != "keep":
@@ -137,7 +145,12 @@ class ToyArmPose(S.ToySingle):
     # ---------- the plan ----------
     def make_plans(self, fr):
         a = self.args
-        plan, desc = AP.make_plan(fr, self.apple, self.stage_radius_now(), a.min_stage_back, a.apple_offset,
+        # the calibration offset (torso frame) moves the apple goal -- and with it the staging height
+        off = self.apple_offset_now()
+        apple = np.asarray(self.apple, float) + fr.torso_R @ (off / 100.0)
+        if np.any(np.abs(off) > 1e-9):
+            self.say(f"  apple goal offset (torso x forward, y left, z up): {np.round(off, 2).tolist()} cm", C_CYN)
+        plan, desc = AP.make_plan(fr, apple, self.stage_radius_now(), a.min_stage_back, a.apple_offset,
                                   a.stage_via, a.fingers)
         AP.set_stage_advance(plan[0], a.speed)
         back = AP.make_return_plan(plan, AP.home_goal(fr), a.speed)
@@ -327,6 +340,7 @@ class ToyArmPose(S.ToySingle):
         """APPROACH -> GRASP -> RETURN with the policy on the laptop (run_toy --onboard: policy_loop_onboard)."""
         plan, back = self._start_policy()
         out_a, stopped = self.run_goals(plan, "approach")
+        self.fr_at_apple = self.frames(self.io.read())
         out_g = out_b = ""
         if not stopped and out_a.startswith("APPLE") and self.io.estop_why is None:
             out_g = self.grasp_close()
@@ -343,6 +357,7 @@ class ToyArmPose(S.ToySingle):
         from onboard_link import run_policy_onboard
         plan, back = self._start_policy()
         out_a, stopped = run_policy_onboard(self, extra={"goals": [g.to_dict() for g in plan]})
+        self.fr_at_apple = self.frames(self.io.read())
         out_g = out_b = ""
         if not stopped and str(out_a).startswith("APPLE") and self.io.estop_why is None:
             out_g = self.grasp_close()

@@ -39,8 +39,8 @@ N_IN, N_OUT = 35, 7
 #: the goal tracker of the env (track_goal params)
 TRACK = dict(pos_tol=0.02, ang_tol_deg=15.0, finger_tol_deg=25.0, speed_tol=0.08, hold_time=0.2,
              via_pos_tol=0.03, via_ang_tol_deg=25.0)
-#: play_arm_pose_reach.py defaults (stage_radius: the dashboard's field, 0.15 by default on the robot)
-STAGE_RADIUS = 0.15
+#: play_arm_pose_reach.py defaults (stage_radius: the dashboard's field, 0.24 by default on the robot)
+STAGE_RADIUS = 0.24
 MIN_STAGE_BACK = 0.08
 WAYPOINT_TIMEOUT_S = 4.0
 #: the STAGING point is only there to make the approach (or the way back) better: no hold there. The next

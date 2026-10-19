@@ -556,7 +556,8 @@ class DualToyMixin:
             self._said_help = True
         try:
             if getattr(self, "apple_true", None) is not None:
-                fr = self.frames(self.io.read())
+                # where the hand was AT THE APPLE (toy_arm_pose: the policy step ends back home)
+                fr = getattr(self, "fr_at_apple", None) or self.frames(self.io.read())
                 v = self.apple_true - fr.palm_ref
                 gap = float(np.linalg.norm(v)) - self.args.apple_radius
                 n_gap = float(v @ fr.palm_normal) - self.args.apple_radius - R.PALM_TOUCH_HEIGHT
