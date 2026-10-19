@@ -694,3 +694,18 @@ for _id, _env in (("AppleGraspVisible-v2", AppleGraspVisibleV2EnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspVisibleV2PPORunnerCfg},
         disable_env_checker=True,
     )
+
+# point-to-point arm policy: goal pocket + palm normal (+ optional fingers), no tree, no home
+# (apple_arm_pose_env_cfg.py; pose library: scripts/build_arm_pose_library.py)
+
+from .apple_arm_pose_env_cfg import AppleArmPoseEnvCfg, AppleArmPoseEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleArmPosePPORunnerCfg
+
+for _id, _env in (("AppleArmPose-v1", AppleArmPoseEnvCfg),
+                  ("AppleArmPose-Play-v1", AppleArmPoseEnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPosePPORunnerCfg},
+        disable_env_checker=True,
+    )

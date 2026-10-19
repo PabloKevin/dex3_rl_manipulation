@@ -151,7 +151,16 @@ def place_tree_fixed_waist(
         env._camera_view0 = camera_view_yaw0(env, camera)
     ids = torch.as_tensor(env_ids, device=dev, dtype=torch.long)
     lo, hi = (math.radians(a) for a in yaw_range_deg)
+    # a new yaw only with a new tree (place_apple_tree's own test): a retry of
+    # the same apple, or the next apple of the same tree (the harvest bench),
+    # keeps the tree where it is, so the torso keeps its yaw
+    T = getattr(env, "_tree", None)
+    fresh = torch.ones(len(ids), dtype=torch.bool, device=dev)
+    if T is not None and not new_tree_each_reset:
+        for k, i in enumerate(ids.tolist()):
+            fresh[k] = T.trees[i] is None or (bool(T.new_tree[i]) and not bool(T.retry_request[i]))
     yaw = lo + (hi - lo) * torch.rand(len(ids), device=dev)
+    yaw = torch.where(fresh, yaw, env._fixed_waist_yaw[ids])
     env._fixed_waist_yaw[ids] = yaw
     q = yaw.unsqueeze(-1)
     robot.write_joint_state_to_sim(q, torch.zeros_like(q), joint_ids=[env._fw_joint], env_ids=ids)

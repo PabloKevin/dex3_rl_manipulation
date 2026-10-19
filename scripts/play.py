@@ -239,7 +239,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "right_wrist_yaw_joint",
     ]
     _robot = env.unwrapped.scene["robot"]
-    _apple = env.unwrapped.scene["apple"]
+    # robot-only tasks (AppleArmGoal / AppleArmPose) have no apple: the readout uses their goal
+    _apple = env.unwrapped.scene["apple"] if "apple" in env.unwrapped.scene.keys() else None
     _jids = [_robot.data.joint_names.index(n) for n in _ARM_NAMES]
     _palm_bid = _robot.data.body_names.index("right_hand_palm_link")
 
@@ -259,7 +260,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     _probe_palm_axes()
     print("default arm q :", _fmt(_robot.data.default_joint_pos[0, _jids]))
-    print("apple world   :", _fmt(_apple.data.root_pos_w[0]))
+    if _apple is not None:
+        print("apple world   :", _fmt(_apple.data.root_pos_w[0]))
     print("palm  world   :", _fmt(_robot.data.body_pos_w[0, _palm_bid]))
     print("SANITY: apple z - 1.085 (shoulder) should lie in REACH_TARGET_DZ_RANGE")
     print("        from params/env.yaml of the run you are loading.\n")
@@ -285,8 +287,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 _q = _robot.data.joint_pos[0, _jids]
                 _dq = _robot.data.joint_vel[0, _jids]
                 _palm = _robot.data.body_pos_w[0, _palm_bid]
-                _tgt = _apple.data.root_pos_w[0].clone()
-                _tgt[2] -= 0.08
+                if _apple is not None:
+                    _tgt = _apple.data.root_pos_w[0].clone()
+                    _tgt[2] -= 0.08
+                elif hasattr(env.unwrapped, "_arm_pose"):
+                    _tgt = env.unwrapped._arm_pose.target[0].clone()
+                else:
+                    _tgt = _palm.clone()
                 _d = float(torch.norm(_tgt - _palm))
 
                 _Rp = _mfq(_robot.data.body_quat_w[0:1, _palm_bid, :])[0]

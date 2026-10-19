@@ -409,3 +409,21 @@ class AppleGraspSingleV3PPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
     """AppleGraspSingle-v3: grasp only, behind AppleReachSingle-v2. Own log
     folder (logs/rsl_rl/apple_grasp_single_v3)."""
     experiment_name = "apple_grasp_single_v3"
+
+
+@configclass
+class AppleArmPosePPORunnerCfg(AppleArmGoalPPORunnerCfg):
+    """AppleArmPose-v1: point-to-point arm policy (no tree, no home), from
+    scratch. Wider network than the reach (a general "where is the arm able
+    to go without hitting the body" map), 1024 envs x 32 steps. Own log
+    folder (logs/rsl_rl/apple_arm_pose)."""
+    experiment_name = "apple_arm_pose"
+    max_iterations = 4000
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=0.5,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256, 256, 128],
+        critic_hidden_dims=[256, 256, 128],
+        activation="elu",
+    )
