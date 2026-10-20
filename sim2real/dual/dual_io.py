@@ -40,12 +40,20 @@ OFFSET_TOPIC = "/apple_picker/apple_offset"      # {"cm": [x, y, z]} from the da
 HARVEST_CTL_TOPIC = "/apple_picker/harvest_ctl"  # {"cmd": "stop"} from the dashboard's END button (toy_harvest)
 DETECTED_TOPIC = "/fruits_detected_torso"         # the detector's fruit, torso frame, with their picture boxes
 CAMERA_INFO_TOPIC = "/unitree/color/camera_info"  # the head camera's picture size / intrinsics
+COLOR_TOPIC = "/unitree/color/image_raw/compressed/throttled"          # the picture (JPEG), as live_locator reads it
+DEPTH_TOPIC = "/unitree/aligned_depth_to_color/image_raw/throttled"    # the aligned depth (16UC1, mm)
+GRIP_TOPIC = "/apple_picker/grip"                 # {"pct": x} from the dashboard (toy_harvest's grip strength)
 HB_HZ = 20.0
 VOICE_DIR = os.path.join(os.path.dirname(HERE), "voice")
 #: speak() key -> WAV in sim2real/voice
 EXTRA_CLIPS = {"hasta_la_vista": "hasta_la_vista_baby.wav"}
+#: toy_harvest's own lines (user's recordings 2026-10-20: mp3 -> 16 kHz mono 16-bit WAV, silence trimmed)
+RL_CLIPS = ["rl_harvest_start", "rl_scan_right", "rl_scan_left", "rl_apple_found", "rl_aim", "rl_too_far",
+            "rl_grasping", "rl_pulling", "rl_stem_strong", "rl_got_it", "rl_empty", "rl_dropped", "rl_basket",
+            "rl_deposited", "rl_no_more", "rl_done", "rl_end_pressed", "rl_safety"]
+EXTRA_CLIPS.update({k: k + ".wav" for k in RL_CLIPS})
 #: their volume_gain (the picker's clips play at 1.8): the easter egg is quieter
-EXTRA_GAIN = {"hasta_la_vista": 0.9}
+EXTRA_GAIN = {"hasta_la_vista": 0.9, **{k: 0.9 for k in RL_CLIPS}}   # as loud as each other (RMS 0.11-0.15)
 #: v20 grabs the arm with its own stiff hold (HOLD_KP 400 at its latch) when no target came for
 #: QREF_STALE_S = 0.25 s; at the switch back to the stream's kp 100 the arm jumps by the sag
 #: difference. Measured 2026-10-15 (session 15-27-04): 300-1474 ms gaps while the toy computed
@@ -131,6 +139,22 @@ class DualIO(T.PickerIO):
         self.node.create_subscription(self.String, DETECTED_TOPIC, self._on_detected, 10)
         #: the head camera's {"w", "fx", "cx"} once heard (None = not yet)
         self.cam_info = None
+        #: the dashboard's grip strength for toy_harvest, % of the picker's finger kp (None = not set there)
+        self.grip_pct = None
+        self.node.create_subscription(self.String, GRIP_TOPIC, self._on_grip, 10)
+        #: the latest head-camera colour / depth messages (decoded on demand: latest_rgbd)
+        self._img = {"color": None, "depth": None}
+        try:
+            from rclpy.qos import qos_profile_sensor_data
+            from sensor_msgs.msg import CompressedImage, Image
+            self.node.create_subscription(CompressedImage, COLOR_TOPIC,
+                                          lambda m: self._img.__setitem__("color", (time.monotonic(), m)),
+                                          qos_profile_sensor_data)
+            self.node.create_subscription(Image, DEPTH_TOPIC,
+                                          lambda m: self._img.__setitem__("depth", (time.monotonic(), m)),
+                                          qos_profile_sensor_data)
+        except Exception:
+            pass
         try:
             from sensor_msgs.msg import CameraInfo
             self.node.create_subscription(CameraInfo, CAMERA_INFO_TOPIC, self._on_camera_info, 2)
@@ -188,7 +212,10 @@ class DualIO(T.PickerIO):
     def _on_harvest_ctl(self, msg):
         try:
             if json.loads(msg.data).get("cmd") == "stop":
+                first = self.harvest_stop_t is None
                 self.harvest_stop_t = time.monotonic()
+                if first:
+                    self.speak("rl_end_pressed", max_age_s=3.0)
                 if self.brief is not None:
                     self.brief("STOP", "END pressed on the dashboard: the harvest ends after the current step")
         except Exception:
@@ -207,6 +234,30 @@ class DualIO(T.PickerIO):
             self.det_hist.append((t, out))
         except Exception:
             pass
+
+    def _on_grip(self, msg):
+        try:
+            self.grip_pct = float(json.loads(msg.data)["pct"])
+        except Exception:
+            pass
+
+    def latest_rgbd(self, max_age_s=1.0):
+        """(rgb [H, W, 3] uint8, depth [H, W] uint16 mm, age s) of the newest pair, or None."""
+        c, d = self._img.get("color"), self._img.get("depth")
+        if c is None or d is None:
+            return None
+        now = time.monotonic()
+        if now - c[0] > max_age_s or now - d[0] > max_age_s:
+            return None
+        try:
+            import cv2
+            bgr = cv2.imdecode(np.frombuffer(bytes(c[1].data), np.uint8), cv2.IMREAD_COLOR)
+            rgb = bgr[:, :, ::-1].copy()
+            m = d[1]
+            depth = np.frombuffer(bytes(m.data), np.uint16).reshape(m.height, m.width)
+            return rgb, depth, max(now - c[0], now - d[0])
+        except Exception:
+            return None
 
     def _on_camera_info(self, msg):
         try:

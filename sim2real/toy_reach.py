@@ -642,7 +642,7 @@ class PickerIO:
             hs = self.app.right_hand_state
             if hs is not None and len(hs.motor_state) >= 7:
                 hdq = np.array([float(getattr(hs.motor_state[i], "dq", 0.0)) for i in range(7)])
-            if self.args.grasp:
+            if self.args.grasp or getattr(self.args, "want_pads", False):   # toy_harvest's held check too
                 pads = TIO.flat_from_handstate(hs)
         except Exception:
             pass
@@ -1367,6 +1367,7 @@ class Toy:
             io.waist_to(waist_to, len(traj) * R.DT)
         v_stop = 2.0 * a.move_speed + 0.6
         dq_prev, t_prev, acc_hist = None, None, []
+        n_over = 0
         t_next = io.now()
         for q in traj:
             if io.estop_why is not None:
@@ -1378,11 +1379,14 @@ class Toy:
                 return f"{label}: the daemon is in exec_mode '{s.mode}', not qref -- it is not following"
             if check and label:
                 if dq_prev is not None:
-                    acc_hist = (acc_hist + [(s.arm_dq - dq_prev) / max(0.005, s.t - t_prev)])[-3:]
+                    acc_hist = (acc_hist + [(s.arm_dq - dq_prev) / max(getattr(self, "acc_dt_min", 0.005),
+                                                                       s.t - t_prev)])[-3:]
                 dq_prev, t_prev = s.arm_dq.copy(), s.t
                 jv = float(np.max(np.abs(s.arm_dq)))
                 ja = float(np.max(np.abs(np.mean(acc_hist, axis=0)))) if len(acc_hist) == 3 else 0.0
-                if jv > v_stop or ja > a.move_acc_stop:
+                # acc_persist: that many consecutive ticks over the limit (1 = the old single-sample stop)
+                n_over = n_over + 1 if ja > a.move_acc_stop else 0
+                if jv > v_stop or n_over >= getattr(self, "acc_persist", 1):
                     why = (f"joint speed {jv:.2f} rad/s > {v_stop:.2f}" if jv > v_stop else
                            f"joint ACCELERATION {ja:.1f} rad/s^2 > {a.move_acc_stop:.1f}")
                     print(f"{C_RED}  STOP in '{label}': {why} -- holding the arm where it is{C_OFF}", flush=True)

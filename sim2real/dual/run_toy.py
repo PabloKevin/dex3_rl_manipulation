@@ -31,6 +31,7 @@ imported unchanged; three of their pieces are swapped here:
 Own options (everything else goes to the toy):
   --verbose           the toy's full output in this terminal (default: only the short log here,
                       the full output in <run>/toy_full.log)
+  --humor             play the humour lines ("Hasta la vista, baby" at Ctrl-C, ...); without it they never play
   --closer_cm X       tell the policy the apple is X cm further along the approach, so it ends
                       X cm closer to the real one (the dashboard's 'closer' field overrides it)
   --strict_envelope   refuse a target outside the policy's training envelope (default: run it,
@@ -81,6 +82,8 @@ CLOSER_CM = 0.0
 CALIB = None
 #: s of the stiffness ramp kp 100 -> v20's 400 before "bye" (see DualToyMixin.handover_to_hold)
 HANDOVER_S = 1.0
+#: --humor: the humour lines play ("Hasta la vista, baby" at Ctrl-C, ...); without it they never do (user 2026-10-20)
+HUMOR = False
 #: s the arm is held while the hand opens at the end of a run (open_hand_at_end)
 HAND_OPEN_END_S = 1.0
 #: rad: corner rounding of the scripted joint paths (smooth_joint_path_traj)
@@ -363,7 +366,7 @@ class DualToyMixin:
     #   got_it / missed_it "I missed that one, let me try again"       REACHED / time limit
     #   need_help "I need help, please check my arm"                   any stop or error
     #   finish_my_work "I have finished my work here"                  back home, run over
-    #   hasta_la_vista "Hasta la vista, baby" (sim2real/voice)         Ctrl-C, before the run ends
+    #   hasta_la_vista "Hasta la vista, baby" (sim2real/voice)         Ctrl-C, before the run ends (--humor only)
     def hasta_la_vista(self):
         """Easter egg, not a function of the run. Ctrl-C: the arm is lowered by the daemon's RESET
         (kp 0, light kd) and the clip plays from its own thread so that it ENDS as the arm settles,
@@ -385,7 +388,8 @@ class DualToyMixin:
             def run():
                 time.sleep(max(0.0, lower_s - clip_s() - 0.2))
                 self.voice("hasta_la_vista", priority=True, max_age_s=0.0)
-            threading.Thread(target=run, daemon=True, name="hasta_la_vista").start()
+            if HUMOR:                                 # a humour line: only with --humor (the lowering always)
+                threading.Thread(target=run, daemon=True, name="hasta_la_vista").start()
             self.brief("INFO", f"Ctrl-C: lowering the arm ({lower_s:g} s)", fold_s=0.0)
         try:
             io.lower_arm(on_descent=say_it)
@@ -780,6 +784,10 @@ def _main():
     if "--verbose" in rest:
         VERBOSE = True
         rest.remove("--verbose")
+    global HUMOR
+    if "--humor" in rest:
+        HUMOR = True
+        rest.remove("--humor")
     global CLOSER_CM
     if "--closer_cm" in rest:
         i = rest.index("--closer_cm")

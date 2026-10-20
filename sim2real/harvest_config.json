@@ -16,7 +16,10 @@
  },
  "moves": {
   "speed_rad_s": 0.6,
-  "_help": "peak joint speed of the scripted moves (HOME <-> READY)"
+  "_help": "peak joint speed of the scripted moves (HOME <-> READY, HOME <-> DEPOSIT START); their safety stop on the MEASURED joint acceleration: over acc_stop_rad_s2 for acc_persist consecutive ticks, each estimated over at least acc_dt_min_s (robot 2026-10-20: one 12.4 rad/s^2 sample, the old limit 12, stopped a 0.7 rad/s^2 move with nothing wrong seen; a falling or struck arm is ~30 and lasts)",
+  "acc_stop_rad_s2": 20.0,
+  "acc_persist": 3,
+  "acc_dt_min_s": 0.015
  },
  "detach": {
   "pull_m": 0.08,
@@ -63,7 +66,17 @@
   "strong_n": 1.0,
   "empty_n": 0.1,
   "travel_min": 0.15,
-  "travel_empty": 0.85,
-  "_help": "IS THE APPLE IN THE HAND (after the detach, and again back at HOME before the deposit): the calibrated pads (logs/sim2real/tactile_calib.json: thumb / index / middle forces, N, over a baseline taken right before the close) say HELD when at least 2 fingers press >= held_n or one >= strong_n, EMPTY when every finger < empty_n; otherwise, or with no usable pads (no data, or no noise at all: a fake hand), the fingers' travel decides (held between travel_min and travel_empty of the commanded close). EMPTY: the hand opens, no deposit, the next apple / the scan. Every check is logged with its numbers -- tune these from a run with and without an apple."
+  "travel_empty": 0.6,
+  "_help": "IS THE APPLE IN THE HAND, after the detach: (1) the calibrated pads (logs/sim2real/tactile_calib.json: thumb / index / middle forces over a baseline taken right before the close) decide when clear -- HELD: at least 2 fingers >= held_n or one >= strong_n; EMPTY: every finger < empty_n -- and then nothing else is checked (and the pads check again at home before the deposit). (2) Not clear (or no usable pads): when the arm is back at READY, the hand is in the head camera's picture: a detector red_apple whose BOX covers the grasp pocket's pixel (FK + the detector's camera calibration, +- vision_px) and whose centre is within vision_m of the pocket, over vision_s = HELD, none = EMPTY (robot 2026-10-20 recordings: held -> a red_apple box at the hand; empty -> none). (3) No detector messages at all: the fingers' travel (held between travel_min and travel_empty; robot 2026-10-20 from the camera-labelled grasps: held 50-54 %, empty 65-78 % -> 0.60). EMPTY: the hand opens, no deposit, the next apple / the scan. Robot 2026-10-20: the pads were never read (toy_harvest did not ask for them) -- fixed; their thresholds are a first guess, tune from the logged forces.",
+  "vision_s": 0.6,
+  "vision_m": 0.05,
+  "vision_px": 10
+ },
+ "reactive": {
+  "block_far_m": 0.05,
+  "block_n": 1.0,
+  "block_lead_rad": 0.12,
+  "block_s": 0.4,
+  "_help": "REACTIVE FALLBACK during the APPROACH (onboard): BLOCKED when, with the palm still more than block_far_m from the apple's surface, a pad presses >= block_n, or the arm lags its command beyond its gravity sag by >= block_lead_rad on a shoulder / elbow joint for block_s (real approaches 2026-10-19/20: at most 0.072 rad: the motion's own lag). The approach stops, the arm backs off; the next try comes from the side (the trunk check's free side, else one side then the other). A detach that stalls (a trunk in the hand does not come off) counts as blocked too. Thresholds not yet seen on a real trunk contact: logged."
  }
 }
