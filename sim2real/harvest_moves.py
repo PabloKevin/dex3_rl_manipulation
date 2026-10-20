@@ -35,7 +35,7 @@ DEFAULTS = {
     "deposit_start_q": [0.02, -1.11, 0.41, 0.49, -0.24, -0.26, 0.47],
     "left_scan_q": [0.19, 0.52, 0.29, 0.68, 0.14, 0.01, -0.01],
     "grasp_check": {"baseline_s": 0.3, "read_s": 0.3, "held_n": 0.3, "empty_n": 0.1, "settle_s": 0.5,
-                    "travel_min": 0.15, "travel_empty": 0.64, "vision_s": 0.6, "vision_m": 0.05, "vision_px": 10},
+                    "travel_min": 0.15, "travel_empty": 0.60, "vision_s": 0.6, "vision_m": 0.05, "vision_px": 10},
     "reactive": {"block_far_m": 0.05, "block_n": 2.0, "block_lead_rad": 0.12, "block_s": 0.4},
     "basket": {"from_shoulder_m": [0.0, -0.522, -0.049], "waist_range_deg": [-15.0, 0.0], "max_reach_m": 0.50,
                "accept_m": 0.06, "exclude_radius_m": 0.30},

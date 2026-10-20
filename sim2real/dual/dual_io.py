@@ -417,8 +417,11 @@ class DualIO(T.PickerIO):
             sys.exit("no rt/lowstate -- check the cable / network (student_setup/LOCAL_SETUP_this_laptop.md)")
         if not self.shadow:
             self.app.start()
-            self.set_rl_thumb(np.radians(float(getattr(self.args, "thumb_deg", 0.0) or 0.0)),
-                              kp=getattr(self.args, "thumb_kp", None))
+            th_deg = getattr(self.args, "thumb_deg", None)
+            th_kp = getattr(self.args, "thumb_kp", None)
+            if (th_deg is not None and abs(float(th_deg) - 30.0) > 0.01) or th_kp is not None:
+                # only when asked: at the picker's 30 deg and gain the hand stays exactly the picker's
+                self.set_rl_thumb(np.radians(float(30.0 if th_deg is None else th_deg)), kp=th_kp)
             if self.args.hand != "keep":
                 self.node._set_hand_output_enabled(True, reason="rl_toy_dual")
                 self.node._startup_force_open_hands()
