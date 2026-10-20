@@ -33,11 +33,14 @@ DEFAULTS = {
     "home_q": [0.3, -0.6, 0.8, 1.0, 0.0, 0.0, 0.0],
     "ready_q": None,
     "home_ready_via": [0.07, -0.78, 0.53, 0.95, 0.0, 0.0, 0.0],
-    "basket": {"from_shoulder_m": [0.0, -0.522, -0.049], "waist_deg": -15.0, "max_reach_m": 0.50, "accept_m": 0.06},
+    "basket": {"from_shoulder_m": [0.0, -0.522, -0.049], "waist_range_deg": [-30.0, 0.0], "max_reach_m": 0.50,
+               "accept_m": 0.06, "exclude_radius_m": 0.30},
     "moves": {"speed_rad_s": 0.6},
     "detach": {"pull_m": 0.08, "pull_speed_m_s": 0.03, "kp": 250.0, "kd": 14.0, "tau_cap_nm": 18.0,
                "stall_s": 4.0, "snap_dq": 0.6, "speed_stop": 3.0},
-    "view": {"edge_frac": 0.12, "margin_px": 3, "image_w": 424, "fx": 303.1, "cx": 215.8},
+    "view": {"edge_frac": 0.12, "margin_px": 3, "image_w": 424, "fx": 303.1, "cx": 215.8, "labels": ["red_apple"]},
+    "waist": {"lock_window_s": 0.3, "lock_range_deg": 0.3, "lock_tol_deg": 1.0, "lock_timeout_s": 1.5},
+    "reach": {"map": "reach_map.npz", "palm_turn_cost_deg": 15.0, "waist_turn_cost_deg": 10.0},
 }
 
 
@@ -217,17 +220,16 @@ def main():
           f"at {cfg['moves']['speed_rad_s']:g} rad/s")
     b = cfg["basket"]
     B = basket_point(kin, cfg)
-    w3 = np.array([math.radians(float(b["waist_deg"])), 0.0, 0.0])
-    drop, u, _, short = basket_drop(kin, cfg, w3)
     fr0 = kin.frames([0, 0, 0], cfg["home_q"])
     print(f"basket point (pelvis) {np.round(B, 3).tolist()}: {np.round(fr0.torso_R.T @ (B - fr0.torso_pos), 3).tolist()} "
-          f"from the torso at waist 0")
-    fr = kin.frames(w3, cfg["home_q"])
-    rel = fr.torso_R.T @ (drop - fr.shoulder_pos)
-    print(f"  deposit at waist {float(b['waist_deg']):+.0f} deg: the drop point {short * 100:.1f} cm short of it "
-          f"(max reach {float(b['max_reach_m']):.2f} m), from the shoulder (torso frame) {np.round(rel, 3).tolist()}, "
-          f"azimuth {math.degrees(math.atan2(rel[1], rel[0])):+.0f} deg (the policy's task region: within 75 deg of "
-          f"forward, >= 0.10 m forward, <= 0.60 m)")
+          f"from the torso at waist 0; deposit at a waist in {b['waist_range_deg']} deg (the nearest)")
+    for wd in b["waist_range_deg"]:
+        w3 = np.array([math.radians(float(wd)), 0.0, 0.0])
+        drop, u, _, short = basket_drop(kin, cfg, w3)
+        fr = kin.frames(w3, cfg["home_q"])
+        rel = fr.torso_R.T @ (drop - fr.shoulder_pos)
+        print(f"  waist {float(wd):+.0f} deg: the drop point {short * 100:.1f} cm short of the basket point (max reach "
+              f"{float(b['max_reach_m']):.2f} m), from the shoulder (torso frame) {np.round(rel, 3).tolist()}")
 
 
 if __name__ == "__main__":

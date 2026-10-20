@@ -30,6 +30,11 @@ parser.add_argument("--basket_shoulder", type=float, nargs=3, default=[0.0, -0.5
 parser.add_argument("--max_reach", type=float, default=0.50, help="drop point at most this far from the shoulder")
 parser.add_argument("--stage_radius", type=float, default=0.24)
 parser.add_argument("--reps", type=int, default=3)
+parser.add_argument("--palm", choices=["horizontal", "down"], default="horizontal",
+                    help="the drop's palm normal: along the torso -> basket line, or the ground")
+parser.add_argument("--fingers", choices=["free", "arm"], default="free",
+                    help="arm: the fingers along the arm (horizontal shoulder -> drop line), counted by the policy")
+parser.add_argument("--no_staging", action="store_true", help="READY -> the basket directly (and back)")
 parser.add_argument("--speed", type=float, default=0.3)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -119,8 +124,19 @@ def main():
     stage = tp + args.stage_radius * u
     stage[:, 2] = drop[:, 2]
     finger_now = ready_g[2]
-    chain = [("staging", (stage, u, finger_now), False, True), ("basket", (drop, u, finger_now), False, False),
-             ("staging back", (stage, u, finger_now), False, True), ("ready", ready_g, True, False)]
+    up = quat_apply(tq, torch.tensor([0.0, 0.0, 1.0], device=dev).expand(N, 3))
+    n_drop = -up if args.palm == "down" else u
+    f_drop = finger_now
+    if args.fingers == "arm":
+        f_drop = drop - sh
+        f_drop = f_drop - (f_drop * up).sum(-1, keepdim=True) * up
+        f_drop = f_drop / f_drop.norm(dim=-1, keepdim=True)
+    f_on = args.fingers == "arm"
+    if args.no_staging:
+        chain = [("basket", (drop, n_drop, f_drop), f_on, False), ("ready", ready_g, True, False)]
+    else:
+        chain = [("staging", (stage, n_drop, f_drop), f_on, True), ("basket", (drop, n_drop, f_drop), f_on, False),
+                 ("staging back", (stage, n_drop, f_drop), f_on, True), ("ready", ready_g, True, False)]
 
     def set_goal(ids, G, f_on):
         P.target[ids], P.normal[ids], P.finger[ids] = G[0][ids], G[1][ids], G[2][ids]
@@ -184,7 +200,7 @@ def main():
             break
     short = (B - drop)[:, :2].norm(dim=-1) * 100
     rows = []
-    lines = [f"[basket waist] speed {args.speed}, {timeout:.1f} s per leg (staging: advance at 5 cm / 30 deg or "
+    lines = [f"[basket waist] palm {args.palm}, fingers {args.fingers}, {'no staging' if args.no_staging else 'staging'}; speed {args.speed}, {timeout:.1f} s per leg (staging: advance at 5 cm / 30 deg or "
              f"{adv_s:.1f} s), drop within {args.max_reach} m of the shoulder"]
     for yi, y in enumerate(args.yaws):
         sel = slice(yi * args.reps, (yi + 1) * args.reps)
@@ -203,6 +219,7 @@ def main():
                      f" | overlap {row['overlap']}/{args.reps} <3cm {row['near']}/{args.reps} | hand highest "
                      f"{row['top_vs_shoulder_cm']:+.0f} cm vs shoulder, farthest {row['max_radius_m']:.2f} m from the axis")
     out = os.path.join(REPO, "logs", "sim2real", "basket_waist_eval.json")
+    out = out.replace(".json", f"_{args.palm}_{args.fingers}{'_direct' if args.no_staging else ''}.json")
     json.dump({"policy": args.policy, "speed": args.speed, "rows": rows, "lines": lines}, open(out, "w"), indent=1)
     print("\n".join(lines), flush=True)
     env.close()

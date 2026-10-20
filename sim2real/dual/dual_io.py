@@ -12,6 +12,7 @@ changes:
 """
 from __future__ import annotations
 
+import collections
 import dataclasses
 import json
 import os
@@ -125,6 +126,8 @@ class DualIO(T.PickerIO):
         #: the detector's last boxes (toy_harvest: is the fruit whole in the picture?): (monotonic time,
         #: [(torso-frame xyz, [x1, y1, x2, y2] px)])
         self.det_boxes = (0.0, [])
+        #: the detector's messages of the last ~2 s: [(monotonic t, [(torso xyz, box, class label)])]
+        self.det_hist = collections.deque(maxlen=40)
         self.node.create_subscription(self.String, DETECTED_TOPIC, self._on_detected, 10)
         #: the head camera's {"w", "fx", "cx"} once heard (None = not yet)
         self.cam_info = None
@@ -197,8 +200,11 @@ class DualIO(T.PickerIO):
             for o in json.loads(msg.data).get("objects", []):
                 c, bb = o.get("cartesian"), o.get("bbox")
                 if c is not None and bb is not None and len(bb) >= 4:
-                    out.append((np.array([float(c["x"]), float(c["y"]), float(c["z"])]), [float(v) for v in bb[:4]]))
-            self.det_boxes = (time.monotonic(), out)
+                    out.append((np.array([float(c["x"]), float(c["y"]), float(c["z"])]), [float(v) for v in bb[:4]],
+                                str(o.get("class_label", ""))))
+            t = time.monotonic()
+            self.det_boxes = (t, [(x, b) for x, b, _ in out])
+            self.det_hist.append((t, out))
         except Exception:
             pass
 

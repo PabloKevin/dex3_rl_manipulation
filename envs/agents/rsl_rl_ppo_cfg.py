@@ -482,3 +482,13 @@ class AppleGraspArmPosePPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
     0.005; no warm start). Own log folder (logs/rsl_rl/apple_grasp_arm_pose)."""
     experiment_name = "apple_grasp_arm_pose"
     max_iterations = 5000
+
+
+@configclass
+class AppleArmPoseV4PPORunnerCfg(AppleArmPoseV2PPORunnerCfg):
+    """AppleArmPose-v4: v2 within the robot's shoulder-roll limit, fine-tuned from the robot's v1 policy
+    (warm start logs/rsl_rl/apple_arm_pose_v4/warmstart_v1/model_0.pt from
+    logs/rsl_rl/apple_arm_pose/2026-10-19_13-31-55/exported/policy.pt, scripts/warmstart_from_jit.py --std 0.15;
+    v2's fine-tune PPO settings). Own log folder (logs/rsl_rl/apple_arm_pose_v4)."""
+    experiment_name = "apple_arm_pose_v4"
+    max_iterations = 1500

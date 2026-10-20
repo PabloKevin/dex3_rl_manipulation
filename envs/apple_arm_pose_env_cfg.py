@@ -349,3 +349,47 @@ class AppleArmPoseV3EnvCfg_PLAY(AppleArmPoseV3EnvCfg):
         self.viewer.eye = (1.6, -1.6, 1.6)
         self.viewer.lookat = (0.0, 0.0, 1.0)
         self.events.draw_goal = EventTerm(func=ap.draw_goal, mode="interval", interval_range_s=(0.0, 0.0))
+
+
+# ─────────────────────────────────────────────
+#  v4: v2 within the robot's shoulder-roll limit (AppleArmPose-v4)
+# ─────────────────────────────────────────────
+# Robot 2026-10-19 (toy_harvest, run 18-06-34): 4 of 7 reaches ended 27-33 cm off with the command pinned at
+# the robot's right shoulder roll limit (+0.0524 rad: the toy / runner clip it there, a screw holding the
+# hand wiring) and then at the elbow / shoulder yaw limits -- v1/v2 trained with the roll up to +0.35 (7% of
+# the library's poses above the robot's limit) and its target clip at +1.49. v4 = v2 (the hold phase) with
+# the roll target clipped at the robot's limit, the posture box there too, and the library without the poses
+# beyond it (scripts/filter_arm_pose_library.py -> envs/assets/arm_pose_library_roll.npz). Same 35 / 7 as
+# v1 (the robot code is unchanged), fine-tuned from the robot's policy (AppleArmPose-v1 run 2026-10-19_13-31-55).
+from .apple_reach_visible_v2_env_cfg import SHOULDER_ROLL_MAX  # noqa: E402
+
+ARM_POSE_ROLL_LIBRARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets",
+                                     "arm_pose_library_roll.npz")
+_ROLL_I = RIGHT_ARM_JOINTS.index("right_shoulder_roll_joint")
+POSTURE_UPPER_V4 = [SHOULDER_ROLL_MAX if i == _ROLL_I else v for i, v in enumerate(POSTURE_UPPER)]
+
+
+@configclass
+class AppleArmPoseV4EnvCfg(AppleArmPoseV2EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        clip = dict(self.actions.right_arm.clip)
+        lo, _ = clip["right_shoulder_roll_joint"]
+        clip["right_shoulder_roll_joint"] = (lo, SHOULDER_ROLL_MAX)
+        self.actions.right_arm.clip = clip
+        self.rewards.posture_box.params["upper"] = POSTURE_UPPER_V4
+        self.events.reset_arm_pose.params["library_file"] = ARM_POSE_ROLL_LIBRARY
+
+
+@configclass
+class AppleArmPoseV4EnvCfg_PLAY(AppleArmPoseV4EnvCfg):
+    """A few envs, the goal drawn (env 0), for watching a policy (play.py)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.viewer.origin_type = "env"
+        self.viewer.env_index = 0
+        self.viewer.eye = (1.3, -1.0, 1.45)
+        self.viewer.lookat = (0.15, -0.15, 1.0)
+        self.events.draw_goal = EventTerm(func=ap.draw_goal, mode="interval", interval_range_s=(0.0, 0.0))

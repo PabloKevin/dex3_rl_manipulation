@@ -781,3 +781,17 @@ for _id, _env in (("AppleGraspArmPose-v1", AppleGraspArmPoseEnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspArmPosePPORunnerCfg},
         disable_env_checker=True,
     )
+
+# v4: v2 within the robot's shoulder-roll limit (+0.0524 rad), fine-tuned from the robot's v1 policy
+
+from .apple_arm_pose_env_cfg import AppleArmPoseV4EnvCfg, AppleArmPoseV4EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleArmPoseV4PPORunnerCfg
+
+for _id, _env in (("AppleArmPose-v4", AppleArmPoseV4EnvCfg),
+                  ("AppleArmPose-Play-v4", AppleArmPoseV4EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPoseV4PPORunnerCfg},
+        disable_env_checker=True,
+    )

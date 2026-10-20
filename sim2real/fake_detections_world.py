@@ -18,6 +18,7 @@ import numpy as np
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--apples", required=True, help="'x,y,z;x,y,z' torso frame at waist 0 [m]")
+ap.add_argument("--green", default="", help="'x,y,z;...' fake GREEN apples (class green_apple), same frame")
 ap.add_argument("--net-if", default="lo")
 ap.add_argument("--hfov_deg", type=float, default=70.0, help="the camera's horizontal view (the D435i at 424 px: 70)")
 ap.add_argument("--image_w", type=float, default=424.0, help="picture width [px] of the boxes (fx from --hfov_deg)")
@@ -61,7 +62,8 @@ threading.Thread(target=_read_yaw, daemon=True).start()
 rclpy.init()
 node = rclpy.create_node("fake_detections_world")
 pub = node.create_publisher(String, "/fruits_detected_torso", 10)
-apples = [np.array([float(v) for v in t.split(",")]) for t in a.apples.split(";")]
+apples = [(np.array([float(v) for v in t.split(",")]), "red_apple") for t in a.apples.split(";")]
+apples += [(np.array([float(v) for v in t.split(",")]), "green_apple") for t in a.green.split(";") if t.strip()]
 threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 print(f"[fake_det_world] {len(apples)} apples fixed in the world, view +-{a.hfov_deg / 2:.0f} deg", flush=True)
 t_end = time.time() + a.duration
@@ -69,7 +71,7 @@ while time.time() < t_end:
     psi = W["yaw"]
     c, s = math.cos(-psi), math.sin(-psi)
     objs = []
-    for p0 in apples:
+    for p0, label in apples:
         p = np.array([c * p0[0] - s * p0[1], s * p0[0] + c * p0[1], p0[2]])     # the torso turned by psi
         bearing = math.degrees(math.atan2(p[1], p[0]))
         ang_r = math.degrees(math.asin(min(1.0, 0.04 / max(np.linalg.norm(p[:2]), 0.05))))
@@ -83,7 +85,7 @@ while time.time() < t_end:
         if x2 - x1 < 4:
             continue
         q = p + np.random.normal(0.0, 0.003, 3)
-        objs.append({"class_label": "red_apple", "confidence": 0.9, "camera": "unitree", "radius_m": 0.04,
+        objs.append({"class_label": label, "confidence": 0.9, "camera": "unitree", "radius_m": 0.04,
                      "stamp_s": time.time(), "cartesian": {"x": float(q[0]), "y": float(q[1]), "z": float(q[2])},
                      "bbox": [int(x1), 100, int(x2), 140]})
     m = String()

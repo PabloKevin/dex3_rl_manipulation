@@ -117,6 +117,33 @@ def fetch_log(remote: str, local_dir: str) -> str:
         return ""
 
 
+#: log copies running in the background (fetch_async): the run does not wait for scp between its steps
+_FETCHES = []
+
+
+def fetch_async(remote: str, local_dir: str, say=None) -> None:
+    """fetch_log in a background thread (robot 2026-10-19: two scp per policy leg held every next step ~1 s;
+    in loopback the robot copy waited out its 5 s timeout). join_fetches() collects them at the end."""
+    def run():
+        got = fetch_log(remote, local_dir)
+        if got and say is not None:
+            try:
+                say("INFO", f"onboard log: {got}", fold_s=0.0)
+            except Exception:
+                pass
+    th = threading.Thread(target=run, daemon=True, name="fetch_log")
+    th.start()
+    _FETCHES.append(th)
+
+
+def join_fetches(timeout_s: float = 20.0) -> None:
+    """Wait (at most timeout_s in all) for the background log copies; the runner's text log too."""
+    t_end = time.monotonic() + timeout_s
+    for th in list(_FETCHES):
+        th.join(max(0.0, t_end - time.monotonic()))
+    _FETCHES.clear()
+
+
 def check_runner(toy, timeout_s: float = 20.0) -> str:
     """Right after the robot connects (before the arm moves): the runner answers and has the policy.
     -> '' or why not. The link is built here, so DDS discovery has the whole home phase too."""
@@ -250,11 +277,9 @@ def run_policy_onboard(toy, extra=None, tick=None):
         say("INFO", f"onboard: {res.get('steps')} steps at {res.get('hz')} Hz, {res.get('late')} late, compute max "
                     f"{res.get('compute_ms_max')} ms", fold_s=0.0)
         if res.get("log"):
-            got = fetch_log(res["log"], toy.log_dir)
-            if got:
-                say("INFO", f"onboard log: {got}", fold_s=0.0)
-    # the runner's own text log (robot /tmp/rl_onboard.log) beside the run's logs, every episode
-    fetch_log(RUNNER_LOG, toy.log_dir)
+            fetch_async(res["log"], toy.log_dir, say)
+    # the runner's own text log (robot /tmp/rl_onboard.log): once, at the end of the run (run_toy.finish)
+    toy._fetch_runner_log = True
     if stopped and "OPERATOR" not in str(outcome):
         toy.halted = outcome
     # 5. the toy takes the arm back from the daemon's hold (same gains) for what follows

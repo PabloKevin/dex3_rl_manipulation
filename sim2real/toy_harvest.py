@@ -6,23 +6,26 @@ toy_harvest.py -- AUTONOMOUS harvest with the arm-pose toy (toy_arm_pose.py) and
 The arm rests at HOME, tucked down by the hip (harvest_config.json home_q: nothing in front of the chest, so
 the waist turns without pushing the apples); the arm-pose policy starts and ends at READY (the old home, in
 front of the belly); HOME <-> READY is a scripted joint move (harvest_moves.py). One GO, then (no clicks):
-  DETECT    the arm at HOME, the waist still: the apples the head camera sees NOW (seen within FRESH_S),
-            reachable (in front of the right shoulder: the arm-pose policy's task region), not harvested or
-            given up yet (a memory of positions fixed to the ground) -> the LOWEST one
-  CENTER    that apple not whole in the picture left-right (its box at the left / right edge, or its centre
-            too near it -- above / below does not count): the waist turns to centre it first, then DETECT
-  APPROACH  HOME -> READY, then the policy: staging -> apple            GRASP  the picker's close
+  DETECT    the arm at HOME, the waist still: the apples the head camera sees NOW (seen within FRESH_S), RED
+            (the detector's class), not by the basket, reachable from some waist yaw of the scan (reach_map.py: a
+            geometric volume of where the pocket can go with which palm heading, sampled once offline -- a
+            table look-up, no IK), not harvested or given up yet -> the LOWEST one
+  AIM       the waist yaw and palm heading to take it from (look-ups: the smallest palm turn + waist turn, the
+            apple whole in the picture left-right there); a turn of the waist first when needed, then DETECT
+  APPROACH  HOME -> READY, then the policy: staging -> apple (the palm turned as AIM chose)
+  GRASP     the picker's close
   DETACH    the hand pulled slowly straight back (stiffer, the pull force capped, the stem's snap caught;
             no safety stop for the snap -- it is expected here)
   RETURN    the policy: the same staging point -> READY; then HOME
-  DEPOSIT   the waist to the basket's yaw (-15 deg), HOME -> READY, the policy: staging -> the basket
-            (fixed to the ground where the right arm points stretched out to the right at waist 0)
+  DEPOSIT   the waist into the basket's yaw range (-30..0 deg, only as far as needed), HOME -> READY, the
+            policy straight to the drop, the palm facing the ground, the fingers along the arm (the basket is
+            fixed to the ground where the right arm points stretched out to the right at waist 0)
   RELEASE   the hand opens; the policy back to READY, HOME, the waist back to where it was; DETECT again
   SCAN      nothing left in view: the waist turns RIGHT (to --right_deg) on a slow quintic; the moment a new
             reachable apple shows, it brakes -- a quintic from the current yaw / speed / acceleration -- to
-            centre the new apples in the view, waits until the waist is still ("locked"), then DETECT. At the
-            right limit with nothing: the same to the LEFT (--left_deg). At the left limit: the waist home
-            (0 deg), the run ends.
+            centre the new apples in the view, waits until the waist is steady, then DETECT. At the right
+            limit with nothing: the same to the LEFT (--left_deg). At the left limit: the waist home (0 deg),
+            the run ends. (The robot smooths the streamed waist between packets: g1_dual dual-2.)
 An apple that fails --max_tries times is skipped. The dashboard's END button ends the run after the current
 step (the waist goes home); STOP / the remote (E-STOP) work as always. Whatever ends the run, the hand opens
 (run_toy.open_hand_at_end). The dashboard's state ring shows these states.
@@ -47,35 +50,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import arm_pose_io as AP  # noqa: E402
 import harvest_moves as HM  # noqa: E402
+import reach_map as RMAP  # noqa: E402
 import toy_arm_pose as TA  # noqa: E402
 
 S, T, R = TA.S, TA.T, TA.R
 C_CYN, C_GRN, C_RED, C_YEL = T.C_CYN, T.C_GRN, T.C_RED, T.C_YEL
 
 #: the dashboard's state ring (status "states"), in the order of one harvest
-HARVEST_STATES = ["DETECT", "CENTER", "APPROACH", "GRASP", "DETACH", "RETURN", "DEPOSIT", "RELEASE", "SCAN"]
+HARVEST_STATES = ["DETECT", "AIM", "APPROACH", "GRASP", "DETACH", "RETURN", "DEPOSIT", "RELEASE", "SCAN"]
 #: an apple is "in view now" when the tracker saw it within this (s; ~10 Hz camera + latency)
 FRESH_S = 0.8
 #: the same apple (ground-fixed memory): within this (m)
 SAME_APPLE_M = 0.06
-#: the waist is "locked" when within LOCK_DEG of its target and slower than LOCK_SPEED_DEG for LOCK_HOLD_S
-LOCK_DEG, LOCK_SPEED_DEG, LOCK_HOLD_S, LOCK_TIMEOUT_S = 0.6, 1.0, 0.5, 5.0
 #: grasp: fingers closed further than this share of their travel = nothing in the hand
 EMPTY_TRAVEL = 0.85
-#: the arm-pose policy's task region (envs/apple_arm_pose_env_cfg.TASK_FILTER), relative to the right shoulder,
-#: torso frame: where its goals were trained
-REACH_FORWARD_MIN, REACH_MAX, REACH_DZ = 0.10, 0.60, (-0.45, 0.30)
-#: and not across the body: at most this far to the LEFT of the right shoulder (loopback 2026-10-19: an apple
-#: 30 cm left of it, with the waist at its +15 deg limit, ended 35 cm away)
-REACH_LEFT_MAX = 0.18
+#: the waist yaws AIM considers (deg step over the scan range)
+AIM_STEP_DEG = 2.0
 #: the hand closes only when the apple waypoint ended this close (real timeouts ended 2.3-4.5 cm off);
 #: further = a missed try, the arm goes home
 GRASP_MAX_ERR = 0.05
 #: a detector box belongs to an apple of the tracker within this (m, torso frame)
 BOX_MATCH_M = 0.06
-#: an apple at the picture's edge: the waist turns to centre it at most this many times, then it is given up
+#: AIM turns the waist for one apple at most this many times (the camera then looks again each time)
 MAX_CENTER = 2
-#: the waist turn that centres an apple must be at least this (deg); less = it cannot be centred (a limit)
+#: a waist turn smaller than this (deg) is not made: the apple is harvested from here
 MIN_CENTER_DEG = 1.5
 #: s over which the stiffness goes back from the detach's to the policy's (the arm kept where it is)
 GAIN_BACK_S = 0.3
@@ -155,7 +153,7 @@ def parse_args():
     print(f"  HARVEST: autonomous (lowest apple first), waist scan {a.right_deg:+.0f} .. {a.left_deg:+.0f} deg at "
           f"{a.scan_speed_deg:g} deg/s; home = the arm tucked {np.round(R.HOME_Q, 2).tolist()}, the policy from READY "
           f"{np.round(a.hcfg['ready_q'], 2).tolist()}; deposit "
-          + ("at home" if a.no_deposit else f"in the basket at waist {float(b['waist_deg']):+.0f} deg "
+          + ("at home" if a.no_deposit else f"in the basket, waist in {b['waist_range_deg']} deg, palm down "
                                             f"({os.path.basename(a.harvest_config)})"))
     return a
 
@@ -165,6 +163,9 @@ class ToyHarvest(TA.ToyArmPose):
         super().__init__(args)
         self.hcfg = args.hcfg
         self.ik = HM.ArmIK(self.kin, self.lo, self.hi)
+        self.rmap = RMAP.ReachMap(os.path.join(HERE, self.hcfg["reach"]["map"]))
+        self.basket_B = HM.basket_point(self.kin, self.hcfg)
+        self._no_box_warned = False
         self.hstate, self.hstate_t = "DETECT", time.monotonic()
         self.memory = []                         # [{"p": pelvis xyz, "tries": n, "done": bool, "centered": n}]
         self.n_picked = self.n_tries = 0
@@ -200,16 +201,25 @@ class ToyHarvest(TA.ToyArmPose):
         v = self.hcfg["view"]
         return float(ci.get("w", v["image_w"])), float(ci.get("fx", v["fx"])), float(ci.get("cx", v["cx"]))
 
+    def _recent_boxes(self):
+        """The detector's boxes of the last FRESH_S: [(torso xyz, [x1, y1, x2, y2], label)], newest first; None
+        when the detector sends no boxes at all (then nothing is filtered by picture or class)."""
+        hist = list(getattr(self.io, "det_hist", []) or [])
+        now = time.monotonic()
+        out = [b for t, bs in reversed(hist) if now - t < FRESH_S for b in bs]
+        return out if (out or any(bs for _, bs in hist)) else None
+
     def in_picture(self, p, r, fr, boxes):
-        """Is the apple at p (pelvis) whole in the head camera's picture left-right? -> (whole, its bearing in
-        the camera [rad, + left], why). The detector's box when one matches, else its sphere projected."""
+        """Is the apple at p (pelvis) whole in the head camera's picture left-right, seen from frames fr? ->
+        (whole, its bearing in the camera [rad, + left], why, label). The detector's newest box when one
+        matches (boxes: _recent_boxes), else its sphere projected (the URDF camera)."""
         v = self.hcfg["view"]
         W, fx, cx = self._camera()
         pt = fr.torso_R.T @ (p - fr.torso_pos)
-        box = None
-        for q_t, bb in boxes:
+        box, label = None, None
+        for q_t, bb, lab in (boxes or []):
             if np.linalg.norm(q_t - pt) < BOX_MATCH_M:
-                box = bb
+                box, label = bb, lab
                 break
         if box is not None:
             x1, x2 = box[0], box[2]
@@ -217,7 +227,7 @@ class ToyHarvest(TA.ToyArmPose):
         else:
             c = fr.camera_R.T @ (p - fr.camera_pos)
             if c[0] <= 0.05:
-                return False, 0.0, "behind the camera"
+                return False, 0.0, "behind the camera", label
             u = cx - fx * c[1] / c[0]
             rp = fx * float(r or self.args.apple_radius) / c[0]
             x1, x2 = u - rp, u + rp
@@ -226,13 +236,44 @@ class ToyHarvest(TA.ToyArmPose):
         bearing = math.atan((cx - uc) / fx)
         m = float(v["margin_px"])
         if x1 < m or x2 > W - m:
-            return False, bearing, f"cut by the {'left' if x1 < m else 'right'} edge ({src} x {x1:.0f}..{x2:.0f} of {W:.0f} px)"
+            return False, bearing, f"cut by the {'left' if x1 < m else 'right'} edge ({src} x {x1:.0f}..{x2:.0f} of {W:.0f} px)", label
         if abs(uc - W / 2) > (W / 2) * (1.0 - float(v["edge_frac"])):
-            return False, bearing, f"its centre near the {'left' if uc < W / 2 else 'right'} edge ({src} x {uc:.0f} of {W:.0f} px)"
-        return True, bearing, src
+            return False, bearing, f"its centre near the {'left' if uc < W / 2 else 'right'} edge ({src} x {uc:.0f} of {W:.0f} px)", label
+        return True, bearing, src, label
 
-    def visible_apples(self):
-        """[{"p": pelvis xyz, "r", "whole", "bearing", "why"}] the camera sees NOW, reachable, not harvested /
+    def headings_here(self, p, fr):
+        """The palm heading offsets (deg) that reach the apple goal p (pelvis) with the waist of frames fr."""
+        return self.rmap.headings_at(fr.torso_R.T @ (np.asarray(p, float) - fr.shoulder_pos))
+
+    def aim(self, p, r, s, whole_now):
+        """Where to harvest the apple at p (pelvis) from: the waist yaw within the scan range and the palm
+        heading turn, both looked up (reach_map, the URDF camera) -- no IK. Cost: palm turn /
+        palm_turn_cost_deg + waist turn / waist_turn_cost_deg; the apple must be whole in the picture there
+        (at the current yaw: the detector's box says so). -> {"w", "h", "turn_deg"} or None (reachable at no yaw)."""
+        a, c = self.args, self.hcfg["reach"]
+        w_now = float(s.waist_q[0])
+        best = None
+        ws = np.radians(np.arange(a.right_deg, a.left_deg + 1e-6, AIM_STEP_DEG))
+        for w in np.concatenate([[w_now], ws]):
+            w3 = np.array([w, s.waist_q[1], s.waist_q[2]])
+            fr = self.kin.frames(w3, R.HOME_Q)
+            hs = self.headings_here(p, fr)
+            if not hs:
+                continue
+            here = abs(w - w_now) < 1e-6
+            whole = whole_now if here else self.in_picture(p, r, fr, None)[0]
+            if not whole:
+                continue
+            cost = abs(hs[0]) / float(c["palm_turn_cost_deg"]) + abs(math.degrees(w - w_now)) / float(c["waist_turn_cost_deg"])
+            if best is None or cost < best[0] - 1e-9:
+                best = (cost, w, hs[0])
+        if best is None:
+            return None
+        return {"w": best[1], "h": best[2], "turn_deg": math.degrees(best[1] - w_now)}
+
+    def visible_apples(self, with_aim=True):
+        """[{"p": pelvis xyz, "r", "whole", "bearing", "why", "aim"}] the camera sees NOW: red (the detector's
+        class), not by the basket, reachable from some waist yaw of the scan (reach_map), not harvested /
         given up."""
         io = self.io
         try:
@@ -242,25 +283,33 @@ class ToyHarvest(TA.ToyArmPose):
         now = time.time()
         s = io.read()
         fr = self.frames(s)
-        t_box, boxes = getattr(io, "det_boxes", (0.0, []))
-        boxes = boxes if time.monotonic() - t_box < FRESH_S else []
+        boxes = self._recent_boxes()
+        if boxes is None and not self._no_box_warned:
+            self._no_box_warned = True
+            self.brief("WARN", "the detector sends no picture boxes: no class (red) and no whole-in-picture check")
+        labels = set(self.hcfg["view"].get("labels") or [])
+        excl = float(self.hcfg["basket"].get("exclude_radius_m", 0.0))
         out = []
         seen = list(snap.seen_stamps) + [0.0] * len(snap.apples_all)
         radii = list(snap.radii) + [None] * len(snap.apples_all)
         for i, pt in enumerate(snap.apples_all):
             if now - float(seen[i]) > FRESH_S:
                 continue
-            pt = np.asarray(pt, float)
-            p = fr.torso_R @ pt + fr.torso_pos
-            rel = fr.torso_R.T @ (p - fr.shoulder_pos)
-            if rel[0] < REACH_FORWARD_MIN or np.linalg.norm(rel) > REACH_MAX or not REACH_DZ[0] <= rel[2] <= REACH_DZ[1] \
-                    or rel[1] > REACH_LEFT_MAX:
-                continue
+            p = fr.torso_R @ np.asarray(pt, float) + fr.torso_pos
+            if excl > 0.0 and np.hypot(*(p - self.basket_B)[:2]) < excl:
+                continue                                    # in / by the basket
             m = self._memo(p)
             if m is not None and (m["done"] or m["tries"] >= self.args.max_tries):
                 continue
-            whole, bearing, why = self.in_picture(p, radii[i], fr, boxes)
-            out.append({"p": p, "r": radii[i], "whole": whole, "bearing": bearing, "why": why})
+            whole, bearing, why, label = self.in_picture(p, radii[i], fr, boxes)
+            if boxes is not None and labels and label not in labels:
+                continue                                    # not a red apple (or no box of it now)
+            x = {"p": p, "r": radii[i], "whole": whole, "bearing": bearing, "why": why, "label": label}
+            if with_aim:
+                x["aim"] = self.aim(p, radii[i], s, whole)
+                if x["aim"] is None:
+                    continue                                # out of the arm's reach at every yaw of the scan
+            out.append(x)
         return out
 
     def _memo(self, p, create=False):
@@ -336,21 +385,24 @@ class ToyHarvest(TA.ToyArmPose):
             self.io.sleep_until(t_next)
 
     def waist_lock(self, target):
-        """Hold the waist command at target until the measured waist is there and still."""
+        """Hold the waist command at target until the measured yaw is steady (within lock_range_deg over
+        lock_window_s) and within lock_tol_deg of it, or lock_timeout_s."""
+        L = self.hcfg["waist"]
         q_hold = self.q_sent if self.q_sent is not None else R.HOME_Q
         t0 = time.monotonic()
-        still_since = None
-        while time.monotonic() - t0 < LOCK_TIMEOUT_S:
+        hist = []
+        while time.monotonic() - t0 < float(L["lock_timeout_s"]):
             if self.io.estop_why is not None:
                 return False
             self.io.send_arm(q_hold, waist=target, waist_dq=0.0)
-            w, dw = self.waist_now()
-            ok = abs(math.degrees(w - target)) < LOCK_DEG and abs(math.degrees(dw)) < LOCK_SPEED_DEG
-            still_since = (still_since or time.monotonic()) if ok else None
-            if still_since is not None and time.monotonic() - still_since >= LOCK_HOLD_S:
+            now = time.monotonic()
+            hist = [(t, w) for t, w in hist if now - t <= float(L["lock_window_s"])] + [(now, self.waist_now()[0])]
+            ws = np.degrees([w for _, w in hist])
+            if now - hist[0][0] >= 0.9 * float(L["lock_window_s"]) and np.ptp(ws) <= float(L["lock_range_deg"]) \
+                    and abs(float(ws[-1]) - math.degrees(target)) <= float(L["lock_tol_deg"]):
                 return True
             time.sleep(R.DT)
-        self.brief("WARN", f"waist not locked in {LOCK_TIMEOUT_S:.0f} s (at {math.degrees(self.waist_now()[0]):+.1f}, "
+        self.brief("WARN", f"waist not steady in {float(L['lock_timeout_s']):g} s (at {math.degrees(self.waist_now()[0]):+.1f}, "
                            f"target {math.degrees(target):+.1f} deg): going on")
         return True
 
@@ -370,23 +422,17 @@ class ToyHarvest(TA.ToyArmPose):
             return False
         return self.waist_lock(target)
 
-    def center_on(self, x):
-        """Turn the waist so that apple x sits in the middle of the picture. -> True (turned), False (it
-        cannot be centred: a waist limit, or tried MAX_CENTER times), None (E-STOP)."""
-        a = self.args
+    def aim_turn(self, x):
+        """Turn the waist to the yaw AIM chose for apple x. -> True (turned), None (E-STOP)."""
         m = self._memo(x["p"], create=True)
-        w, _ = self.waist_now()
-        target = float(np.clip(w + x["bearing"], math.radians(a.right_deg), math.radians(a.left_deg)))
-        if m["centered"] >= MAX_CENTER or abs(math.degrees(target - w)) < MIN_CENTER_DEG:
-            self.brief("WARN", f"apple {np.round(x['p'], 3).tolist()} not whole in the picture ({x['why']}) and "
-                               f"it cannot be centred ({'tried ' + str(m['centered']) + 'x' if m['centered'] >= MAX_CENTER else 'the waist limit'}): skipped")
-            self.give_up(x["p"])
-            return False
         m["centered"] += 1
-        self.hset("CENTER", "turning the waist to see the whole apple")
-        self.brief("INFO", f"the lowest apple is not whole in the picture ({x['why']}): the waist turns "
-                           f"{math.degrees(target - w):+.0f} deg to centre it first")
-        return True if self.waist_to(target, "centre the apple") else None
+        ai = x["aim"]
+        why = "not whole in the picture: " + x["why"] if not x["whole"] else \
+            ("out of reach from here" if not self.headings_here(x["p"], self.frames(self.io.read())) else "easier from there")
+        self.hset("AIM", "turning the waist to reach / see the apple")
+        self.brief("INFO", f"apple {np.round(x['p'], 3).tolist()} ({why}): the waist turns {ai['turn_deg']:+.0f} deg, "
+                           f"palm {ai['h']:+.0f} deg from the approach line there")
+        return True if self.waist_to(ai["w"], "aim at the apple") else None
 
     def scan(self):
         """Turn the waist toward the scan side until new apples show, centre them, lock. -> True (apples to
@@ -595,27 +641,42 @@ class ToyHarvest(TA.ToyArmPose):
         return plan, back
 
     # ---- the basket ----
+    def basket_goal(self, s):
+        """The drop: the reachable point over the basket, the palm facing the ground, the fingers along the arm
+        (the horizontal shoulder -> drop line)."""
+        drop, u, B, short = HM.basket_drop(self.kin, self.hcfg, np.asarray(s.waist_q, float))
+        fr = self.frames(s)
+        up = fr.torso_R[:, 2]
+        f = drop - fr.shoulder_pos
+        f = f - np.dot(f, up) * up
+        f /= max(np.linalg.norm(f), 1e-9)
+        return AP.Goal("basket", drop, -up, f, True, False), short
+
     def deposit(self, carrying=True):
-        """From HOME with the apple: the waist to the basket's yaw, READY, the policy to the basket, the hand
-        opens, the policy back to READY, HOME, the waist back. -> (outcome, stopped)"""
+        """From HOME with the apple: the waist into the basket's yaw range (only as far as needed), READY, the
+        policy straight to the drop (palm down), the hand opens, the policy back to READY, HOME, the waist
+        back. -> (outcome, stopped)"""
         io, b = self.io, self.hcfg["basket"]
         w_back = self.waist_now()[0]
-        self.hset("DEPOSIT", f"the waist to {float(b['waist_deg']):+.0f} deg for the basket")
-        if not self.waist_to(math.radians(float(b["waist_deg"])), "the basket"):
+        lo, hi = (math.radians(float(v)) for v in b["waist_range_deg"])
+        w_dep = float(np.clip(w_back, lo, hi))
+        self.hset("DEPOSIT", f"the waist to {math.degrees(w_dep):+.0f} deg for the basket")
+        if abs(w_dep - w_back) > math.radians(0.5) and not self.waist_to(w_dep, "the basket"):
             return f"E-STOP: {io.estop_why}", True
         err = self.to_ready()
         if err:
             return err, True
         s = io.read()
-        drop, u, B, short = HM.basket_drop(self.kin, self.hcfg, np.asarray(s.waist_q, float))
-        plan, back = self._ready_plan(drop, "basket")
-        self.hset("DEPOSIT", "arm-pose policy: staging, then over the basket")
-        self.brief("INFO", f"basket: the drop point {short * 100:.1f} cm short of the basket point (the arm's reach)",
-                   fold_s=0.0)
-        out, stopped = self.legs(plan, "deposit")
+        ready = AP.home_goal(self.frames(s))
+        ready.name = "ready"
+        goal, short = self.basket_goal(s)
+        self.hset("DEPOSIT", "arm-pose policy: over the basket, the palm down")
+        self.brief("INFO", f"basket: the drop point {short * 100:.1f} cm short of the basket point (the arm's reach), "
+                           f"palm down, fingers along the arm", fold_s=0.0)
+        out, stopped = self.legs([goal], "deposit")
         if stopped or io.estop_why is not None:
             return out, True
-        d_end = float(np.linalg.norm(AP.hand_frame(self.frames(io.read()))[0] - drop))
+        d_end = float(np.linalg.norm(AP.hand_frame(self.frames(io.read()))[0] - goal.target))
         if d_end > float(b["accept_m"]):
             self.brief("WARN", f"the hand ended {d_end * 100:.1f} cm from the drop point (> {float(b['accept_m']) * 100:.0f}):"
                                " released there anyway (better than carrying it on)")
@@ -623,19 +684,41 @@ class ToyHarvest(TA.ToyArmPose):
         self.release_at_home()
         self._carrying = False
         self.hset("DEPOSIT", "arm-pose policy: back to ready")
-        out_b, stopped = self.legs(back, "return")
+        out_b, stopped = self.legs([ready], "return")
         if stopped or io.estop_why is not None:
             return out_b, True
         err = self.to_home()
         if err:
             return err, True
-        if not self.waist_to(w_back, "back where the scan was"):
+        if abs(w_dep - w_back) > math.radians(0.5) and not self.waist_to(w_back, "back where the scan was"):
             return f"E-STOP: {io.estop_why}", True
         return "deposited", False
 
     # ---- one apple ----
-    def harvest_one(self, p, r):
-        """APPROACH, GRASP, DETACH, RETURN, DEPOSIT (RELEASE) for the apple at p (pelvis). -> (outcome, stop)"""
+    @staticmethod
+    def turn_plan(plan, back, heading_deg, fr):
+        """The palm normal of the staging and apple goals turned by heading_deg about the torso's vertical (+ =
+        left), the staging point moved onto the turned approach line (as far from the apple as before)."""
+        if abs(heading_deg) < 1e-6:
+            return
+        up = fr.torso_R[:, 2]
+        h = math.radians(heading_deg)
+        n0 = plan[-1].normal
+        n = math.cos(h) * n0 + math.sin(h) * np.cross(up, n0) + (1 - math.cos(h)) * np.dot(up, n0) * up
+        n /= np.linalg.norm(n)
+        goal = plan[-1].target
+        d = plan[0].target - goal
+        d_h = d - np.dot(d, up) * up
+        stage = goal - float(np.linalg.norm(d_h)) * (n - np.dot(n, up) * up) / max(np.linalg.norm(n - np.dot(n, up) * up), 1e-9) \
+            + np.dot(d, up) * up
+        for g in (plan[0], plan[1], back[0]):
+            g.normal = n.copy()
+        plan[0].target = stage.copy()
+        back[0].target = stage.copy()
+
+    def harvest_one(self, p, r, heading=0.0):
+        """APPROACH, GRASP, DETACH, RETURN, DEPOSIT (RELEASE) for the apple at p (pelvis), the palm turned
+        heading deg from the approach rule (reach_map). -> (outcome, stop)"""
         a, io = self.args, self.io
         self.apple = np.asarray(p, float)
         self.apple_true = self.apple.copy()
@@ -653,6 +736,10 @@ class ToyHarvest(TA.ToyArmPose):
         fr = self.frames(s)
         plan, back = self.make_plans(fr)
         back[-1].name = "ready"
+        if heading:
+            self.turn_plan(plan, back, heading, fr)
+            self.brief("INFO", f"palm turned {heading:+.0f} deg from the approach line (reach map: the forward one does "
+                               f"not reach)", fold_s=0.0)
         self.hset("APPROACH", "arm-pose policy: staging, then the apple")
         self.hand_cup()
         out_a, stopped = self.legs(plan, "approach")
@@ -758,14 +845,26 @@ class ToyHarvest(TA.ToyArmPose):
                     break
                 continue
             x = self.lowest(apples)
-            if not x["whole"]:
-                c = self.center_on(x)
-                if c is None:
-                    stopped, why = True, f"E-STOP: {io.estop_why}"
-                    break
-                continue                        # look again (centred, or that apple given up)
-            self.brief("INFO", f"next: apple {np.round(x['p'], 3).tolist()} (pelvis), the lowest of {len(apples)}")
-            out, stop = self.harvest_one(x["p"], x["r"])
+            ai = x["aim"]
+            m = self._memo(x["p"], create=True)
+            if abs(ai["turn_deg"]) >= MIN_CENTER_DEG:
+                if m["centered"] < MAX_CENTER:
+                    c = self.aim_turn(x)
+                    if c is None:
+                        stopped, why = True, f"E-STOP: {io.estop_why}"
+                        break
+                    continue                    # look again from there
+                fr = self.frames(io.read())
+                hs = self.headings_here(x["p"], fr)
+                if not (x["whole"] and hs):
+                    self.brief("WARN", f"apple {np.round(x['p'], 3).tolist()}: still not reachable / whole after "
+                                       f"{m['centered']} waist turns: skipped")
+                    self.give_up(x["p"])
+                    continue
+                ai = {"w": self.waist_now()[0], "h": hs[0], "turn_deg": 0.0}
+            self.brief("INFO", f"next: apple {np.round(x['p'], 3).tolist()} (pelvis), the lowest of {len(apples)}"
+                               + (f", palm {ai['h']:+.0f} deg" if ai["h"] else ""))
+            out, stop = self.harvest_one(x["p"], x["r"], heading=ai["h"])
             self.brief("DONE" if out == "picked" else "WARN", f"apple {self.n_tries}: {out} ({self.n_picked} picked)")
             if stop:
                 stopped, why = True, out

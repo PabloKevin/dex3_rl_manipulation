@@ -721,6 +721,14 @@ class DualToyMixin:
                 self.io.speech_done(8.0)              # ... heard before the process ends
         except Exception:
             pass
+        if ONBOARD:
+            try:                                      # the policy legs' log copies ran in the background
+                import onboard_link as OL
+                if getattr(self, "_fetch_runner_log", False):
+                    OL.fetch_async(OL.RUNNER_LOG, self.log_dir)
+                OL.join_fetches(20.0)
+            except Exception as e:
+                self.brief("WARN", f"onboard log copies: {e}")
         n_keep = getattr(self.io, "n_keep", 0)
         if n_keep:
             self.brief("INFO", f"keep-alive repeated the last arm target {n_keep}x while the toy computed "
