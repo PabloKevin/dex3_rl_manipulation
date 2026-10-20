@@ -150,6 +150,8 @@ def parse_args():
     p.add_argument("--trunk_side", choices=["off", "shadow", "act"], default="act",
                    help="apple beside the trunk (sim2real/trunk_side.py: depth + colour): act = reach from its free side "
                         "(the palm turned up to 60 deg), shadow = only log / save the picture, off")
+    p.add_argument("--max_trunks", type=int, default=3,
+                   help="at most this many trees (trunks) in the scene: per picture and in the trunk map (3 trees now)")
     p.add_argument("--reactive", choices=["off", "on"], default="on",
                    help="stop an approach that pushes on something before the apple (pads / arm lag), back off, retry "
                         "from the side; a stalled detach (a trunk does not come off) also makes the next try a side one")
@@ -219,17 +221,18 @@ class ToyHarvest(TA.ToyArmPose):
                     return speak(key, **kw)
             self.io.speak = harvest_speak
         self._too_far_said, self._too_far_new, self._scan_said = [], False, None
-        self._trunk_pel = None
+        self._trunks, self._trunk_sel = [], (None, "none")
         pub = getattr(self.io, "publish", None)
         if pub is not None:
             def publish(doc, target):        # the dashboard: the harvest's own state ring and counters
-                tr = getattr(self, "_trunk_pel", None)
-                if tr is not None:              # the dashboard's MuJoCo view draws it (torso frame, as the plan)
+                trs = getattr(self, "_trunks", None)
+                if trs:                         # the dashboard's MuJoCo view draws them (torso frame, as the plan)
                     try:
                         fr = self.frames(self.io.read())
                         to_t = lambda q: (fr.torso_R.T @ (np.asarray(q, float) - fr.torso_pos)).round(4).tolist()
-                        doc = dict(doc, trunk={"p0": to_t(tr["p0"]), "p1": to_t(tr["p1"]), "r": round(tr["r"], 4),
-                                               "rel": tr["rel"]})
+                        k_sel, rel = getattr(self, "_trunk_sel", (None, "none"))
+                        doc = dict(doc, trunks=[{"pts": [to_t(q) for q in t["pts"]], "r": round(t["r"], 4),
+                                                 "rel": rel if i == k_sel else ""} for i, t in enumerate(trs)])
                     except Exception:
                         pass
                 doc = dict(doc, state=self.hstate, states=HARVEST_STATES,
@@ -796,7 +799,7 @@ class ToyHarvest(TA.ToyArmPose):
 
     def tactile_verdict(self, when):
         """The calibrated pads alone -> (True held / False empty / None not clear, text). Clear = at least 2 fingers
-        >= held_n or one >= strong_n (held), every finger < empty_n (empty)."""
+        >= held_n (held), every finger < empty_n (empty). Only logged now: the decision is at READY (camera / travel)."""
         G = self.hcfg["grasp_check"]
         io = self.io
         pads = getattr(self, "_pads", None)
@@ -815,7 +818,7 @@ class ToyHarvest(TA.ToyArmPose):
             return None, "no pad readings"
         f = np.mean(F, axis=0)
         txt = f"pads thumb {f[0]:.2f} / index {f[1]:.2f} / middle {f[2]:.2f} N"
-        if int(np.sum(f >= float(G["held_n"]))) >= 2 or float(f.max()) >= float(G["strong_n"]):
+        if int(np.sum(f >= float(G["held_n"]))) >= 2:
             return True, txt
         if float(f.max()) < float(G["empty_n"]):
             return False, txt
@@ -903,10 +906,11 @@ class ToyHarvest(TA.ToyArmPose):
 
     # ---- is the apple beside the trunk? (depth + colour, trunk_side.py) ----
     def trunk_check(self, p, r):
-        """The trunk near apple p (pelvis) as a CYLINDER from the camera's picture + depth (trunk_side.fit_trunk), and
-        the apple's side of it -> (verdict 'left' | 'right' (where the TRUNK is, seen from the robot) | 'none' |
-        'n/a', text). The cylinder is kept (pelvis frame: it stays put when the waist turns) for the dashboard's
-        MuJoCo view; the picture with its outline is saved in the run folder."""
+        """EVERY trunk the head camera shows (trunk_side.detect_trunks: the bark colour first, the depth to place and
+        check, cylinders of 1-2 parts from the floor), merged into the trunks seen so far (pelvis frame: fixed to the
+        ground), then apple p vs its nearest trunk -> (verdict 'left' | 'right' (where the TRUNK is, seen from the
+        robot) | 'none' | 'n/a', text). All of them go to the dashboard's MuJoCo view; the picture with their
+        outlines is saved in the run folder."""
         import trunk_side as TS
         rgbd = self.io.latest_rgbd() if hasattr(self.io, "latest_rgbd") else None
         if rgbd is None:
@@ -916,27 +920,29 @@ class ToyHarvest(TA.ToyArmPose):
         try:
             if getattr(self, "_tproj", None) is None:
                 self._tproj = TS.Projector()
+                self._floor_z = TS.floor_z_pelvis(self.kin)
             s = self.io.read()
             fr = self.frames(s)
-            pt = fr.torso_R.T @ (np.asarray(p, float) - fr.torso_pos)
             hm = TS.hand_mask(self._tproj, TS.hand_points_torso(self.kin, np.asarray(s.waist_q, float),
                                                                  np.asarray(s.arm_q, float)), depth.shape)
-            cyl = TS.fit_trunk(rgb, depth, self._tproj, pt, r, hm)
+            mt = int(getattr(self.args, "max_trunks", 3) or 3)
+            new = TS.detect_trunks(rgb, depth, self._tproj, fr, self._floor_z, hm, max_trunks=mt)
+            self._trunks = TS.merge_trunk_map(getattr(self, "_trunks", []) or [], new, max_trunks=mt)
+            cam = fr.torso_R @ self._tproj.t + fr.torso_pos
+            k, rel, lateral, gap = TS.apple_vs_trunks(self._trunks, np.asarray(p, float), r, cam)
         except Exception as e:
             return "n/a", f"trunk check failed: {e}"
-        if cyl is None:
-            self._trunk_pel = None
-            txt = f"no trunk found near it (picture {age:.2f} s old)"
-            verdict = "none"
+        self._trunk_sel = (k, rel)
+        if k is None:
+            verdict, txt = "none", f"no trunk seen ({len(new)} in this picture)"
         else:
-            to_pel = lambda q: fr.torso_R @ np.asarray(q, float) + fr.torso_pos
-            self._trunk_pel = {"p0": to_pel(cyl["p0"]), "p1": to_pel(cyl["p1"]), "r": cyl["r"], "rel": cyl["apple_rel"]}
-            txt = (f"the apple {cyl['apple_rel'].replace('_', ' ')} (off its axis {cyl['lateral_m'] * 100:+.0f} cm across "
-                   f"the view, surfaces {cyl['gap_m'] * 100:.0f} cm apart; trunk r {cyl['r'] * 100:.1f} cm, "
-                   f"{cyl['n']} points; picture {age:.2f} s old)")
-            verdict = cyl["verdict"]
+            verdict = {"left_of_trunk": "right", "right_of_trunk": "left"}.get(rel, "none")
+            txt = (f"{len(new)} trunk(s) in this picture, {len(self._trunks)} known; the nearest: the apple "
+                   f"{rel.replace('_', ' ')} (off its axis {lateral * 100:+.0f} cm across the view, surfaces "
+                   f"{gap * 100:.0f} cm apart; trunk r {self._trunks[k]['r'] * 100:.1f} cm; picture {age:.2f} s old)")
         try:
-            TS.overlay(rgb, self._tproj, pt, r, cyl, f"{verdict}: {txt}").save(
+            pt = fr.torso_R.T @ (np.asarray(p, float) - fr.torso_pos)
+            TS.draw_trunks(rgb, self._tproj, fr, self._trunks, pt, r, k, f"{verdict}: {txt}").save(
                 os.path.join(self.log_dir, f"trunk_{time.strftime('%H%M%S')}_{verdict}.jpg"), quality=90)
         except Exception:
             pass
@@ -1037,8 +1043,10 @@ class ToyHarvest(TA.ToyArmPose):
         pads = getattr(self, "_watch_pads", None)
         if pads is not None and s.pads is not None and pads.noise is not None and np.any(np.nan_to_num(pads.noise) > 0):
             t9, _, _ = pads.taxels(s.pads)
-            if float(np.max(t9)) >= float(G["block_n"]):
-                why = f"a pad pressed {float(np.max(t9)):.1f} N before the apple"
+            fing = np.array([t9[0] + t9[1], t9[4] + t9[5], t9[2] + t9[3]])       # thumb, index, middle [N]
+            if int(np.sum(fing >= float(G["block_n"]))) >= 2:
+                why = (f"two fingers pressed before the apple (thumb {fing[0]:.1f} / index {fing[1]:.1f} / middle "
+                       f"{fing[2]:.1f} N)")
         q, qc = np.asarray(st["q"], float), np.asarray(st.get("q_cmd", st["q"]), float)
         g = self.kin.gravity_torque(s.waist_q, q)
         lead = float(np.max(np.abs((qc - q) - g / float(self.args.kp))[:4]))
@@ -1288,21 +1296,13 @@ class ToyHarvest(TA.ToyArmPose):
                 self.hset("RELEASE", "the stem held: letting the apple go")
                 self.release_at_home()
             else:
-                v, tact = self.tactile_verdict("after the detach")
-                tv_held, trav = self.travel_verdict()
-                pending = v is None                      # the pads not clear: the camera decides at READY
-                held = True if pending else v
-                detail = f"after the detach: pads {tact}; {trav}"
-                if not pending:
-                    self.say_check("after the detach", held, f"the pads ({tact}; {trav})")
-                    self.record_grasp(snap, held, detail)
-                else:
-                    self.brief("INFO", f"after the detach: the pads do not decide ({tact}; {trav}): the camera "
-                                       f"checks at ready", fold_s=0.0)
-                if not held:
-                    self.brief("WARN", f"nothing in the hand after the detach (try {m['tries']} of {a.max_tries}): "
-                                       f"no deposit")
-                    self.release_at_home()
+                # NOT decided here (robot 2026-10-20: 'held' right after the detach, then the apple fell, or the hand
+                # was empty with the thumb pad reading 30 N): only logged; the check comes at READY, later
+                _, tact = self.tactile_verdict("after the detach")
+                _, trav = self.travel_verdict()
+                detail = f"after the detach: {tact}; {trav}"
+                self.brief("INFO", detail + " (the check comes at ready)", fold_s=0.0)
+                held, pending = True, True
         self._carrying = held
         self.hset("RETURN", "arm-pose policy: back through the staging point to ready")
         # a stem that lets go late (the detach skipped, or pulled without a snap) jerks the arm here: not a stop
@@ -1311,15 +1311,21 @@ class ToyHarvest(TA.ToyArmPose):
         if stopped or io.estop_why is not None:
             return out_b, True
         if held and grasped and pending:
-            # the hand at READY is in the camera's picture: the detector's apple in it, or not
+            # the hand at READY is in the camera's picture: settled, then the detector's apple in it, or not; without
+            # detections the fingers' travel (an empty hand closes further); the pads are only logged (they lie)
             self.hset("RETURN", "showing the hand to the camera: is the apple in it?")
+            G = self.hcfg["grasp_check"]
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < float(G.get("settle_s", 0.5)):
+                self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.1)
             v, how = self.vision_verdict()
+            vt, trav = self.travel_verdict()
+            _, tact = self.tactile_verdict("at ready")
             if v is None:
-                v, trav = self.travel_verdict()
-                how = f"the fingers' travel ({trav}; {how})"
-                v = True if v is None else v
+                v = True if vt is None else vt
+                how = f"the fingers' travel ({trav}; {how}; {tact})"
             else:
-                how = f"the camera ({how})"
+                how = f"the camera ({how}; {trav}; {tact})"
             held = v
             self.say_check("at ready", held, how)
             self.record_grasp(snap, held, detail + f"; at ready: {how}")
@@ -1332,10 +1338,10 @@ class ToyHarvest(TA.ToyArmPose):
         err = self.to_home()
         if err:
             return err, True
-        if held and grasped and not pending:
-            v, tact = self.tactile_verdict("back at home")
+        if held and grasped:
+            v, trav = self.travel_verdict()
             if v is False:
-                self.brief("WARN", f"the apple was lost on the way back ({tact}): no deposit, the next apple")
+                self.brief("WARN", f"the apple was lost on the way home ({trav}): no deposit, the next apple")
                 self.say_rl("rl_dropped")
                 self.release_at_home()
                 self._carrying = False

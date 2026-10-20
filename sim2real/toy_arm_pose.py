@@ -105,17 +105,19 @@ class ToyArmPose(S.ToySingle):
         app = getattr(io, "app", None)
         if not getattr(io, "commands", False) or app is None or self.args.hand == "keep":
             return
-        target = math.radians(THUMB_REST_DEG)
+        rl_q = getattr(io, "rl_thumb_q", None)               # RL mode: the toy's own thumb angle (dual_io.set_rl_thumb)
+        rest_deg = THUMB_REST_DEG if rl_q is None else math.degrees(rl_q)
+        target = math.radians(rest_deg)
         q = io.hand.hand_finger_q("right") if hasattr(io, "hand") else None
         if q is None:
             return
         err0 = math.degrees(float(q[0]) - target)
         if abs(err0) <= THUMB_SKIP_DEG:
-            self._brief("INFO", f"thumb_0 at {math.degrees(float(q[0])):.0f} deg (rest {THUMB_REST_DEG:.0f}): fine")
+            self._brief("INFO", f"thumb_0 at {math.degrees(float(q[0])):.0f} deg (target {rest_deg:.0f}): fine")
             return
         kp0 = list(getattr(app, "hand_kp_vec", None) or [float(getattr(app, "hand_kp", 0.5))] * 7)
         kp = list(kp0)
-        kp[0] = kp0[0] * THUMB_RESEAT_KP_X
+        kp[0] = min(3.0, kp0[0] * THUMB_RESEAT_KP_X)            # capped: the RL run already holds it at 1.5
         app.hand_kp_vec = kp
         t0 = time.monotonic()
         try:
@@ -128,8 +130,9 @@ class ToyArmPose(S.ToySingle):
             app.hand_kp_vec = kp0
         q = io.hand.hand_finger_q("right")
         now = float("nan") if q is None else math.degrees(float(q[0]))
-        self._brief("INFO", f"thumb_0 re-seated: {THUMB_REST_DEG + err0:.0f} -> {now:.0f} deg (rest "
-                            f"{THUMB_REST_DEG:.0f}; its kp x{THUMB_RESEAT_KP_X:g} for {time.monotonic() - t0:.1f} s)")
+        self._brief("INFO" if abs(now - rest_deg) <= THUMB_TOL_DEG else "WARN",
+                    f"thumb_0 re-seated: {rest_deg + err0:.0f} -> {now:.0f} deg (target {rest_deg:.0f}; its kp "
+                    f"{kp[0]:g} for {time.monotonic() - t0:.1f} s, then {kp0[0]:g})")
 
     def at_home(self):
         """run_toy calls it at home, before looking for the fruit."""

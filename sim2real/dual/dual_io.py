@@ -361,6 +361,53 @@ class DualIO(T.PickerIO):
         """The dashboard's old /apple_picker/estop: forwarded to the daemon's RL E-STOP."""
         self._ctl_send({"cmd": "estop", "why": "dashboard STOP (/apple_picker/estop)"})
 
+    # ---------------- the thumb's rotation in RL mode ----------------
+    def set_rl_thumb(self, q, kp=None):
+        """Hold the Dex3 RIGHT thumb_0 (the thumb's rotation) at q [rad] instead of the picker's runtime rest (full_move2
+        HAND_REST_THUMB_DEG 30, forced open AND closed on every frame). Only THIS process's own hand writer (the RL
+        toy's app) is changed -- full_move2 / hand_control and the original test are untouched: the writer takes the
+        rest from app.rh_open_target[0], set here, and the picker's apply_targets() (run at every close) resets it
+        through set_hand_open_targets, wrapped on this app object to set it again. The toy's copy of the pick config
+        gets the same thumb in its open / close targets, so grasp_travel_frac does not count a thumb that is not
+        commanded to move. Callable any time (a grasp policy controlling the thumb later)."""
+        app = self.app
+        self.rl_thumb_q = float(np.clip(float(q), -1.05, 1.05))
+        if kp is not None:                         # thumb_0's own gain (the picker's 0.5 does not beat its friction)
+            v = list(getattr(app, "hand_kp_vec", None) or [float(getattr(app, "hand_kp", 0.5))] * 7)
+            v[0] = float(np.clip(float(kp), 0.1, 3.0))
+            app.hand_kp_vec = v
+        if not getattr(app, "_rl_thumb_wrapped", False) and hasattr(app, "set_hand_open_targets"):
+            orig = app.set_hand_open_targets
+
+            def set_hand_open_targets(*a, **k):
+                out = orig(*a, **k)
+                self._apply_rl_thumb()
+                return out
+            app.set_hand_open_targets = set_hand_open_targets
+            app._rl_thumb_wrapped = True
+        self._apply_rl_thumb()
+
+    def _apply_rl_thumb(self):
+        app, q = self.app, getattr(self, "rl_thumb_q", None)
+        if q is None:
+            return
+        try:
+            with app._target_lock:
+                for name in ("rh_open_target", "rh_close_target", "rh_target"):
+                    v = getattr(app, name, None)
+                    if v is not None:
+                        v[0] = q
+        except Exception as e:
+            print(f"[RL thumb] could not set the thumb: {e}")
+            return
+        pc = getattr(self.hand, "pick_cfg", None)
+        for name in ("hand_open_target_right", "hand_close_target_right"):
+            v = getattr(pc, name, None) if pc is not None else None
+            if v is not None:
+                v = list(v)
+                v[0] = q
+                object.__setattr__(pc, name, tuple(v))
+
     # ---------------- PickerIO overrides ----------------
     def connect(self):
         b = self.brief or (lambda *_a, **_k: None)
@@ -370,6 +417,8 @@ class DualIO(T.PickerIO):
             sys.exit("no rt/lowstate -- check the cable / network (student_setup/LOCAL_SETUP_this_laptop.md)")
         if not self.shadow:
             self.app.start()
+            self.set_rl_thumb(np.radians(float(getattr(self.args, "thumb_deg", 0.0) or 0.0)),
+                              kp=getattr(self.args, "thumb_kp", None))
             if self.args.hand != "keep":
                 self.node._set_hand_output_enabled(True, reason="rl_toy_dual")
                 self.node._startup_force_open_hands()

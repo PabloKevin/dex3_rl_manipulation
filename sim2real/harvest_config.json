@@ -63,20 +63,20 @@
   "baseline_s": 0.3,
   "read_s": 0.3,
   "held_n": 0.3,
-  "strong_n": 1.0,
   "empty_n": 0.1,
   "travel_min": 0.15,
-  "travel_empty": 0.6,
-  "_help": "IS THE APPLE IN THE HAND, after the detach: (1) the calibrated pads (logs/sim2real/tactile_calib.json: thumb / index / middle forces over a baseline taken right before the close) decide when clear -- HELD: at least 2 fingers >= held_n or one >= strong_n; EMPTY: every finger < empty_n -- and then nothing else is checked (and the pads check again at home before the deposit). (2) Not clear (or no usable pads): when the arm is back at READY, the hand is in the head camera's picture: a detector red_apple whose BOX covers the grasp pocket's pixel (FK + the detector's camera calibration, +- vision_px) and whose centre is within vision_m of the pocket, over vision_s = HELD, none = EMPTY (robot 2026-10-20 recordings: held -> a red_apple box at the hand; empty -> none). (3) No detector messages at all: the fingers' travel (held between travel_min and travel_empty; robot 2026-10-20 from the camera-labelled grasps: held 50-54 %, empty 65-78 % -> 0.60). EMPTY: the hand opens, no deposit, the next apple / the scan. Robot 2026-10-20: the pads were never read (toy_harvest did not ask for them) -- fixed; their thresholds are a first guess, tune from the logged forces.",
+  "travel_empty": 0.64,
+  "_help": "IS THE APPLE IN THE HAND: decided once the arm is back at READY after the detach -- not right after it (robot 2026-10-20: 'held' after the detach, then it fell; and an empty hand read 30 N on the thumb pad alone) -- after settle_s: the hand is in the head camera's picture there, a detector red_apple whose BOX covers the grasp pocket's pixel (FK + the detector's camera calibration, +- vision_px) with its centre within vision_m of the pocket, over vision_s = HELD, none = EMPTY (robot 2026-10-20 recordings: held -> a red_apple box at the hand; empty -> none). No detector messages: the fingers' travel decides (held between travel_min and travel_empty; camera-labelled grasps with the thumb at the picker's 30 deg: held 50-54 %, empty 65-88 %; the RL thumb at 0 deg leaves the thumb out of the travel (both targets 0) -> held ~54-58 %, empty ~70 %+ -> 0.64; re-check once the thumb-0 grasps are recorded). Back at home before the deposit the travel checks again (an apple dropped on the way: the fingers close further). The pads are only LOGGED (thumb / index / middle N; HELD by them would need 2 fingers >= held_n, EMPTY all < empty_n): unreliable on this hand. EMPTY: the hand opens, no deposit, the next apple / the scan.",
   "vision_s": 0.6,
   "vision_m": 0.05,
-  "vision_px": 10
+  "vision_px": 10,
+  "settle_s": 0.5
  },
  "reactive": {
   "block_far_m": 0.05,
-  "block_n": 1.0,
+  "block_n": 2.0,
   "block_lead_rad": 0.12,
   "block_s": 0.4,
-  "_help": "REACTIVE FALLBACK during the APPROACH (onboard): BLOCKED when, with the palm still more than block_far_m from the apple's surface, a pad presses >= block_n, or the arm lags its command beyond its gravity sag by >= block_lead_rad on a shoulder / elbow joint for block_s (real approaches 2026-10-19/20: at most 0.072 rad: the motion's own lag). The approach stops, the arm backs off; the next try comes from the side (the trunk check's free side, else one side then the other). A detach that stalls (a trunk in the hand does not come off) counts as blocked too. Thresholds not yet seen on a real trunk contact: logged."
+  "_help": "REACTIVE FALLBACK during the APPROACH (onboard): BLOCKED when, with the palm still more than block_far_m from the apple's surface, TWO fingers' pads press >= block_n each (robot 2026-10-20: a single pad read 1.1-1.6 N on two approaches that were not blocked, and 30 N on an empty hand), or the arm lags its command beyond its gravity sag by >= block_lead_rad on a shoulder / elbow joint for block_s (real approaches 2026-10-19/20: at most 0.072 rad: the motion's own lag). The approach stops, the arm backs off; the next try comes from the side (the trunk check's free side, else one side then the other). A detach that stalls (a trunk in the hand does not come off) counts as blocked too. Thresholds not yet seen on a real trunk contact: logged."
  }
 }

@@ -127,6 +127,14 @@ def parse_args():
     p.add_argument("--waist_limit_deg", type=float, default=45.0)
     p.add_argument("--hand", choices=["cup", "open", "keep"], default="cup",
                    help="cup: the reach pre-shape the policy was trained with (default)")
+    p.add_argument("--thumb_deg", type=float, default=0.0,
+                   help="RL mode (the dual toys) only: the Dex3 right thumb's rotation (thumb_0). 0 = the thumb closes "
+                        "INTO THE GAP between the index and the middle finger (URDF FK: the closed thumb tip 0.3 cm from "
+                        "the gap's centre; the picker's 30 deg puts it 3.1 cm towards the middle finger, on it). The "
+                        "original test keeps its 30 deg")
+    p.add_argument("--thumb_kp", type=float, default=1.5,
+                   help="RL mode only: thumb_0's kp for the whole run (the picker's 0.5 is below its friction: robot logs "
+                        "read it parked anywhere from 17 to 49 deg whatever it was commanded)")
     p.add_argument("--touch", choices=["virtual", "zero"], default="virtual",
                    help="palm force input: the virtual apple's contact (default) or always 0")
     p.add_argument("--kp", type=float, default=R.ARM_KP, help="arm stiffness sent with the targets (sim: 100)")

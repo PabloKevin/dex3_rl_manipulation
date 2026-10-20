@@ -28,6 +28,7 @@ import sys
 import time
 import datetime
 
+import math
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -402,11 +403,581 @@ def evaluate(labels_path=None, per_sheet=12):
     return res
 
 
+
+# ─────────────────────────────────────────────
+#  EVERY TRUNK in the picture: colour first, the depth to filter, 1-2 segment cylinders from the floor
+# ─────────────────────────────────────────────
+# User 2026-10-20: three trunks now; each a vertical cylinder (maybe one part a bit diagonal), from the ground;
+# find them by the bark colour, check by the depth, then fit. Points in the PELVIS frame (fixed to the ground).
+#: bark colour (OpenCV HSV): not green, not grey (S >= 25), not bright (the red apples, the light floor)
+BARK_V = (15, 130)
+#: points kept: depth range from the camera (m), above the floor by (m), up to (m above the floor)
+DEPTH_RANGE = (0.20, 1.60)
+ABOVE_FLOOR, MAX_HEIGHT = 0.03, 1.60
+#: 3D grouping: voxel (m), minimum points / vertical extent (m) of a trunk
+VOXEL, MIN_PTS, MIN_EXTENT = 0.03, 120, 0.18
+#: a trunk leans at most this much (horizontal m per vertical m: 1 = 45 deg)
+MAX_LEAN = 1.0
+#: two pieces are the same trunk when their lines pass within this (m) at the heights they share / between them
+MERGE_M = 0.06
+#: the two-segment fit is used when it lowers the residual by this share and each part has this share of the points
+SPLIT_GAIN, SPLIT_MIN_SHARE = 0.35, 0.25
+
+
+def floor_z_pelvis(kin):
+    """The floor's height in the pelvis frame: the feet's sole (the URDF ankle roll links, the sole ~0.03 m below)."""
+    import reach_io as R
+    kin.frames([0.0, 0.0, 0.0], R.HOME_Q)
+    z = [float(kin.data.oMf[kin.model.getFrameId(l)].translation[2]) for l in ("left_ankle_roll_link", "right_ankle_roll_link")]
+    return min(z) - 0.03
+
+
+def bark_points(rgb, depth_mm, proj, fr, floor_z, mask=None):
+    """Bark-coloured pixels with a valid depth -> pelvis-frame points (and their pixels)."""
+    import cv2
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, s_, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    depth = depth_mm.astype(float) * 0.001
+    bark = ~((h >= GREEN_H[0]) & (h <= GREEN_H[1])) & (s_ >= SAT[0]) & (s_ <= SAT[1]) & (v >= BARK_V[0]) & (v <= BARK_V[1])
+    bark &= (depth > DEPTH_RANGE[0]) & (depth < DEPTH_RANGE[1])
+    if mask is not None:
+        bark &= ~mask
+    vs, us = np.nonzero(bark)
+    if len(us) == 0:
+        return np.zeros((0, 3)), us, vs
+    Pt = _backproject(proj, us.astype(float), vs.astype(float), depth[vs, us])
+    Pp = Pt @ fr.torso_R.T + fr.torso_pos
+    keep = (Pp[:, 2] > floor_z + ABOVE_FLOOR) & (Pp[:, 2] < floor_z + MAX_HEIGHT)
+    return Pp[keep], us[keep], vs[keep]
+
+
+def _components(P):
+    """Connected 3D groups on a voxel grid (26-neighbours) -> list of index arrays."""
+    if len(P) == 0:
+        return []
+    from collections import defaultdict, deque
+    vox = np.floor(P / VOXEL).astype(int)
+    cells = defaultdict(list)
+    for i, k in enumerate(map(tuple, vox)):
+        cells[k].append(i)
+    seen, out = set(), []
+    nb = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1) if (a, b, c) != (0, 0, 0)]
+    for k in cells:
+        if k in seen:
+            continue
+        q, comp = deque([k]), []
+        seen.add(k)
+        while q:
+            c = q.popleft()
+            comp.extend(cells[c])
+            for d in nb:
+                n = (c[0] + d[0], c[1] + d[1], c[2] + d[2])
+                if n in cells and n not in seen:
+                    seen.add(n)
+                    q.append(n)
+        out.append(np.array(comp))
+    return out
+
+
+def _line_xy_of_z(P, w=None):
+    """Least squares x(z), y(z) = a + b z -> (a [2], b [2], rms m)."""
+    z = P[:, 2]
+    A = np.stack([np.ones_like(z), z], axis=1)
+    coef, *_ = np.linalg.lstsq(A, P[:, :2], rcond=None)
+    res = P[:, :2] - A @ coef
+    return coef[0], coef[1], float(np.sqrt((res ** 2).sum(1).mean()))
+
+
+def _robust_line(P, iters=3):
+    keep = np.ones(len(P), bool)
+    for _ in range(iters):
+        a, b, _ = _line_xy_of_z(P[keep])
+        res = np.linalg.norm(P[:, :2] - (a + np.outer(P[:, 2], b)), axis=1)
+        thr = max(0.025, 2.5 * float(np.median(res[keep])))
+        keep = res < thr
+        if keep.sum() < 20:
+            break
+    a, b, rms = _line_xy_of_z(P[keep])
+    return a, b, rms, keep
+
+
+def fit_trunk_polyline(P, cam_pelvis, floor_z):
+    """One trunk's points -> {"pts": [floor, (knee), top] axis points, "r", "n"} or None. x, y as linear functions
+    of the height (a vertical-ish trunk), one line or two joined at a knee, the lean capped, the axis pushed the
+    trunk's radius away from the camera (the points are its front), extended down to the floor."""
+    a, b, rms1, keep = _robust_line(P)
+    Q = P[keep]
+    if len(Q) < MIN_PTS or float(np.ptp(Q[:, 2])) < MIN_EXTENT:
+        return None
+    z0, z1 = float(Q[:, 2].min()), float(Q[:, 2].max())
+    best = None
+    if len(Q) > 2 * MIN_PTS:
+        for zk in np.quantile(Q[:, 2], np.linspace(SPLIT_MIN_SHARE, 1 - SPLIT_MIN_SHARE, 9)):
+            lo, hi = Q[Q[:, 2] <= zk], Q[Q[:, 2] > zk]
+            if len(lo) < 40 or len(hi) < 40:
+                continue
+            al, bl, rl = _line_xy_of_z(lo)
+            ah, bh, rh = _line_xy_of_z(hi)
+            r2 = float(np.sqrt((rl ** 2 * len(lo) + rh ** 2 * len(hi)) / len(Q)))
+            if best is None or r2 < best[0]:
+                best = (r2, zk, (al, bl), (ah, bh))
+    def xy(ab, z):
+        return ab[0] + ab[1] * z
+    if best is not None and best[0] < (1 - SPLIT_GAIN) * rms1:
+        _, zk, lo_ab, hi_ab = best
+        knee = (xy(lo_ab, zk) + xy(hi_ab, zk)) / 2.0
+        segs = [(lo_ab, floor_z, zk), (hi_ab, zk, z1)]
+        pts = [np.r_[xy(lo_ab, floor_z), floor_z], np.r_[knee, zk], np.r_[xy(hi_ab, z1), z1]]
+    else:
+        pts = [np.r_[xy((a, b), floor_z), floor_z], np.r_[xy((a, b), z1), z1]]
+        segs = [((a, b), floor_z, z1)]
+    # the lean: a part more leaning than MAX_LEAN is not a trunk (a branch / a leaf edge)
+    for ab, _, _ in segs:
+        if float(np.linalg.norm(ab[1])) > MAX_LEAN:
+            return None
+    # the radius: the band's half width across the view, at each height
+    mid = np.mean(pts, axis=0)
+    view = mid - cam_pelvis
+    view[2] = 0.0
+    view /= max(np.linalg.norm(view), 1e-9)
+    across = np.array([-view[1], view[0], 0.0])
+    w = []
+    for zc in np.linspace(z0, z1, 8):
+        sl = Q[np.abs(Q[:, 2] - zc) < 0.03]
+        if len(sl) > 15:
+            w.append(0.5 * float(np.ptp(sl @ across)))
+    r = float(np.clip(np.median(w) if w else 0.03, *TRUNK_R))
+    pts = [p + r * view for p in pts]
+    return {"pts": [np.asarray(p, float) for p in pts], "r": r, "n": int(len(Q))}
+
+
+def _seg_dist(p, a, b):
+    ab = b - a
+    t = float(np.clip((p - a) @ ab / max(ab @ ab, 1e-12), 0.0, 1.0))
+    return float(np.linalg.norm(p - (a + t * ab))), a + t * ab
+
+
+def trunk_axis_dist(tr, p):
+    """(distance of p to the trunk's axis polyline, the closest axis point)."""
+    best = (1e9, None)
+    for a, b in zip(tr["pts"][:-1], tr["pts"][1:]):
+        d = _seg_dist(np.asarray(p, float), a, b)
+        if d[0] < best[0]:
+            best = d
+    return best
+
+
+#: the colour mask cleaned with an opening of this size (px): leaf stems / apple rims (thin) drop out, bark bands stay
+OPEN_PX = 7
+#: a band: at least this long (px) and this elongated (length / width), within this angle (deg) of the picture's vertical
+BAND_MIN_LEN, BAND_MIN_ASPECT, BAND_MAX_TILT = 50, 2.5, 50
+#: pieces of one band (leaves in front) are joined when their centre lines pass within this (px)
+BAND_JOIN_PX = 10
+#: the trunk's depth: the median over its band; the band is dropped when the depth is beyond (m)
+TRUNK_MAX_DEPTH = 1.25
+
+
+def _band_line(us, vs):
+    """Robust centre line of a band: u = a + b v (the picture's x as a function of its row) -> (a, b, rms px)."""
+    keep = np.ones(len(us), bool)
+    for _ in range(3):
+        A = np.stack([np.ones(keep.sum()), vs[keep]], axis=1)
+        coef, *_ = np.linalg.lstsq(A, us[keep], rcond=None)
+        res = us - (coef[0] + coef[1] * vs)
+        width = float(np.percentile(np.abs(res[keep]), 90))
+        keep = np.abs(res) < max(3.0, 1.5 * width)
+    A = np.stack([np.ones(keep.sum()), vs[keep]], axis=1)
+    coef, *_ = np.linalg.lstsq(A, us[keep], rcond=None)
+    res = us[keep] - (coef[0] + coef[1] * vs[keep])
+    return float(coef[0]), float(coef[1]), float(np.sqrt((res ** 2).mean())), keep
+
+
+#: a row's bark run counts as a trunk cross-section when this wide (px)
+RUN_W = (5, 80)
+#: a run continues a track when its centre is within this (px, or half the track's width) of the track's, rows apart
+#: at most TRACK_GAP, and its width within TRACK_WRATIO of the track's
+TRACK_GAP, TRACK_WRATIO = 8, 3.0
+
+
+def _runs(row):
+    """(start, end) of the True runs of a 1-D bool array."""
+    d = np.diff(np.r_[0, row.astype(np.int8), 0])
+    return list(zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0] - 1))
+
+
+def detect_trunk_bands(rgb, depth_mm, mask=None):
+    """The trunks as BANDS in the picture (colour first): the bark mask cleaned, then TRACED row by row from the
+    bottom up -- a run of bark of a trunk's width that continues a track's centre and width extends it (a trunk is a
+    long near-vertical band; leaves and stems give short / wide / wandering runs) -- tracks broken by leaves joined
+    when their centre lines agree. -> [{"a", "b" (centre u = a + b v), "v0", "v1", "half_w" px, "depth" m, "n",
+    "two"}], the longest first."""
+    import cv2
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h, s_, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    bark = (~((h >= GREEN_H[0]) & (h <= GREEN_H[1])) & (s_ >= SAT[0]) & (s_ <= SAT[1])
+            & (v >= BARK_V[0]) & (v <= BARK_V[1])).astype(np.uint8)
+    if mask is not None:
+        bark[mask] = 0
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (OPEN_PX, OPEN_PX))
+    bark = cv2.morphologyEx(bark, cv2.MORPH_OPEN, k)
+    bark = cv2.morphologyEx(bark, cv2.MORPH_CLOSE, k).astype(bool)
+    H, W = bark.shape
+    tracks, done = [], []
+    for vrow in range(H - 1, -1, -1):
+        runs = [(float(a0), float(a1)) for a0, a1 in _runs(bark[vrow]) if RUN_W[0] <= a1 - a0 + 1 <= RUN_W[1]]
+        used = set()
+        for tr in tracks:
+            c_pred = tr["c"][-1] + tr["slope"] * (vrow - tr["v"][-1])        # slope = du / dv
+            best = None
+            for j, (a0, a1) in enumerate(runs):
+                if j in used:
+                    continue
+                c, w = 0.5 * (a0 + a1), a1 - a0 + 1
+                if abs(c - c_pred) <= max(6.0, 0.5 * tr["w"][-1]) and 1 / TRACK_WRATIO <= w / tr["w"][-1] <= TRACK_WRATIO:
+                    if best is None or abs(c - c_pred) < best[0]:
+                        best = (abs(c - c_pred), j, c, w)
+            if best is not None:
+                _, j, c, w = best
+                used.add(j)
+                tr["v"].append(vrow); tr["c"].append(c); tr["w"].append(w)
+                if len(tr["v"]) >= 6:                       # the track's own lean (px per row, going up)
+                    tr["slope"] = float(np.polyfit(tr["v"][-12:], tr["c"][-12:], 1)[0])
+        for tr in list(tracks):
+            if tr["v"][-1] - vrow > TRACK_GAP:
+                tracks.remove(tr)
+                done.append(tr)
+        for j, (a0, a1) in enumerate(runs):
+            if j not in used:
+                tracks.append({"v": [vrow], "c": [0.5 * (a0 + a1)], "w": [a1 - a0 + 1], "slope": 0.0})
+    done += tracks
+    pieces = []
+    for tr in done:
+        if len(tr["v"]) < 12:
+            continue
+        vs, cs, ws = np.array(tr["v"], float), np.array(tr["c"], float), np.array(tr["w"], float)
+        bb, aa = np.polyfit(vs, cs, 1)
+        if np.degrees(np.arctan(abs(bb))) > BAND_MAX_TILT:
+            continue
+        pieces.append({"vs": vs, "cs": cs, "ws": ws})
+    # pieces of one trunk (leaves in front): joined when their centre lines agree
+    def line(pc):
+        bb, aa = np.polyfit(pc["vs"], pc["cs"], 1)
+        return aa, bb
+    depth = depth_mm.astype(float) * 0.001
+
+    def _piece_depth(pc):
+        ui = np.clip(np.round(pc["cs"]).astype(int), 0, W - 1)
+        dd = depth[pc["vs"].astype(int), ui]
+        dd = dd[(dd > DEPTH_RANGE[0]) & (dd < DEPTH_RANGE[1])]
+        return float(np.median(dd)) if dd.size else 9.0
+    joined = True
+    while joined:
+        joined = False
+        for i in range(len(pieces)):
+            for j in range(i + 1, len(pieces)):
+                ai, bi = line(pieces[i])
+                aj, bj = line(pieces[j])
+                pi, pj = pieces[i], pieces[j]
+                di = abs((ai + bi * np.median(pj["vs"])) - np.median(pj["cs"]))
+                dj = abs((aj + bj * np.median(pi["vs"])) - np.median(pi["cs"]))
+                wi, wj = np.median(pi["ws"]), np.median(pj["ws"])
+                if max(di, dj) < max(BAND_JOIN_PX, 0.7 * max(wi, wj)) and abs(np.degrees(np.arctan(bi) - np.arctan(bj))) < 20 \
+                        and 0.4 <= wi / wj <= 2.5 and abs(_piece_depth(pi) - _piece_depth(pj)) < 0.15:
+                    pieces[i] = {k2: np.r_[pi[k2], pj[k2]] for k2 in ("vs", "cs", "ws")}
+                    pieces.pop(j)
+                    joined = True
+                    break
+            if joined:
+                break
+    depth = depth_mm.astype(float) * 0.001
+    bands = []
+    for pc in pieces:
+        vs, cs, ws = pc["vs"], pc["cs"], pc["ws"]
+        bb, aa = np.polyfit(vs, cs, 1)
+        v0, v1 = float(vs.min()), float(vs.max())
+        half_w = 0.5 * float(np.median(ws)) / np.sqrt(1 + bb * bb)
+        length = (v1 - v0) * np.sqrt(1 + bb * bb)
+        if length < BAND_MIN_LEN or length / (2 * half_w) < BAND_MIN_ASPECT:
+            continue
+        ui = np.clip(np.round(cs).astype(int), 0, W - 1)
+        dd = depth[vs.astype(int), ui]
+        dd = dd[(dd > DEPTH_RANGE[0]) & (dd < DEPTH_RANGE[1])]
+        if dd.size < 8:
+            continue
+        dz = float(np.median(dd))
+        if dz > TRUNK_MAX_DEPTH:
+            continue
+        band = {"a": float(aa), "b": float(bb), "v0": v0, "v1": v1, "half_w": half_w, "depth": dz, "n": int(len(vs)),
+                "two": None}
+        if len(vs) > 60:                                    # a knee: the lower and upper halves leaning differently
+            vm = float(np.median(vs))
+            lo, hi = vs >= vm, vs < vm
+            bl, al = np.polyfit(vs[lo], cs[lo], 1)
+            bh, ah = np.polyfit(vs[hi], cs[hi], 1)
+            rms1 = float(np.sqrt(np.mean((cs - (aa + bb * vs)) ** 2)))
+            rms2 = float(np.sqrt(np.mean(np.r_[cs[lo] - (al + bl * vs[lo]), cs[hi] - (ah + bh * vs[hi])] ** 2)))
+            if abs(np.degrees(np.arctan(bl) - np.arctan(bh))) > 10 and rms2 < 0.6 * rms1:
+                band["two"] = ((float(al), float(bl)), (float(ah), float(bh)), vm)
+        bands.append(band)
+    bands.sort(key=lambda bd: -bd["n"])
+    return bands
+
+
+#: the band is sampled in bins of this many rows for its depth (the camera looks down: the depth changes along it)
+BIN_ROWS = 8
+
+
+#: at most this many trunks (trees) in the scene: per picture and in the map (user 2026-10-20: three trees now;
+#: toy_harvest --max_trunks)
+MAX_TRUNKS = 3
+
+
+def detect_trunks(rgb, depth_mm, proj, fr, floor_z, mask=None, max_trunks=None):
+    """Every trunk the picture shows -> [{"pts" (axis points, pelvis frame, from the floor up), "r", "n"}]: the
+    bands found by colour (detect_trunk_bands); along each, per BIN_ROWS rows, the median depth of the band's own
+    pixels places its centre in 3D (the depth only places / checks: a bin without depth is skipped), x and y fitted
+    as lines of the height (one, or two at the band's knee), the lean capped, the axis pushed the trunk's radius
+    behind its visible front, extended down to the floor along its lowest part."""
+    max_trunks = MAX_TRUNKS if max_trunks is None else int(max_trunks)
+    depth = depth_mm.astype(float) * 0.001
+    H, W = depth.shape
+    cam = fr.torso_R @ proj.t + fr.torso_pos
+    out = []
+    for bd in detect_trunk_bands(rgb, depth_mm, mask)[:max_trunks + 4]:
+        two = bd["two"]
+        P3, vk = [], (None if two is None else two[2])
+        for v0 in np.arange(bd["v0"], bd["v1"] + 1, BIN_ROWS):
+            vc = v0 + 0.5 * BIN_ROWS
+            ab = (bd["a"], bd["b"]) if two is None else (two[0] if vc >= two[2] else two[1])
+            uc = ab[0] + ab[1] * vc
+            hw = max(2, int(round(bd["half_w"])))
+            ys = np.arange(int(v0), int(min(H, v0 + BIN_ROWS)))
+            xs = np.arange(int(max(0, uc - hw)), int(min(W, uc + hw + 1)))
+            if len(ys) == 0 or len(xs) == 0:
+                continue
+            dd = depth[np.ix_(ys, xs)].ravel()
+            dd = dd[(dd > DEPTH_RANGE[0]) & (dd < DEPTH_RANGE[1])]
+            if dd.size < 6:
+                continue
+            z = float(np.median(dd))
+            p = fr.torso_R @ _backproject(proj, np.array([uc]), np.array([vc]), np.array([z]))[0] + fr.torso_pos
+            P3.append((vc, p))
+        if len(P3) < 4:
+            continue
+        V = np.array([q[0] for q in P3])
+        Q = np.array([q[1] for q in P3])
+        if float(np.median(np.linalg.norm(Q - cam, axis=1))) > TRUNK_MAX_DEPTH + 0.15:
+            continue
+        zq = Q[:, 2]
+        z_lo, z_hi = float(zq.min()), float(zq.max())
+        if z_hi - z_lo < MIN_EXTENT:
+            continue
+        # the TRAINING trunk: vertical from the floor to a kink, then one part leaning <= 15 deg from it
+        base, kink, lean, rms, keep = fit_training_trunk(Q, floor_z)
+        if rms > 0.05 or keep.sum() < 4:                        # does not follow a trunk's axis
+            continue
+        z_hi = float(zq[keep].max())
+        pts = training_trunk_pts(base, kink, lean, floor_z, z_hi)
+        zc_mean = float(np.median(np.linalg.norm(Q - cam, axis=1)))
+        r = float(np.clip(bd["half_w"] * zc_mean / CAM["fx"], *TRUNK_R))
+        view = np.mean(pts, axis=0) - cam
+        view[2] = 0.0
+        view /= max(np.linalg.norm(view), 1e-9)
+        pts = [np.asarray(p, float) + r * view for p in pts]
+        out.append({"pts": pts, "r": r, "n": bd["n"], "depth": zc_mean, "kink_m": float(kink - floor_z),
+                    "lean_deg": float(np.degrees(np.arctan(np.linalg.norm(lean)))), "rms": rms})
+    # one trunk seen as two bands (leaves across it): the same 3D axis -> keep the longer one
+    keep = []
+    for t in out:
+        mid = 0.5 * (t["pts"][1] + t["pts"][-1])
+        if all(trunk_axis_dist(k, mid)[0] > 0.06 for k in keep):
+            keep.append(t)
+    return keep[:max_trunks]                                   # the bands come longest first
+
+
+#: THE TRAINING TRUNK (envs/apple_reach_spindle_env_cfg.SPINDLE, tree_sampler.trunk_axis): vertical from the ground
+#: up to a kink (m above the floor), then ONE straight part from the kink, leaning 3-15 deg in any direction:
+#: axis xy(z) = base + lean * max(z - kink, 0). The real trunks are fitted with exactly this model (user 2026-10-20).
+KINK_RANGE = (0.5, 0.9)
+LEAN_DEG_MAX = 15.0
+#: the kink is searched on this grid (m); an upper part shorter than this (m) over the kink cannot show its lean
+KINK_STEP, LEAN_MIN_SPAN = 0.02, 0.10
+
+
+def fit_training_trunk(Q, floor_z, iters=3):
+    """Trunk centre points Q (pelvis frame, N x 3) -> (base xy [2], kink z (pelvis), lean [2] (dx/dz, dy/dz), rms m,
+    keep mask) with the training model: x, y = base + lean * max(z - kink, 0), the lower part VERTICAL, the kink in
+    KINK_RANGE above the floor, |lean| <= tan(LEAN_DEG_MAX). Points not above the kink by LEAN_MIN_SPAN: a vertical
+    trunk (no lean seen), the kink at the visible top / the range's middle."""
+    Q = np.asarray(Q, float)
+    z = Q[:, 2]
+    lean_max = math.tan(math.radians(LEAN_DEG_MAX))
+    keep = np.ones(len(Q), bool)
+
+    def solve(k, sel):
+        h = np.maximum(z[sel] - k, 0.0)
+        if float(h.max(initial=0.0)) < LEAN_MIN_SPAN:              # nothing seen above the kink: vertical
+            base = np.median(Q[sel, :2], axis=0)
+            lean = np.zeros(2)
+        else:
+            A = np.stack([np.ones_like(h), h], axis=1)
+            coef, *_ = np.linalg.lstsq(A, Q[sel, :2], rcond=None)
+            base, lean = coef[0], coef[1]
+            n = float(np.linalg.norm(lean))
+            if n > lean_max:                                       # capped: the base refitted with the capped lean
+                lean = lean * lean_max / n
+                base = np.mean(Q[sel, :2] - np.outer(h, lean), axis=0)
+        res = np.linalg.norm(Q[:, :2] - (base + np.outer(np.maximum(z - k, 0.0), lean)), axis=1)
+        return base, lean, res
+
+    best = None
+    for _ in range(iters):
+        best = None
+        for kf in np.arange(KINK_RANGE[0], KINK_RANGE[1] + 1e-9, KINK_STEP):
+            k = floor_z + float(kf)
+            base, lean, res = solve(k, keep)
+            rms = float(np.sqrt(np.mean(res[keep] ** 2)))
+            if best is None or rms < best[3] - 1e-4:
+                best = (base, k, lean, rms, res)
+        base, k, lean, rms, res = best
+        thr = max(0.025, 2.5 * float(np.median(res[keep])))
+        new = res < thr
+        if new.sum() < 4 or np.array_equal(new, keep):
+            break
+        keep = new
+    base, k, lean, rms, res = best
+    if not np.any(lean):                                           # no lean seen: the kink where the view ends
+        k = float(np.clip(z[keep].max(), floor_z + KINK_RANGE[0], floor_z + KINK_RANGE[1]))
+    return np.asarray(base, float), float(k), np.asarray(lean, float), rms, keep
+
+
+def training_trunk_pts(base, kink, lean, floor_z, z_top):
+    """The axis polyline of a training-model trunk: the floor, the kink, the top (the kink only when above it)."""
+    pts = [np.r_[base, floor_z]]
+    if z_top > kink + 1e-3:
+        pts += [np.r_[base, kink], np.r_[base + lean * (z_top - kink), z_top]]
+    else:
+        pts += [np.r_[base, max(z_top, floor_z + 0.05)]]
+    return [np.asarray(p, float) for p in pts]
+
+
+def apple_vs_trunks(trunks, apple_pelvis, r_apple, cam_pelvis):
+    """The nearest trunk to the apple and the apple's side of it (seen from the robot) -> (index or None,
+    'front' | 'left_of_trunk' | 'right_of_trunk' | 'far' | 'none', lateral m, gap m)."""
+    if not trunks:
+        return None, "none", 0.0, 0.0
+    A = np.asarray(apple_pelvis, float)
+    ds = [trunk_axis_dist(t, A) for t in trunks]
+    k = int(np.argmin([d[0] for d in ds]))
+    dist, foot = ds[k]
+    r = trunks[k]["r"]
+    gap = dist - r - float(r_apple)
+    to_robot = cam_pelvis - foot
+    to_robot[2] = 0.0
+    to_robot /= max(np.linalg.norm(to_robot), 1e-9)
+    left = np.cross([0.0, 0.0, 1.0], -to_robot)
+    lateral = float((A - foot) @ left)
+    if gap > NEAR_M:
+        rel = "far"
+    elif abs(lateral) <= r + FRONT_FRAC * float(r_apple):
+        rel = "front"
+    else:
+        rel = "left_of_trunk" if lateral > 0 else "right_of_trunk"
+    return k, rel, lateral, gap
+
+
+def merge_trunk_map(old, new, tol=0.08, max_trunks=None):
+    """The trunks seen so far (pelvis frame) updated with this picture's: a new one replaces an old one whose axis
+    passes within tol (the newer view wins), the others stay; at most max_trunks (the newest views first)."""
+    out = list(new)
+    for t in old:
+        mid = 0.5 * (t["pts"][0] + t["pts"][-1])
+        if all(trunk_axis_dist(n, mid)[0] > tol for n in new):
+            out.append(t)
+    return out[:MAX_TRUNKS if max_trunks is None else int(max_trunks)]
+
+
+def draw_trunks(rgb, proj, fr, trunks, apple_torso=None, r_apple=0.04, sel=None, title=""):
+    """The picture with every trunk's outline (orange: the one beside the apple, yellow: the others)."""
+    from PIL import Image, ImageDraw
+    im = Image.fromarray(np.asarray(rgb, np.uint8))
+    d = ImageDraw.Draw(im)
+    for k, t in enumerate(trunks):
+        col = (255, 120, 0) if k == sel else (255, 230, 80)
+        for a, b in zip(t["pts"][:-1], t["pts"][1:]):
+            pts = [a + f * (b - a) for f in np.linspace(0, 1, 10)]
+            pix = []
+            for q in pts:
+                qt = fr.torso_R.T @ (q - fr.torso_pos)
+                pix.append(proj.pixel(qt, t["r"]))
+            pix = [x for x in pix if x[3] > 0.1]
+            if len(pix) < 2:
+                continue
+            uv = np.array([[x[0], x[1]] for x in pix])
+            dv = uv[-1] - uv[0]
+            nrm = np.array([-dv[1], dv[0]]) / max(np.linalg.norm(dv), 1e-6)
+            for sg in (-1, 1):
+                d.line([tuple(uv[i] + sg * pix[i][2] * nrm) for i in range(len(pix))], fill=col, width=2)
+    if apple_torso is not None:
+        u, v, rp, _ = proj.pixel(apple_torso, r_apple)
+        d.ellipse([u - rp, v - rp, u + rp, v + rp], outline=(0, 255, 255), width=2)
+    d.rectangle([0, 0, im.width, 12], fill=(0, 0, 0))
+    d.text((3, 0), title, fill=(255, 255, 0))
+    return im
+
+
+def evaluate_trunks(runs=None, out_name="trunks"):
+    """Every recorded attempt (or the given runs): all trunks drawn + the apple's side -> sheets."""
+    from PIL import Image
+    sys.path.insert(0, HERE)
+    import reach_io as R
+    kin = R.G1Kinematics()
+    P = Projector()
+    floor = floor_z_pelvis(kin)
+    rows = attempts()
+    if runs:
+        rows = [r for r in rows if r["run"] in runs]
+    tiles, res = [], []
+    for k, a in enumerate(rows):
+        rgb = np.array(Image.open(a["color"]).convert("RGB"))
+        dmm = np.array(Image.open(a["depth"]))
+        w3 = np.asarray(a["waist"], float)
+        fr = kin.frames(w3, R.HOME_Q)
+        hm = hand_mask(P, hand_points_torso(kin, w3, np.asarray(a["arm_q"])), dmm.shape)
+        trunks = detect_trunks(rgb, dmm, P, fr, floor, hm)
+        apple_p = fr.torso_R @ np.asarray(a["apple_torso"]) + fr.torso_pos
+        cam = fr.torso_R @ P.t + fr.torso_pos
+        sel, rel, lat, gap = apple_vs_trunks(trunks, apple_p, a["radius"], cam)
+        res.append(dict(idx=k, run=a["run"], episode=a["episode"], n_trunks=len(trunks), rel=rel, lateral=lat, gap=gap,
+                        trunks=[{"pts": [p.tolist() for p in t["pts"]], "r": t["r"], "n": t["n"]} for t in trunks]))
+        tiles.append(draw_trunks(rgb, P, fr, trunks, a["apple_torso"], a["radius"], sel,
+                                 f"#{k} {len(trunks)} trunks; apple {rel} ({lat * 100:+.0f} cm, gap {gap * 100:.0f})"))
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for s0 in range(0, len(tiles), 12):
+        ts = tiles[s0:s0 + 12]
+        W, H = ts[0].size
+        sheet = Image.new("RGB", (W * 3, H * ((len(ts) + 2) // 3)), "white")
+        for i, t in enumerate(ts):
+            sheet.paste(t, ((i % 3) * W, (i // 3) * H))
+        sheet.save(os.path.join(OUT_DIR, f"{out_name}_{s0 // 12:02d}.jpg"), quality=88)
+    with open(os.path.join(OUT_DIR, f"{out_name}.jsonl"), "w") as fh:
+        for r in res:
+            fh.write(json.dumps(r) + "\n")
+    print(f"[trunks] {len(res)} attempts: trunks found per picture " +
+          str(np.bincount([r['n_trunks'] for r in res]).tolist()) + "; apple: " +
+          ", ".join(f"{k} {sum(r['rel'] == k for r in res)}" for k in ("front", "left_of_trunk", "right_of_trunk", "far", "none")))
+    return res
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--eval", action="store_true")
     ap.add_argument("--labels", default=None)
+    ap.add_argument("--trunks", nargs="*", default=None, help="every trunk per picture (the given runs, else all)")
+    ap.add_argument("--max_trunks", type=int, default=MAX_TRUNKS, help="at most this many trunks (trees) per picture")
     a = ap.parse_args()
+    MAX_TRUNKS = a.max_trunks
     if a.eval:
         evaluate(a.labels)
+    if a.trunks is not None:
+        evaluate_trunks(a.trunks or None)
