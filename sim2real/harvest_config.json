@@ -27,7 +27,8 @@
   "stall_s": 4.0,
   "snap_dq": 0.6,
   "speed_stop": 3.0,
-  "_help": "DETACH, after the grasp and before the policy takes the apple back: the hand pulled straight back along the approach by pull_m at pull_speed_m_s, stiffer (kp / kd) than the policy's 100 / 10 so that a snapping stem moves the arm less. The pull waits (does not advance) while kp x lead > tau_cap_nm on a shoulder / elbow joint: the stem holds and the stored spring stays small. A joint faster than snap_dq = the stem broke: the target is put where the arm IS (the spring let go). Still holding after stall_s of waiting: the tension is let off, the hand opens (a missed try). Up to speed_stop rad/s is no safety stop here (the snap is expected; robot 2026-10-19: 1.4 rad/s at kp 100 stopped the run)."
+  "return_speed_stop": 2.5,
+  "_help": "DETACH, after the grasp and before the policy takes the apple back: the hand pulled back along its OWN approach path played backwards (the onboard runner streams the measured arm path at 25 Hz; no IK), pull_m of pocket travel at pull_speed_m_s on a quintic time scale, stiffer (kp / kd, ramped in from the policy's 100 / 10) so that a snapping stem moves the arm less. The pull eases off smoothly as kp x lead on a shoulder / elbow joint nears tau_cap_nm (the stem holds: the stored spring stays small); a joint faster than snap_dq = the stem broke: the target is put where the arm IS (the spring let go). Still holding after stall_s at the cap: the tension is let off, the hand opens (a missed try). Up to speed_stop rad/s is no safety stop while detaching, and the policy leg right after a grasp stops only above return_speed_stop (a stem letting go late; the usual stop is 1.58 rad/s: robot 2026-10-19 stopped at 1.75)."
  },
  "view": {
   "edge_frac": 0.12,

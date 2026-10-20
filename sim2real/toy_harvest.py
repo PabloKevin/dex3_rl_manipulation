@@ -14,8 +14,9 @@ front of the belly); HOME <-> READY is a scripted joint move (harvest_moves.py).
             apple whole in the picture left-right there); a turn of the waist first when needed, then DETECT
   APPROACH  HOME -> READY, then the policy: staging -> apple (the palm turned as AIM chose)
   GRASP     the picker's close
-  DETACH    the hand pulled slowly straight back (stiffer, the pull force capped, the stem's snap caught;
-            no safety stop for the snap -- it is expected here)
+  DETACH    the hand pulled slowly back along its own approach path, replayed backwards (stiffer, the pull
+            easing off as the stem's tension builds, the snap caught; no safety stop for the snap -- it is
+            expected here; the policy leg after it stops only above detach.return_speed_stop)
   RETURN    the policy: the same staging point -> READY; then HOME
   DEPOSIT   the waist into the basket's yaw range (-30..0 deg, only as far as needed), HOME -> READY, the
             policy straight to the drop, the palm facing the ground, the fingers along the arm (the basket is
@@ -132,6 +133,9 @@ def parse_args():
     p.add_argument("--scan_speed_deg", type=float, default=5.0)
     p.add_argument("--scan_acc_deg", type=float, default=8.0)
     p.add_argument("--max_tries", type=int, default=2)
+    p.add_argument("--waist_kp", type=float, default=None,
+                   help="a softer waist (60..380) while the harvest moves it (the robot's dual-2 daemon; default: "
+                        "its own 380); the arm's policy legs always run at 380")
     p.add_argument("--no_deposit", action="store_true", help="release at home instead of the basket")
     p.add_argument("--deposit_test", action="store_true",
                    help="one deposit with no apple (the hand opens over the basket), then the run ends: to place "
@@ -162,7 +166,6 @@ class ToyHarvest(TA.ToyArmPose):
     def __init__(self, args):
         super().__init__(args)
         self.hcfg = args.hcfg
-        self.ik = HM.ArmIK(self.kin, self.lo, self.hi)
         self.rmap = RMAP.ReachMap(os.path.join(HERE, self.hcfg["reach"]["map"]))
         self.basket_B = HM.basket_point(self.kin, self.hcfg)
         self._no_box_warned = False
@@ -523,39 +526,81 @@ class ToyHarvest(TA.ToyArmPose):
         return err
 
     # ---- DETACH: the apple off its stem without the snap ----
-    def detach(self, u_apple):
-        """The hand pulled straight back (along -u_apple, the approach) by pull_m at pull_speed_m_s, at the
-        detach's stiffer kp / kd, the arm's sag compensated. The pull waits while the commanded lead on a
-        shoulder / elbow joint would mean more than tau_cap_nm (the stem holds: little stored spring); a joint
-        faster than snap_dq = the stem broke -> the target is put where the arm IS for 0.4 s (the spring let
-        go). -> "snapped" | "pulled" | "stalled" (the tension let off) | "SAFETY STOP: ..." | "E-STOP: ..."."""
+    def replay_path(self, pull_m):
+        """The approach leg's own measured arm path (the onboard runner's 25 Hz state, or the laptop leg's rows),
+        played BACKWARDS from the apple until the pocket is pull_m from where it ended -- no IK. Only the samples
+        that move steadily away from the apple are kept (the hovering at its end drops out), lightly smoothed,
+        moved to start exactly where the arm IS (the offset fading out along the path) and resampled evenly in
+        pocket distance. -> (joint path [N, 7], its pocket length m) or (None, why)."""
+        rec = getattr(self, "_leg_approach", None) or []
+        if len(rec) < 3:
+            return None, "no recorded approach"
+        s = self.io.read()
+        w3 = np.asarray(s.waist_q, float)
+        qs = [np.asarray(q, float) for _, _, q in rec]
+        pk = [AP.hand_frame(self.kin.frames(w3, q))[0] for q in qs]
+        end = pk[-1]
+        # backwards from the apple: the samples moving steadily away from it, until pull_m ALONG the path
+        keep, d_last, arc = [len(qs) - 1], 0.0, 0.0
+        for i in range(len(qs) - 2, -1, -1):
+            d = float(np.linalg.norm(pk[i] - end))
+            if d > d_last + 0.002:
+                arc += float(np.linalg.norm(pk[i] - pk[keep[-1]]))
+                keep.append(i)
+                d_last = d
+                if arc >= pull_m:
+                    break
+        if arc < 0.03:
+            return None, f"the recorded approach moved only {arc * 100:.1f} cm"
+        Q = np.array([qs[i] for i in keep])
+        if len(Q) >= 5:
+            Q[1:-1] = (Q[:-2] + Q[1:-1] + Q[2:]) / 3.0
+        Q = Q + np.linspace(1.0, 0.0, len(Q))[:, None] * (np.asarray(s.arm_q, float) - Q[0])
+        P = np.array([AP.hand_frame(self.kin.frames(w3, q))[0] for q in Q])
+        cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+        L = min(float(cum[-1]), float(pull_m))          # the last 25 Hz step may overshoot pull_m: cut there
+        u = np.linspace(0.0, L, max(10, int(L / 0.002)))
+        Qu = np.stack([np.interp(u, cum, Q[:, j]) for j in range(7)], axis=1)
+        return Qu, L
+
+    def detach(self):
+        """The hand pulled back along its own approach (replay_path) by pull_m at pull_speed_m_s on a quintic
+        time scale, at the detach's stiffer kp / kd (ramped in over GAIN_BACK_S, the arm kept where it is), the
+        sag compensated. The pull slows smoothly to a stop as the commanded lead on a shoulder / elbow joint
+        approaches tau_cap_nm (the stem holds: little stored spring); a joint faster than snap_dq = the stem
+        broke -> the target is put where the arm IS for 0.4 s. Up to speed_stop rad/s is no safety stop here.
+        -> "snapped" | "pulled" | "stalled" (the tension let off) | "skipped: ..." | "SAFETY STOP: ..." | "E-STOP: ..."."""
         D = self.hcfg["detach"]
         io, a = self.io, self.args
+        path, L = self.replay_path(float(D["pull_m"]))
+        if path is None:
+            self.brief("WARN", f"detach: {L} -- no pull, the policy takes the apple back", fold_s=0.0)
+            return f"skipped: {L}"
         s = io.read()
         w3 = np.asarray(s.waist_q, float)
         named = T.hand_named(s)
-        path, e_ik, _ = HM.detach_path(self.ik, np.asarray(s.arm_q, float), w3, -np.asarray(u_apple, float),
-                                       float(D["pull_m"]))
-        path = np.asarray(path)
         kp, kd, cap = float(D["kp"]), float(D["kd"]), float(D["tau_cap_nm"])
-        T_pull = max(1.0, 1.875 * float(D["pull_m"]) / float(D["pull_speed_m_s"]))
+        T_pull = max(1.0, 1.875 * L / float(D["pull_speed_m_s"]))
         tp = waited = 0.0
         q_catch, t_catch, peak, lead_max = None, None, 0.0, 0.0
         result = None
-        q_des = path[0]
-        self.brief("STEP", f"detach: pull {float(D['pull_m']) * 100:.0f} cm back in {T_pull:.1f} s at kp {kp:g} "
-                           f"(pull force capped at {cap:g} N m per joint, the snap caught)")
-        t_next = io.now()
+        q_des, q_des_prev = path[0], None
+        self.brief("STEP", f"detach: the approach replayed backwards, {L * 100:.0f} cm in {T_pull:.1f} s at kp {kp:g} "
+                           f"(the pull eases off near {cap:g} N m per joint, the snap caught)")
+        t0 = io.now()
+        t_next = t0
         while True:
             if io.estop_why is not None:
                 return f"E-STOP: {io.estop_why}"
             s = io.read()
             q, jv = np.asarray(s.arm_q, float), float(np.max(np.abs(s.arm_dq)))
             peak = max(peak, jv)
+            g = T.quintic((io.now() - t0) / GAIN_BACK_S)
+            kk, dd = a.kp + g * (kp - a.kp), a.kd + g * (kd - a.kd)
             if jv > float(D["speed_stop"]):
-                q_h = HM.gravity_target(self.kin, w3, q, kp, named)
+                q_h = HM.gravity_target(self.kin, w3, q, kk, named)
                 for _ in range(int(0.5 / R.DT)):
-                    io.send_arm(q_h, kp=kp, kd=kd)
+                    io.send_arm(q_h, kp=kk, kd=dd)
                     time.sleep(R.DT)
                 self.q_sent = q_h
                 return f"SAFETY STOP: joint speed {jv:.2f} rad/s > {float(D['speed_stop']):.2f} while detaching"
@@ -563,19 +608,23 @@ class ToyHarvest(TA.ToyArmPose):
                 f = T.quintic(tp / T_pull) * (len(path) - 1)
                 i = int(min(f, len(path) - 2))
                 q_des = path[i] + (f - i) * (path[i + 1] - path[i])
-                lead = float(np.max(np.abs(q_des[:4] - q[:4])))
-                lead_max = max(lead_max, lead)
-                if jv > float(D["snap_dq"]) and tp > 0.1:
+                tau = float(np.max(np.abs(q_des[:4] - q[:4]))) * kk
+                lead_max = max(lead_max, tau / max(kk, 1.0))
+                # the snap: the arm FASTER than the pull asks (the stem let go), not the pull's own speed
+                v_des = (q_des - q_des_prev) / R.DT if q_des_prev is not None else np.zeros(7)
+                q_des_prev = q_des.copy()
+                if float(np.max(np.abs(np.asarray(s.arm_dq, float) - v_des))) > float(D["snap_dq"]) and tp > 0.1:
                     q_catch, t_catch = q.copy(), io.now()          # the stem broke: the spring let go here
                     q_des = q_catch
-                elif lead * kp > cap:
-                    waited += R.DT                                  # the stem holds: the pull waits
-                    if waited > float(D["stall_s"]):
-                        result = "stalled"
-                        break
                 else:
-                    tp = min(T_pull, tp + R.DT)
-                    if tp >= T_pull and lead * kp < 0.5 * cap:
+                    rate = float(np.clip((cap - tau) / (0.25 * cap), 0.0, 1.0))   # eases off near the cap
+                    if rate <= 0.0:
+                        waited += R.DT
+                        if waited > float(D["stall_s"]):
+                            result = "stalled"
+                            break
+                    tp = min(T_pull, tp + rate * R.DT)
+                    if tp >= T_pull and tau < 0.5 * cap:
                         result = "pulled"
                         break
             else:
@@ -583,8 +632,8 @@ class ToyHarvest(TA.ToyArmPose):
                 if io.now() - t_catch >= 0.4:
                     result = "snapped"
                     break
-            q_cmd = np.clip(HM.gravity_target(self.kin, w3, q_des, kp, named), self.lo, self.hi)
-            io.send_arm(q_cmd, kp=kp, kd=kd)
+            q_cmd = np.clip(HM.gravity_target(self.kin, w3, q_des, kk, named), self.lo, self.hi)
+            io.send_arm(q_cmd, kp=kk, kd=dd)
             self.q_sent = q_cmd
             self.status(s)
             t_next += R.DT
@@ -610,24 +659,36 @@ class ToyHarvest(TA.ToyArmPose):
             self.q_sent = q_cmd
             time.sleep(R.DT)
         self.brief("INFO" if result != "stalled" else "WARN",
-                   f"detach: {result} after {tp:.1f} s of pull ({waited:.1f} s waiting on the stem), peak joint speed "
-                   f"{peak:.2f} rad/s, largest lead {lead_max:.3f} rad (= {lead_max * kp:.0f} N m), IK line "
-                   f"{e_ik * 1000:.1f} mm", fold_s=0.0)
+                   f"detach: {result} after {tp:.1f} of {T_pull:.1f} s of pull ({waited:.1f} s waiting on the stem), "
+                   f"peak joint speed {peak:.2f} rad/s, largest lead {lead_max:.3f} rad", fold_s=0.0)
         return result
 
     # ---- the policy legs ----
-    def _legs_laptop(self, goals, leg):
-        return self.run_goals(goals, leg)
+    def _legs_laptop(self, goals, leg, speed_stop=None):
+        n0 = len(self.rows)
+        keep = self.args.joint_speed_stop
+        if speed_stop:
+            self.args.joint_speed_stop = max(keep, speed_stop)
+        try:
+            out = self.run_goals(goals, leg)
+        finally:
+            self.args.joint_speed_stop = keep
+        self._leg_rec = [(r["t"], goals[min(int(r["wp"]), len(goals) - 1)].name, np.asarray(r["q"], float))
+                         for r in self.rows[n0:]]
+        return out
 
-    def _legs_onboard(self, goals, leg):
+    def _legs_onboard(self, goals, leg, speed_stop=None):
         from onboard_link import run_policy_onboard
-        out, stopped = run_policy_onboard(self, extra={"goals": [g.to_dict() for g in goals]},
-                                          tick=self.settle_tick if self._carrying else None)
+        extra = {"goals": [g.to_dict() for g in goals]}
+        if speed_stop:
+            extra["joint_speed_stop"] = max(float(self.args.joint_speed_stop), float(speed_stop))
+        out, stopped = run_policy_onboard(self, extra=extra, tick=self.settle_tick if self._carrying else None)
         return str(out), stopped
 
-    def legs(self, goals, leg):
+    def legs(self, goals, leg, speed_stop=None):
+        """A policy leg (onboard or laptop); speed_stop: a joint-speed stop above the usual one for this leg."""
         f = self._legs_onboard if getattr(self, "_onboard_mode", False) else self._legs_laptop
-        return f(goals, leg)
+        return f(goals, leg, speed_stop)
 
     def _ready_plan(self, target, name):
         """At READY: (staging -> target, staging -> READY) for the arm-pose policy (the apple's plan)."""
@@ -743,10 +804,11 @@ class ToyHarvest(TA.ToyArmPose):
         self.hset("APPROACH", "arm-pose policy: staging, then the apple")
         self.hand_cup()
         out_a, stopped = self.legs(plan, "approach")
+        self._leg_approach = list(getattr(self, "_leg_rec", []) or [])
         self.fr_at_apple = self.frames(io.read())
         if stopped or io.estop_why is not None:
             return out_a, True
-        held = False
+        held = grasped = False
         d_end = float(np.linalg.norm(AP.hand_frame(self.fr_at_apple)[0] - plan[-1].target))
         if str(out_a).startswith("APPLE") and d_end > GRASP_MAX_ERR:
             self.brief("WARN", f"the hand ended {d_end * 100:.1f} cm from the apple goal (> {GRASP_MAX_ERR * 100:.0f}): "
@@ -757,7 +819,8 @@ class ToyHarvest(TA.ToyArmPose):
             if out_g.startswith("E-STOP"):
                 return out_g, True
             self.hset("DETACH", "pulling the apple off its stem (slow, stiff, the snap caught)")
-            out_d = self.detach(plan[-1].normal)
+            out_d = self.detach()
+            grasped = True
             if out_d.startswith(("E-STOP", "SAFETY")):
                 return out_d, True
             if out_d == "stalled":
@@ -776,7 +839,9 @@ class ToyHarvest(TA.ToyArmPose):
                                        f"{a.max_tries})")
         self._carrying = held
         self.hset("RETURN", "arm-pose policy: back through the staging point to ready")
-        out_b, stopped = self.legs(back, "return")
+        # a stem that lets go late (the detach skipped, or pulled without a snap) jerks the arm here: not a stop
+        out_b, stopped = self.legs(back, "return",
+                                   speed_stop=self.hcfg["detach"].get("return_speed_stop") if grasped else None)
         if stopped or io.estop_why is not None:
             return out_b, True
         self.hset("RETURN", "the arm home")
@@ -808,6 +873,10 @@ class ToyHarvest(TA.ToyArmPose):
         a, io = self.args, self.io
         self._onboard_mode = onboard
         self._t_go = time.monotonic()
+        if a.waist_kp:
+            self.io.waist_kp = float(a.waist_kp)
+            self.brief("INFO", f"waist kp {a.waist_kp:g} while the harvest moves it (the daemon's own 380 otherwise; "
+                               f"needs the robot's dual-2 daemon)", fold_s=0.0)
         self.scan_dir = -1                     # right first
         self.ctx.update(lo=self.lo, hi=self.hi, commanding=True)
         stopped, why = False, ""

@@ -20,6 +20,9 @@ parser.add_argument("--policies", nargs="+", required=True)
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--seconds", type=float, default=90.0)
 parser.add_argument("--seed", type=int, default=7)
+parser.add_argument("--task_prob", type=float, default=None, help="share of task-like (apple-like) goals (env: 0.6)")
+parser.add_argument("--finger_prob", type=float, default=None, help="share of goals whose finger direction counts (0.5)")
+parser.add_argument("--via_prob", type=float, default=None, help="share of pass-through goals (0.25)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 app = AppLauncher(args).app
@@ -37,11 +40,21 @@ import envs  # noqa: E402,F401
 
 KEYS = {"reached": "Curriculum/metrics/reached_share", "timeout_err_cm": "Curriculum/metrics/timeout_err_cm",
         "hold_in_tol": "Curriculum/metrics/hold_in_tol_share", "collision_end": "Episode_Termination/collision"}
+TAG = ""
 
 
 def run(policy_path):
     env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=args.num_envs)
     env_cfg.seed = args.seed
+    for k in ("task_prob", "finger_prob", "via_prob"):
+        if getattr(args, k) is not None:
+            env_cfg.events.advance_goals.params[k] = getattr(args, k)
+    pol_probe = torch.jit.load(policy_path, map_location="cpu")
+    n_in = next(p for p in pol_probe.parameters() if p.dim() == 2).shape[1]
+    if n_in == 36:
+        # AppleArmPose-v3 (+ the waist yaw input): the same goal stream with its 36th input appended
+        from envs.apple_arm_pose_env_cfg import ObservationsV3Cfg
+        env_cfg.observations = ObservationsV3Cfg()
     env = gym.make(args.task, cfg=env_cfg).unwrapped
     pol = torch.jit.load(policy_path, map_location=env.device).eval()
     obs, _ = env.reset()
@@ -68,8 +81,11 @@ def main():
         rows.append(r)
         print(f"[eval] {p}: reached {r['reached'] * 100:.1f}%, timeout error {r['timeout_err_cm']:.1f} cm, hold in tol "
               f"{r['hold_in_tol'] * 100:.0f}%, collision ends {r['collision_end'] * 100:.1f}%", flush=True)
-    out = os.path.join(REPO, "logs", "sim2real", f"eval_arm_pose_{args.task}.json")
-    json.dump(rows, open(out, "w"), indent=1)
+    out = os.path.join(REPO, "logs", "sim2real", f"eval_arm_pose_{args.task}.jsonl")
+    with open(out, "a") as f:
+        for r in rows:
+            f.write(json.dumps(dict(r, task_prob=args.task_prob, finger_prob=args.finger_prob, via_prob=args.via_prob,
+                                    seconds=args.seconds, num_envs=args.num_envs)) + "\n")
     print(f"-> {out}", flush=True)
 
 

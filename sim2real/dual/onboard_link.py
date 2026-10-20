@@ -217,6 +217,7 @@ def run_policy_onboard(toy, extra=None, tick=None):
     if arm_pose and not req.get("goals"):
         toy.hand_cup()                        # the policy trained with the hand in the reach's cup
         say("INFO", f"staging radius {req['stage_radius']:.2f} m", fold_s=0.0)
+    toy._leg_rec = []
     link.start(req)
     toy.sched.reset()
     outcome, stopped, res = None, False, None
@@ -233,6 +234,10 @@ def run_policy_onboard(toy, extra=None, tick=None):
             if io.estop_why is not None:
                 link.stop(f"E-STOP: {io.estop_why}")
             s = link.state
+            if s.get("id") == ep_id and s.get("q") is not None and s.get("t") is not None:
+                rec = toy.__dict__.setdefault("_leg_rec", [])
+                if not rec or rec[-1][0] != s["t"]:          # the leg's measured arm path (25 Hz), for replays
+                    rec.append((float(s["t"]), str(s.get("goal", "")), np.asarray(s["q"], float)))
             if arm_pose and s.get("id") == ep_id:
                 if s.get("phase") == "PLAN" and not getattr(toy, "_plan_said", None) == ep_id:
                     toy._plan_said = ep_id

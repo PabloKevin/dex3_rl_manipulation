@@ -6,8 +6,7 @@ harvest_moves.py -- the geometry of the autonomous harvest (toy_harvest.py) that
                 scripted joint move between them goes through home_ready_via
   BASKET        fixed to the ground; the drop point at the deposit waist (reachable, pulled toward the torso
                 axis) -- the arm-pose policy goes there, as to an apple
-  DETACH        after the grasp: the hand pulled straight back along the approach (a short IK line; toy_harvest
-                streams it, watching the measured state every tick)
+  (DETACH       toy_harvest replays the approach backwards -- no IK anywhere in the harvest)
 The settings are in harvest_config.json. Check a change without the robot:
     ~/miniconda3/envs/g1_dex3_sim2real/bin/python sim2real/harvest_moves.py
 numpy + reach_io's pinocchio model.
@@ -37,7 +36,8 @@ DEFAULTS = {
                "accept_m": 0.06, "exclude_radius_m": 0.30},
     "moves": {"speed_rad_s": 0.6},
     "detach": {"pull_m": 0.08, "pull_speed_m_s": 0.03, "kp": 250.0, "kd": 14.0, "tau_cap_nm": 18.0,
-               "stall_s": 4.0, "snap_dq": 0.6, "speed_stop": 3.0},
+               "stall_s": 4.0, "snap_dq": 0.6, "speed_stop": 3.0,
+               "return_speed_stop": 2.5},
     "view": {"edge_frac": 0.12, "margin_px": 3, "image_w": 424, "fx": 303.1, "cx": 215.8, "labels": ["red_apple"]},
     "waist": {"lock_window_s": 0.3, "lock_range_deg": 0.3, "lock_tol_deg": 1.0, "lock_timeout_s": 1.5},
     "reach": {"map": "reach_map.npz", "palm_turn_cost_deg": 15.0, "waist_turn_cost_deg": 10.0},
@@ -95,81 +95,6 @@ def basket_drop(kin: "R.G1Kinematics", cfg: dict, waist3):
         else:
             lo = m
     return B - hi * u, u, B, hi
-
-
-# ─────────────────────────────────────────────
-#  IK (the detach's straight pull)
-# ─────────────────────────────────────────────
-
-def _skew(v):
-    return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
-
-
-def rot_angle(Ra, Rb) -> float:
-    return float(math.acos(float(np.clip((np.trace(Ra.T @ Rb) - 1.0) / 2.0, -1.0, 1.0))))
-
-
-class ArmIK:
-    """Damped least squares on the grasp POCKET (position) and the palm rotation, the right arm only, within
-    the joint limits; the waist as given."""
-
-    def __init__(self, kin: "R.G1Kinematics", lo=None, hi=None):
-        self.kin, self.pin = kin, kin.pin
-        m = kin.model
-        self.lo = np.asarray(lo if lo is not None else [m.lowerPositionLimit[i] for i in kin.arm_q], float)
-        self.hi = np.asarray(hi if hi is not None else [m.upperPositionLimit[i] for i in kin.arm_q], float)
-        self.fid = kin.fid["palm"]
-
-    def pose(self, waist3, q):
-        """(pocket, palm rotation) in the pelvis frame."""
-        fr = self.kin.frames(waist3, q)
-        return fr.palm_pos + fr.palm_R @ AP.POCKET, fr.palm_R
-
-    def jacobian(self, waist3, q) -> np.ndarray:
-        """6 x 7: the pocket's linear velocity, the palm's angular velocity (pelvis axes)."""
-        pin, kin = self.pin, self.kin
-        qf = kin.set_q(waist3, q)
-        pin.computeJointJacobians(kin.model, kin.data, qf)
-        pin.updateFramePlacements(kin.model, kin.data)
-        J = np.asarray(pin.getFrameJacobian(kin.model, kin.data, self.fid,
-                                            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED))[:, kin.arm_v]
-        r = np.asarray(kin.data.oMf[self.fid].rotation) @ AP.POCKET
-        return np.vstack([J[:3] - _skew(r) @ J[3:], J[3:]])
-
-    def solve(self, q0, waist3, p_goal, R_goal, w_rot=0.25, iters=60, lam=0.02, tol_p=5e-4, tol_r=0.005):
-        """-> (q, position error m, rotation error rad), from q0 (small steps: a path, warm-started)."""
-        q = np.clip(np.asarray(q0, float), self.lo, self.hi)
-        for _ in range(iters):
-            p, Rp = self.pose(waist3, q)
-            e_p = np.asarray(p_goal, float) - p
-            e_r = Rp @ np.asarray(self.pin.log3(Rp.T @ R_goal))
-            if np.linalg.norm(e_p) < tol_p and np.linalg.norm(e_r) < tol_r:
-                break
-            J = self.jacobian(waist3, q)
-            J[3:] *= w_rot
-            e = np.concatenate([e_p, w_rot * e_r])
-            dq = J.T @ np.linalg.solve(J @ J.T + lam ** 2 * np.eye(6), e)
-            s = float(np.max(np.abs(dq)))
-            if s > 0.1:
-                dq *= 0.1 / s
-            q = np.clip(q + dq, self.lo, self.hi)
-        p, Rp = self.pose(waist3, q)
-        return q, float(np.linalg.norm(np.asarray(p_goal, float) - p)), rot_angle(Rp, R_goal)
-
-
-def detach_path(ik: ArmIK, q0, waist3, direction, pull_m, step_m=0.005):
-    """The pocket pulled straight along `direction` (pelvis frame) by pull_m, the palm kept as it is ->
-    (joint path from q0, worst position error m, worst rotation error rad)."""
-    p0, R0 = ik.pose(waist3, q0)
-    d = np.asarray(direction, float) / max(float(np.linalg.norm(direction)), 1e-9)
-    n = max(2, int(math.ceil(pull_m / step_m)))
-    q = np.asarray(q0, float).copy()
-    path, ep_w, er_w = [q.copy()], 0.0, 0.0
-    for i in range(1, n + 1):
-        q, ep, er = ik.solve(q, waist3, p0 + (pull_m * i / n) * d, R0)
-        path.append(q.copy())
-        ep_w, er_w = max(ep_w, ep), max(er_w, er)
-    return path, ep_w, er_w
 
 
 def gravity_target(kin, waist3, q, kp, named=None, clip=0.12):

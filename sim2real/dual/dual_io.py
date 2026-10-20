@@ -395,7 +395,10 @@ class DualIO(T.PickerIO):
                 m.kp, m.kd = kp, kd
             w = c[R.MOTOR_IDX["waist_yaw_joint"]]
             if waist is not None:
-                w.mode, w.q, w.dq, w.tau, w.kp, w.kd = 1, float(waist), float(waist_dq), 0.0, 1.0, 0.0
+                # kp 1.0 = "the waist is in this packet" at the daemon's own stiffness; >= 60 asks a softer one
+                # while the stream moves it (dual-2; toy_harvest --waist_kp)
+                w.mode, w.q, w.dq, w.tau, w.kp, w.kd = 1, float(waist), float(waist_dq), 0.0, \
+                    float(getattr(self, "waist_kp", None) or 1.0), 0.0
             else:
                 w.mode, w.kp = 0, 0.0
             self._rlpub.Write(self._rlcmd)
