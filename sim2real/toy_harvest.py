@@ -40,6 +40,7 @@ FILE (harvest_config.json)  and everything of toy_arm_pose.py
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -141,8 +142,12 @@ def parse_args():
                    help="one deposit with no apple (the hand opens over the basket), then the run ends: to place "
                         "the basket / check harvest_config.json's basket")
     p.add_argument("--harvest_config", default=HM.CONFIG)
-    p.add_argument("--empty_travel", type=float, default=EMPTY_TRAVEL,
-                   help="fingers closed further than this share of their travel = nothing in the hand")
+    p.add_argument("--apple_calib", nargs="?", const="default", default=None,
+                   help="correct the perceived apple with sim2real/apple_pos_calib.py's fit (default file "
+                        "logs/sim2real/apple_calib/apple_calib.json), before the dashboard's offset; off by default")
+    p.add_argument("--empty_travel", type=float, default=None,
+                   help="fingers closed further than this share of their travel = nothing in the hand (when the pads "
+                        "do not decide; default harvest_config.json grasp_check.travel_empty)")
     mine, rest = p.parse_known_args()
     sys.argv = [sys.argv[0]] + rest
     a = TA.parse_args()
@@ -166,9 +171,21 @@ class ToyHarvest(TA.ToyArmPose):
     def __init__(self, args):
         super().__init__(args)
         self.hcfg = args.hcfg
+        if args.empty_travel is not None:
+            self.hcfg["grasp_check"]["travel_empty"] = float(args.empty_travel)
         self.rmap = RMAP.ReachMap(os.path.join(HERE, self.hcfg["reach"]["map"]))
         self.basket_B = HM.basket_point(self.kin, self.hcfg)
         self._no_box_warned = False
+        self.acal = None
+        if args.apple_calib:
+            import apple_pos_calib as AC
+            path = AC.CALIB if args.apple_calib == "default" else args.apple_calib
+            try:
+                self.acal = AC.AppleCalib(path)
+                print(f"  apple calibration {path}: model '{self.acal.m['model']}' from {self.acal.m['n']} grasps "
+                      f"(leave-one-out {self.acal.m['loo_rms_cm']:.1f} cm)")
+            except Exception as e:
+                print(f"  apple calibration {path} unusable ({e}): none")
         self.hstate, self.hstate_t = "DETECT", time.monotonic()
         self.memory = []                         # [{"p": pelvis xyz, "tries": n, "done": bool, "centered": n}]
         self.n_picked = self.n_tries = 0
@@ -663,6 +680,149 @@ class ToyHarvest(TA.ToyArmPose):
                    f"peak joint speed {peak:.2f} rad/s, largest lead {lead_max:.3f} rad", fold_s=0.0)
         return result
 
+    # ---- the left arm: opened during the harvest (off the left leg when the waist turns) ----
+    def left_arm_to(self, q, why, timeout_s=8.0):
+        """The LEFT arm through v20's own daemon-side joint trajectory (grasp_q; in RL mode the dual daemon
+        passes the other arm's commands to v20), the right arm held meanwhile. -> True when done."""
+        arm = getattr(self.io, "arm", None)
+        if q is None or arm is None or not getattr(self.io, "commands", False):
+            return False
+        try:
+            arm.reset_grasp_q("left")
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < timeout_s:
+                if self.io.estop_why is not None:
+                    return False
+                if arm.ensure_grasp_q("left", [np.asarray(q, float)], ramp_s=2.5, seg_s=0.8, hold_s=0.3):
+                    self.brief("INFO", f"left arm {why} ({time.monotonic() - t0:.1f} s)", fold_s=0.0)
+                    return True
+                self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.1)
+        except Exception as e:
+            self.brief("WARN", f"left arm not moved ({why}): {e}")
+            return False
+        self.brief("WARN", f"left arm: no confirmation in {timeout_s:.0f} s ({why})")
+        return False
+
+    def left_arm_open(self):
+        q = self.hcfg.get("left_scan_q")
+        if q is None:
+            return
+        try:
+            self._left_q0 = self.io.arm._theta("left")
+        except Exception:
+            self._left_q0 = None
+        self.left_arm_to(q, "opened for the harvest (off the left leg when the waist turns)")
+
+    def left_arm_back(self):
+        q0 = getattr(self, "_left_q0", None)
+        if q0 is not None and self.hcfg.get("left_scan_q") is not None:
+            self.left_arm_to(q0, "back where it was")
+
+    # ---- is the apple in the hand? (the pads, else the fingers' travel) ----
+    def _pad_reader(self):
+        if getattr(self, "tcal", None) is None:
+            path = getattr(self.args, "tactile_calib", None) or (T.TIO.DEFAULT_CALIB if os.path.exists(T.TIO.DEFAULT_CALIB) else None)
+            if path:
+                try:
+                    self.tcal = T.TIO.TactileCalib.load(path)
+                except Exception as e:
+                    self.brief("WARN", f"tactile calibration unreadable ({e}): the fingers' travel decides")
+        a = self.args
+        return T.PadTactile(a.tactile_gain, a.tactile_top, a.tactile_map, getattr(self, "tcal", None))
+
+    def grasp_baseline(self):
+        """Right before the close: the pads' baseline (the arm held)."""
+        G = self.hcfg["grasp_check"]
+        self._pads = self._pad_reader()
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < float(G["baseline_s"]):
+            s = self.io.read()
+            if s.pads is not None:
+                self._pads.add_baseline(s.pads)
+            self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.05)
+        self._pads_ok = self._pads.finish_baseline()
+
+    def held_check(self, when):
+        """-> (held, detail). The calibrated pads when they say it clearly (>= 2 fingers >= held_n, or one >=
+        strong_n: held; every finger < empty_n: empty), else the fingers' travel."""
+        G = self.hcfg["grasp_check"]
+        io = self.io
+        pads = getattr(self, "_pads", None)
+        verdict, tact = None, "no pads"
+        if pads is not None and getattr(self, "_pads_ok", False) and pads.noise is not None \
+                and np.any(np.nan_to_num(pads.noise) > 0):
+            F = []
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < float(G["read_s"]):
+                s = io.read()
+                if s.pads is not None:
+                    t9, _, _ = pads.taxels(s.pads)
+                    F.append([t9[0] + t9[1], t9[4] + t9[5], t9[2] + t9[3]])      # thumb, index, middle [N]
+                self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.05)
+            if F:
+                f = np.mean(F, axis=0)
+                tact = f"pads thumb {f[0]:.2f} / index {f[1]:.2f} / middle {f[2]:.2f} N"
+                if int(np.sum(f >= float(G["held_n"]))) >= 2 or float(f.max()) >= float(G["strong_n"]):
+                    verdict = True
+                elif float(f.max()) < float(G["empty_n"]):
+                    verdict = False
+        elif pads is not None:
+            tact = "pads unusable (no data / no noise)"
+        tv = None
+        try:
+            tv = io.hand.grasp_travel_frac("right")
+        except Exception:
+            pass
+        trav = "travel n/a" if tv is None else f"travel {tv * 100:.0f}%"
+        if verdict is None and tv is not None:
+            verdict = bool(float(G["travel_min"]) <= tv < float(G["travel_empty"]))
+            src = "travel"
+        else:
+            src = "pads" if verdict is not None else "none (assumed held)"
+        held = True if verdict is None else verdict
+        detail = f"{when}: {'HELD' if held else 'EMPTY'} by {src} ({tact}; {trav})"
+        self.brief("INFO" if held else "WARN", detail, fold_s=0.0)
+        return held, detail
+
+    # ---- calibration data: where the apple REALLY was, from the closed hand ----
+    def grasp_snapshot(self, goal):
+        s = self.io.read()
+        if s.hand_q is None:
+            return None
+        return {"t": time.time(), "arm_q": np.asarray(s.arm_q, float).tolist(), "waist": np.asarray(s.waist_q, float).tolist(),
+                "hand_q": np.asarray(s.hand_q, float).tolist(), "goal_pelvis": np.asarray(goal, float).tolist()}
+
+    def record_grasp(self, snap, held, detail):
+        """One line of logs/sim2real/apple_calib/samples.jsonl (sim2real/apple_pos_calib.py fits on them): the perceived
+        apple, the pocket, and the apple's centre from the closed hand's fingertips (the truth)."""
+        if snap is None:
+            return
+        try:
+            import apple_pos_calib as AC
+            w3, q, hq = (np.asarray(snap[k], float) for k in ("waist", "arm_q", "hand_q"))
+            fr = self.kin.frames(w3, q, T.hand_named(type("S", (), {"hand_q": hq})()))
+            pocket = AP.hand_frame(fr)[0]
+            D = np.asarray(self.apple_true, float)
+            truth, rms = AC.fingertip_centre(self.kin, w3, q, hq, float(self.args.apple_radius), pocket)
+            fr0 = self.kin.frames(w3, R.HOME_Q)
+            Rt = fr0.torso_R
+            c = fr0.camera_R.T @ (D - fr0.camera_pos)
+            uv = [AC.CAM["cx"] - AC.CAM["fx"] * c[1] / c[0], AC.CAM["cy"] - AC.CAM["fy"] * c[2] / c[0]]
+            rec = dict(snap, run=os.path.basename(self.log_dir), episode=time.strftime("%Y%m%d_%H%M%S"), held=bool(held),
+                       detail=detail, perceived_pelvis=D.tolist(), pocket_pelvis=pocket.tolist(),
+                       truth_pelvis=truth.tolist(), tip_fit_rms_m=rms, apple_radius=float(self.args.apple_radius),
+                       residual_torso=(Rt.T @ (pocket - D)).tolist(), residual_truth_torso=(Rt.T @ (truth - D)).tolist(),
+                       rel_shoulder_torso=(Rt.T @ (D - fr0.shoulder_pos)).tolist(), uv=uv,
+                       offset_cm=np.asarray(self.apple_offset_now(), float).tolist(), src="toy")
+            os.makedirs(AC.OUT_DIR, exist_ok=True)
+            with open(AC.SAMPLES, "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            self.brief("INFO", f"calibration record: the apple's centre from the fingertips is "
+                               f"{np.round(Rt.T @ (truth - D) * 100, 1).tolist()} cm from the perceived one (torso frame; "
+                               f"fit {rms * 1000:.0f} mm)", fold_s=0.0)
+        except Exception as e:
+            self.brief("WARN", f"calibration record not written: {e}")
+
     # ---- the policy legs ----
     def _legs_laptop(self, goals, leg, speed_stop=None):
         n0 = len(self.rows)
@@ -724,12 +884,13 @@ class ToyHarvest(TA.ToyArmPose):
         self.hset("DEPOSIT", f"the waist to {math.degrees(w_dep):+.0f} deg for the basket")
         if abs(w_dep - w_back) > math.radians(0.5) and not self.waist_to(w_dep, "the basket"):
             return f"E-STOP: {io.estop_why}", True
-        err = self.to_ready()
+        start = self.hcfg.get("deposit_start_q")
+        err = self.joint_move([start], "home -> deposit start") if start is not None else self.to_ready()
         if err:
             return err, True
         s = io.read()
         ready = AP.home_goal(self.frames(s))
-        ready.name = "ready"
+        ready.name = "deposit start" if start is not None else "ready"
         goal, short = self.basket_goal(s)
         self.hset("DEPOSIT", "arm-pose policy: over the basket, the palm down")
         self.brief("INFO", f"basket: the drop point {short * 100:.1f} cm short of the basket point (the arm's reach), "
@@ -744,11 +905,11 @@ class ToyHarvest(TA.ToyArmPose):
         self.hset("RELEASE", "opening the hand over the basket")
         self.release_at_home()
         self._carrying = False
-        self.hset("DEPOSIT", "arm-pose policy: back to ready")
+        self.hset("DEPOSIT", f"arm-pose policy: back to the {ready.name}")
         out_b, stopped = self.legs([ready], "return")
         if stopped or io.estop_why is not None:
             return out_b, True
-        err = self.to_home()
+        err = self.joint_move([R.HOME_Q], "deposit start -> home") if start is not None else self.to_home()
         if err:
             return err, True
         if abs(w_dep - w_back) > math.radians(0.5) and not self.waist_to(w_back, "back where the scan was"):
@@ -783,6 +944,15 @@ class ToyHarvest(TA.ToyArmPose):
         a, io = self.args, self.io
         self.apple = np.asarray(p, float)
         self.apple_true = self.apple.copy()
+        if self.acal is not None:
+            import apple_pos_calib as AC
+            fr0 = self.frames(io.read())
+            c = fr0.camera_R.T @ (self.apple - fr0.camera_pos)
+            uv = [AC.CAM["cx"] - AC.CAM["fx"] * c[1] / c[0], AC.CAM["cy"] - AC.CAM["fy"] * c[2] / c[0]]
+            d = self.acal.shift_torso(fr0.torso_R.T @ (self.apple - fr0.shoulder_pos), uv)
+            self.apple = self.apple + fr0.torso_R @ d
+            self.brief("INFO", f"apple calibration: perceived apple moved {np.round(d * 100, 1).tolist()} cm (torso)",
+                       fold_s=0.0)
         if r:
             a.apple_radius = float(r)
         m = self._memo(self.apple, create=True)
@@ -815,9 +985,11 @@ class ToyHarvest(TA.ToyArmPose):
                                f"no grasp, a missed try ({m['tries']} of {a.max_tries})")
         elif str(out_a).startswith("APPLE"):
             self.hset("GRASP", "closing the hand (the picker's close)")
+            self.grasp_baseline()
             out_g = self.grasp_close()
             if out_g.startswith("E-STOP"):
                 return out_g, True
+            snap = self.grasp_snapshot(plan[-1].target)
             self.hset("DETACH", "pulling the apple off its stem (slow, stiff, the snap caught)")
             out_d = self.detach()
             grasped = True
@@ -828,15 +1000,12 @@ class ToyHarvest(TA.ToyArmPose):
                 self.hset("RELEASE", "the stem held: letting the apple go")
                 self.release_at_home()
             else:
-                tv = None
-                try:
-                    tv = io.hand.grasp_travel_frac("right")
-                except Exception:
-                    pass
-                held = tv is None or tv < a.empty_travel
+                held, detail = self.held_check("after the detach")
+                self.record_grasp(snap, held, detail)
                 if not held:
-                    self.brief("WARN", f"the hand closed {tv * 100:.0f}% of the way: nothing in it (try {m['tries']} of "
-                                       f"{a.max_tries})")
+                    self.brief("WARN", f"nothing in the hand after the detach (try {m['tries']} of {a.max_tries}): "
+                                       f"no deposit")
+                    self.release_at_home()
         self._carrying = held
         self.hset("RETURN", "arm-pose policy: back through the staging point to ready")
         # a stem that lets go late (the detach skipped, or pulled without a snap) jerks the arm here: not a stop
@@ -848,6 +1017,13 @@ class ToyHarvest(TA.ToyArmPose):
         err = self.to_home()
         if err:
             return err, True
+        if held:
+            held, _ = self.held_check("back at home, before the deposit")
+            if not held:
+                self.brief("WARN", "the apple was lost on the way back: no deposit, the next apple")
+                self.release_at_home()
+                self._carrying = False
+                return f"lost on the way back ({out_a})", False
         if held:
             if self.hcfg.get("basket") and not a.no_deposit:
                 out_dp, stop = self.deposit()
@@ -873,6 +1049,7 @@ class ToyHarvest(TA.ToyArmPose):
         a, io = self.args, self.io
         self._onboard_mode = onboard
         self._t_go = time.monotonic()
+        self.left_arm_open()
         if a.waist_kp:
             self.io.waist_kp = float(a.waist_kp)
             self.brief("INFO", f"waist kp {a.waist_kp:g} while the harvest moves it (the daemon's own 380 otherwise; "
@@ -941,6 +1118,8 @@ class ToyHarvest(TA.ToyArmPose):
         if not stopped and io.estop_why is None and not a.deposit_test:
             self.hset("SCAN", "the waist home")
             self.waist_to(0.0, "home")
+        if io.estop_why is None:
+            self.left_arm_back()
         self.ctx["commanding"] = False
         outcome = (f"HARVEST: {self.n_picked} picked in {self.n_tries} attempt(s); {why}")
         if not stopped:

@@ -160,6 +160,7 @@ def main():
     near = torch.zeros(N, dtype=torch.bool, device=dev)
     top = torch.full((N,), -9.0, device=dev)
     rad = torch.zeros(N, device=dev)
+    front = torch.full((N,), -9.0, device=dev)
     last = torch.zeros(N, 7, device=dev)
     for _ in range(int(L * timeout / env.step_dt) + 10):
         obs = torch.cat([robot.data.joint_pos[:, arm] - robot.data.default_joint_pos[:, arm],
@@ -181,6 +182,7 @@ def main():
         rel_t = quat_apply_inverse(robot.data.body_quat_w[:, torso], pk - robot.data.body_pos_w[:, torso])
         top = torch.where(live, torch.maximum(top, rel_s[:, 2]), top)
         rad = torch.where(live, torch.maximum(rad, rel_t[:, :2].norm(dim=-1)), rad)
+        front = torch.where(live, torch.maximum(front, rel_t[:, 0]), front)
         d, ang, _, _ = ap.errors(env, POCKET)
         adv = torch.tensor([chain[int(k)][3] if k < L else False for k in leg], device=dev)
         passed = adv & (((d < 0.05) & (ang < math.radians(30))) | (t_leg >= adv_s))
@@ -211,15 +213,15 @@ def main():
                              cm=float(d_e[sel, k].mean()), deg=float(a_e[sel, k].mean())))
         row = dict(yaw=y, legs=legs, n=args.reps, drop_short_cm=float(short[sel].mean()), overlap=int(hit[sel].sum()),
                    near=int(near[sel].sum()), top_vs_shoulder_cm=float(top[sel].max()) * 100,
-                   max_radius_m=float(rad[sel].max()))
+                   max_radius_m=float(rad[sel].max()), front_m=float(front[sel].max()))
         rows.append(row)
         lines.append(f" waist {y:+4.0f}: drop {row['drop_short_cm']:.1f} cm short of the basket point | " +
                      "  ".join(f"{l['leg']} {l['ok']}/{args.reps} {l['t']:.1f}s {l['cm']:.1f}cm {l['deg']:.0f}deg"
                                for l in legs) +
                      f" | overlap {row['overlap']}/{args.reps} <3cm {row['near']}/{args.reps} | hand highest "
-                     f"{row['top_vs_shoulder_cm']:+.0f} cm vs shoulder, farthest {row['max_radius_m']:.2f} m from the axis")
+                     f"{row['top_vs_shoulder_cm']:+.0f} cm vs shoulder, farthest {row['max_radius_m']:.2f} m from the axis, most forward {row['front_m']:.2f} m (torso x)")
     out = os.path.join(REPO, "logs", "sim2real", "basket_waist_eval.json")
-    out = out.replace(".json", f"_{args.palm}_{args.fingers}{'_direct' if args.no_staging else ''}.json")
+    out = out.replace(".json", f"_{args.palm}_{args.fingers}{'_direct' if args.no_staging else ''}_{args.ready_q.replace(',', '_')}.json")
     json.dump({"policy": args.policy, "speed": args.speed, "rows": rows, "lines": lines}, open(out, "w"), indent=1)
     print("\n".join(lines), flush=True)
     env.close()

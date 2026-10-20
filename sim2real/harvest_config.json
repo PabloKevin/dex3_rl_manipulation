@@ -8,11 +8,11 @@
  "_home_ready_via": "the arm out to the side on the way between HOME and READY (the straight joint line cuts the thigh's cover by 5.6 cm; through here +3.7 cm worst over the scan's waist yaws)",
  "basket": {
   "from_shoulder_m": [0.0, -0.522, -0.049],
-  "waist_range_deg": [-30.0, 0.0],
+  "waist_range_deg": [-15.0, 0.0],
   "max_reach_m": 0.5,
   "accept_m": 0.06,
   "exclude_radius_m": 0.3,
-  "_help": "WHERE THE BASKET IS: from_shoulder_m = the basket point minus the right shoulder, with the waist at 0, in the torso frame [x forward, y left, z up] -- the default is the grasp pocket of the right arm stretched straight out to the right, the palm at shoulder height. It is fixed to the ground. DEPOSIT: the waist turns into waist_range_deg (only as far as needed: the nearest yaw in the range; the arm tucked at HOME), HOME -> READY, then ONE arm-pose policy goal: the drop point (the basket point pulled toward the torso axis until it is max_reach_m from the shoulder) with the palm facing the GROUND and the fingers along the arm (the horizontal shoulder -> drop line); the hand opens (a warning if the pocket ended further than accept_m), back to READY -> HOME, the waist back. Sim (scripts/eval_basket_waist.py --palm down --fingers arm --no_staging): waist -30 / -15 / 0 deg 3/3 each in 3.6-4.3 s, 1.4 cm, no body overlap or near miss (the palm-horizontal drop through a staging point took 9.6-11 s). Apples within exclude_radius_m (horizontally) of the basket point are never harvested (an apple in the basket is still an apple to the camera)."
+  "_help": "WHERE THE BASKET IS: from_shoulder_m = the basket point minus the right shoulder, with the waist at 0, in the torso frame [x forward, y left, z up] -- the default is the grasp pocket of the right arm stretched straight out to the right, the palm at shoulder height. It is fixed to the ground. DEPOSIT: the waist turns into waist_range_deg (only as far as needed: the nearest yaw in the range; the arm tucked at HOME; -15..0: at -30 the basket is in front and the hand went 0.31 m forward), HOME -> DEPOSIT START (beside the hip), then ONE arm-pose policy goal: the drop point (the basket point pulled toward the torso axis until it is max_reach_m from the shoulder) with the palm facing the GROUND and the fingers along the arm (the horizontal shoulder -> drop line); the hand opens (a warning if the pocket ended further than accept_m), back to DEPOSIT START -> HOME, the waist back. Sim (scripts/eval_basket_waist.py --palm down --fingers arm --no_staging): waist -30 / -15 / 0 deg 3/3 each in 3.6-4.3 s, 1.4 cm, no body overlap or near miss (the palm-horizontal drop through a staging point took 9.6-11 s). Apples within exclude_radius_m (horizontally) of the basket point are never harvested (an apple in the basket is still an apple to the camera)."
  },
  "moves": {
   "speed_rad_s": 0.6,
@@ -42,14 +42,28 @@
  "waist": {
   "lock_window_s": 0.3,
   "lock_range_deg": 0.3,
-  "lock_tol_deg": 1.0,
+  "lock_tol_deg": 2.0,
   "lock_timeout_s": 1.5,
-  "_help": "the waist counts as still (LOCKED) when its measured yaw stayed within lock_range_deg over lock_window_s, within lock_tol_deg of the target; else after lock_timeout_s the run goes on (with a warning). Robot 2026-10-19: the old speed test never passed (5 s lost at every waist move)."
+  "_help": "the waist counts as still (LOCKED) when its measured yaw stayed within lock_range_deg over lock_window_s, within lock_tol_deg of the target; else after lock_timeout_s the run goes on (with a warning). Robot 2026-10-19: the old speed test never passed (5 s lost at every waist move). Robot 2026-10-20: the waist settles ~1.3 deg short of its target (+11.7 for +13) -> lock_tol_deg 2."
  },
  "reach": {
   "map": "reach_map.npz",
   "palm_turn_cost_deg": 15.0,
   "waist_turn_cost_deg": 10.0,
   "_help": "REACHABILITY without IK: sim2real/reach_map.py samples the arm's joint space inside the robot's limits once (offline) and stores, per 2 cm cell around the right shoulder, the palm headings that reach it (the apple's approach rule, or turned up to +-60 deg). Per apple the waist yaw (within the scan range) and the palm turn are chosen by table look-ups: the cost palm turn / palm_turn_cost_deg + waist turn / waist_turn_cost_deg is the smallest; an apple reachable at no yaw of the range is skipped. Rebuild after a change of the robot's joint limits: python3 sim2real/reach_map.py --build."
+ },
+ "deposit_start_q": [0.02, -1.11, 0.41, 0.49, -0.24, -0.26, 0.47],
+ "_deposit_start_q": "DEPOSIT START: the arm beside the right hip (pocket 0.18 m in front of the torso, 0.33 m right; sphere-model clearance 17.6 cm), reached from HOME by a scripted joint move (body cover +5.3 cm worst); the policy goes from here to the drop and back -- not from READY, 0.33 m in front, which pushed apples (robot 2026-10-20). Sim (scripts/eval_basket_waist.py --ready_q <this> --palm down --fingers arm --no_staging): waist -30 / -15 / 0: 3/3 each, 3.4-4.8 s, no overlap, the hand at most 0.31 / 0.19 / 0.10 m in front of the torso.",
+ "left_scan_q": [0.19, 0.52, 0.29, 0.68, 0.14, 0.01, -0.01],
+ "_left_scan_q": "LEFT ARM during the harvest (robot 2026-10-20: the left hand touched the left leg when the waist turned right): opened outward (shoulder roll +0.3), the upper arm turned so the hand points out, the elbow straighter -- 0.3 rad from the robot's rest pose [0.29, 0.22, -0.01, 0.98, 0.14, 0.01, -0.01] (body cover vs the leg -6.2 cm at waist -4); here >= +11 cm at every waist yaw -46..+16. Sent through v20's grasp_q at GO (the dual daemon passes the other arm's commands to v20), back to where it was at the end. null = the left arm not moved.",
+ "grasp_check": {
+  "baseline_s": 0.3,
+  "read_s": 0.3,
+  "held_n": 0.3,
+  "strong_n": 1.0,
+  "empty_n": 0.1,
+  "travel_min": 0.15,
+  "travel_empty": 0.85,
+  "_help": "IS THE APPLE IN THE HAND (after the detach, and again back at HOME before the deposit): the calibrated pads (logs/sim2real/tactile_calib.json: thumb / index / middle forces, N, over a baseline taken right before the close) say HELD when at least 2 fingers press >= held_n or one >= strong_n, EMPTY when every finger < empty_n; otherwise, or with no usable pads (no data, or no noise at all: a fake hand), the fingers' travel decides (held between travel_min and travel_empty of the commanded close). EMPTY: the hand opens, no deposit, the next apple / the scan. Every check is logged with its numbers -- tune these from a run with and without an apple."
  }
 }

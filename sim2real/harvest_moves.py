@@ -32,14 +32,18 @@ DEFAULTS = {
     "home_q": [0.3, -0.6, 0.8, 1.0, 0.0, 0.0, 0.0],
     "ready_q": None,
     "home_ready_via": [0.07, -0.78, 0.53, 0.95, 0.0, 0.0, 0.0],
-    "basket": {"from_shoulder_m": [0.0, -0.522, -0.049], "waist_range_deg": [-30.0, 0.0], "max_reach_m": 0.50,
+    "deposit_start_q": [0.02, -1.11, 0.41, 0.49, -0.24, -0.26, 0.47],
+    "left_scan_q": [0.19, 0.52, 0.29, 0.68, 0.14, 0.01, -0.01],
+    "grasp_check": {"baseline_s": 0.3, "read_s": 0.3, "held_n": 0.3, "strong_n": 1.0, "empty_n": 0.1,
+                    "travel_min": 0.15, "travel_empty": 0.85},
+    "basket": {"from_shoulder_m": [0.0, -0.522, -0.049], "waist_range_deg": [-15.0, 0.0], "max_reach_m": 0.50,
                "accept_m": 0.06, "exclude_radius_m": 0.30},
     "moves": {"speed_rad_s": 0.6},
     "detach": {"pull_m": 0.08, "pull_speed_m_s": 0.03, "kp": 250.0, "kd": 14.0, "tau_cap_nm": 18.0,
                "stall_s": 4.0, "snap_dq": 0.6, "speed_stop": 3.0,
                "return_speed_stop": 2.5},
     "view": {"edge_frac": 0.12, "margin_px": 3, "image_w": 424, "fx": 303.1, "cx": 215.8, "labels": ["red_apple"]},
-    "waist": {"lock_window_s": 0.3, "lock_range_deg": 0.3, "lock_tol_deg": 1.0, "lock_timeout_s": 1.5},
+    "waist": {"lock_window_s": 0.3, "lock_range_deg": 0.3, "lock_tol_deg": 2.0, "lock_timeout_s": 1.5},
     "reach": {"map": "reach_map.npz", "palm_turn_cost_deg": 15.0, "waist_turn_cost_deg": 10.0},
 }
 
@@ -61,6 +65,8 @@ def load_config(path: str | None = None) -> dict:
     cfg["home_q"] = np.asarray(cfg["home_q"], float)
     cfg["ready_q"] = READY_DEFAULT.copy() if cfg.get("ready_q") is None else np.asarray(cfg["ready_q"], float)
     cfg["home_ready_via"] = [] if not cfg.get("home_ready_via") else [np.asarray(cfg["home_ready_via"], float)]
+    cfg["deposit_start_q"] = None if cfg.get("deposit_start_q") is None else np.asarray(cfg["deposit_start_q"], float)
+    cfg["left_scan_q"] = None if cfg.get("left_scan_q") is None else np.asarray(cfg["left_scan_q"], float)
     return cfg
 
 
@@ -143,6 +149,18 @@ def main():
           f"{min(clear(q) for q in path) * 100:+.1f} cm, "
           f"~{1.875 * sum(np.max(np.abs(b - c)) for b, c in zip(pts[:-1], pts[1:])) / cfg['moves']['speed_rad_s']:.1f} s "
           f"at {cfg['moves']['speed_rad_s']:g} rad/s")
+    if cfg["deposit_start_q"] is not None:
+        q = cfg["deposit_start_q"]
+        path = [cfg["home_q"] + f * (q - cfg["home_q"]) for f in np.linspace(0, 1, 15)]
+        fr = kin.frames([0, 0, 0], q)
+        rel = fr.torso_R.T @ (fr.palm_pos + fr.palm_R @ AP.POCKET - fr.torso_pos)
+        print(f"  deposit start {np.round(q, 2).tolist()}: pocket (torso) {np.round(rel, 3).tolist()}, cover "
+              f"{clear(q) * 100:+.1f} cm; HOME -> it (joint line) worst {min(clear(x) for x in path) * 100:+.1f} cm")
+    if cfg["left_scan_q"] is not None and BC is not None:
+        ql = cfg["left_scan_q"]
+        cl = min(float(BC.self_clearance("left", ql, waist=float(w))) for w in np.radians(np.arange(-46, 17, 2)))
+        print(f"  left arm during the harvest {np.round(ql, 2).tolist()}: cover vs the body / legs worst {cl * 100:+.1f} cm "
+              f"over waist -46..+16")
     b = cfg["basket"]
     B = basket_point(kin, cfg)
     fr0 = kin.frames([0, 0, 0], cfg["home_q"])
