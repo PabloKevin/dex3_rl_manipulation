@@ -1,0 +1,44 @@
+{
+ "_help": "toy_harvest.py settings. Edit, then check without the robot: ~/miniconda3/envs/g1_dex3_sim2real/bin/python sim2real/harvest_moves.py (the poses, the body clearance along the scripted moves, where the hand drops into the basket). Joint vectors are the right arm in RIGHT_ARM_JOINTS order: shoulder pitch, roll, yaw, elbow, wrist roll, pitch, yaw [rad].",
+
+ "home_q": [0.3, -0.6, 0.8, 1.0, 0.0, 0.0, 0.0],
+ "_home_q": "HOME: the arm tucked down by the hip, nothing in front of the chest (the hand 0.30 m from the waist axis; the old home 0.46 m). The waist only turns with the arm here; the camera looks from here. Body cover clearance +4.8 cm at every waist yaw of the scan.",
+ "ready_q": null,
+ "_ready_q": "READY: where the arm-pose policy starts and ends (null = reach_io's HOME_Q, the old home the policy ran from on the robot). HOME <-> READY is a scripted joint move through home_ready_via. In sim (scripts/eval_harvest_home.py) the policy started from HOME itself brushed the hip.",
+ "home_ready_via": [0.07, -0.78, 0.53, 0.95, 0.0, 0.0, 0.0],
+ "_home_ready_via": "the arm out to the side on the way between HOME and READY (the straight joint line cuts the thigh's cover by 5.6 cm; through here +3.7 cm worst over the scan's waist yaws)",
+
+ "basket": {
+  "from_shoulder_m": [0.0, -0.522, -0.049],
+  "waist_deg": -15.0,
+  "max_reach_m": 0.50,
+  "accept_m": 0.06,
+  "_help": "WHERE THE BASKET IS: from_shoulder_m = the basket point minus the right shoulder, with the waist at 0, in the torso frame [x forward, y left, z up] -- the default is the grasp pocket of the right arm stretched straight out to the right, the palm at shoulder height. It is fixed to the ground. DEPOSIT: the waist turns to waist_deg (the arm tucked at HOME), then the arm-pose policy goes READY -> staging -> the drop point (the basket point pulled toward the torso axis until it is max_reach_m from the shoulder, the palm along the torso -> basket line), the hand opens if the pocket ended within accept_m of the drop point, and back: staging -> READY -> HOME, the waist back. Sim (scripts/eval_basket_waist.py): waist -15 deg 3/3 reached in 9.6 s, 1.7 cm, no body overlap, the drop 2.8 cm short of the basket point; -30 / -45 / 0 deg overlapped the body or missed."
+ },
+
+ "moves": {
+  "speed_rad_s": 0.6,
+  "_help": "peak joint speed of the scripted moves (HOME <-> READY)"
+ },
+
+ "detach": {
+  "pull_m": 0.08,
+  "pull_speed_m_s": 0.03,
+  "kp": 250.0,
+  "kd": 14.0,
+  "tau_cap_nm": 18.0,
+  "stall_s": 4.0,
+  "snap_dq": 0.6,
+  "speed_stop": 3.0,
+  "_help": "DETACH, after the grasp and before the policy takes the apple back: the hand pulled straight back along the approach by pull_m at pull_speed_m_s, stiffer (kp / kd) than the policy's 100 / 10 so that a snapping stem moves the arm less. The pull waits (does not advance) while kp x lead > tau_cap_nm on a shoulder / elbow joint: the stem holds and the stored spring stays small. A joint faster than snap_dq = the stem broke: the target is put where the arm IS (the spring let go). Still holding after stall_s of waiting: the tension is let off, the hand opens (a missed try). Up to speed_stop rad/s is no safety stop here (the snap is expected; robot 2026-10-19: 1.4 rad/s at kp 100 stopped the run)."
+ },
+
+ "view": {
+  "edge_frac": 0.12,
+  "margin_px": 3,
+  "image_w": 424,
+  "fx": 303.1,
+  "cx": 215.8,
+  "_help": "An apple is harvested only when it is whole in the head camera's picture left-right (its box at least margin_px from the left / right edges) and its centre at least edge_frac of the half-width from those edges; else the waist turns to centre it first. Above / below: no rule. image_w / fx / cx: until /unitree/color/camera_info is heard (then that); without a box (none in the message) the apple's sphere is projected with them."
+ }
+}

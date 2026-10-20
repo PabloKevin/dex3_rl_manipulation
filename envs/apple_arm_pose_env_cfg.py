@@ -293,3 +293,59 @@ class AppleArmPoseV2EnvCfg_PLAY(AppleArmPoseV2EnvCfg):
         self.viewer.eye = (1.3, -1.0, 1.45)
         self.viewer.lookat = (0.15, -0.15, 1.0)
         self.events.draw_goal = EventTerm(func=ap.draw_goal, mode="interval", interval_range_s=(0.0, 0.0))
+
+
+# ─────────────────────────────────────────────
+#  v3: everywhere the arm can go, at any waist yaw (AppleArmPose-v3)
+# ─────────────────────────────────────────────
+# User, 2026-10-19: another A -> B reach, also able to go to every reachable
+# place -- not only where the camera looks -- and to work with the waist
+# turned, reaching behind the back. Trained from scratch (one more input).
+#   - waist yaw per episode over the joint's whole soft range, -140..+140 deg
+#     (URDF +-150, x 0.95), on its own library
+#     (envs/assets/arm_pose_library_full.npz: scripts/build_arm_pose_library.py
+#     --yaw_grid -140 -120 ... 140 --out ...): only the legs move relative to
+#     the arm, but at large yaws they are where a low hand goes;
+#   - + the waist yaw as an input (36): where the legs are;
+#   - goals: 30% task-like (as v1/v2), 70% anywhere reachable, spread EVENLY
+#     over space (each library pose weighted by 1 / the poses in its 5 cm
+#     voxel: uniform joint sampling crowds some regions);
+#   - the v2 hold phase.
+ARM_POSE_FULL_LIBRARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets",
+                                     "arm_pose_library_full.npz")
+FULL_YAW_GRID_DEG = list(range(-140, 141, 20))
+BALANCE_VOXEL = 0.05
+
+
+@configclass
+class ObservationsV3Cfg(ObservationsCfg):
+    @configclass
+    class PolicyObs(ObservationsCfg.PolicyObs):
+        waist_yaw = ObsTerm(func=ap.obs_waist_yaw)            # appended: 35 -> 36
+
+    policy: PolicyObs = PolicyObs()
+
+
+@configclass
+class AppleArmPoseV3EnvCfg(AppleArmPoseV2EnvCfg):
+    observations: ObservationsV3Cfg = ObservationsV3Cfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_arm_pose.params.update({"library_file": ARM_POSE_FULL_LIBRARY,
+                                                  "balance_voxel": BALANCE_VOXEL})
+        self.events.advance_goals.params.update({"task_prob": 0.3, "balanced": True})
+
+
+@configclass
+class AppleArmPoseV3EnvCfg_PLAY(AppleArmPoseV3EnvCfg):
+    """A few envs, the goal drawn (env 0), for watching a policy (play.py)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.viewer.origin_type = "env"
+        self.viewer.env_index = 0
+        self.viewer.eye = (1.6, -1.6, 1.6)
+        self.viewer.lookat = (0.0, 0.0, 1.0)
+        self.events.draw_goal = EventTerm(func=ap.draw_goal, mode="interval", interval_range_s=(0.0, 0.0))

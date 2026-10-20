@@ -36,6 +36,9 @@ SELECT_TOPIC = "/apple_picker/select_fruit"      # the dashboard's click (torso 
 CLOSER_TOPIC = "/apple_picker/reach_closer"      # {"cm": x} from the dashboard
 STAGE_TOPIC = "/apple_picker/stage_radius"       # {"m": x} from the dashboard (the arm-pose toy's staging radius)
 OFFSET_TOPIC = "/apple_picker/apple_offset"      # {"cm": [x, y, z]} from the dashboard (the arm-pose toy's goal offset)
+HARVEST_CTL_TOPIC = "/apple_picker/harvest_ctl"  # {"cmd": "stop"} from the dashboard's END button (toy_harvest)
+DETECTED_TOPIC = "/fruits_detected_torso"         # the detector's fruit, torso frame, with their picture boxes
+CAMERA_INFO_TOPIC = "/unitree/color/camera_info"  # the head camera's picture size / intrinsics
 HB_HZ = 20.0
 VOICE_DIR = os.path.join(os.path.dirname(HERE), "voice")
 #: speak() key -> WAV in sim2real/voice
@@ -116,6 +119,20 @@ class DualIO(T.PickerIO):
         #: the dashboard's apple goal offset for the arm-pose toy, cm in the torso frame (None = not set there)
         self.apple_offset_cm = None
         self.node.create_subscription(self.String, OFFSET_TOPIC, self._on_offset, 10)
+        #: monotonic time of the dashboard's last END (toy_harvest ends after the current step)
+        self.harvest_stop_t = None
+        self.node.create_subscription(self.String, HARVEST_CTL_TOPIC, self._on_harvest_ctl, 10)
+        #: the detector's last boxes (toy_harvest: is the fruit whole in the picture?): (monotonic time,
+        #: [(torso-frame xyz, [x1, y1, x2, y2] px)])
+        self.det_boxes = (0.0, [])
+        self.node.create_subscription(self.String, DETECTED_TOPIC, self._on_detected, 10)
+        #: the head camera's {"w", "fx", "cx"} once heard (None = not yet)
+        self.cam_info = None
+        try:
+            from sensor_msgs.msg import CameraInfo
+            self.node.create_subscription(CameraInfo, CAMERA_INFO_TOPIC, self._on_camera_info, 2)
+        except Exception:
+            pass
         self._tx_lock = threading.Lock()
         self._tx_t = self._main_t = 0.0
         self._tx_last = None                       # the last send_arm arguments (keep-alive repeats them)
@@ -164,6 +181,33 @@ class DualIO(T.PickerIO):
             self.rec.poke()
             if self.brief is not None:
                 self.brief("INFO", f"apple clicked on the dashboard at {np.round(self.click[0], 3).tolist()} (torso)")
+
+    def _on_harvest_ctl(self, msg):
+        try:
+            if json.loads(msg.data).get("cmd") == "stop":
+                self.harvest_stop_t = time.monotonic()
+                if self.brief is not None:
+                    self.brief("STOP", "END pressed on the dashboard: the harvest ends after the current step")
+        except Exception:
+            pass
+
+    def _on_detected(self, msg):
+        try:
+            out = []
+            for o in json.loads(msg.data).get("objects", []):
+                c, bb = o.get("cartesian"), o.get("bbox")
+                if c is not None and bb is not None and len(bb) >= 4:
+                    out.append((np.array([float(c["x"]), float(c["y"]), float(c["z"])]), [float(v) for v in bb[:4]]))
+            self.det_boxes = (time.monotonic(), out)
+        except Exception:
+            pass
+
+    def _on_camera_info(self, msg):
+        try:
+            if msg.width > 0 and msg.k[0] > 0:
+                self.cam_info = {"w": int(msg.width), "fx": float(msg.k[0]), "cx": float(msg.k[2])}
+        except Exception:
+            pass
 
     def _on_offset(self, msg):
         try:

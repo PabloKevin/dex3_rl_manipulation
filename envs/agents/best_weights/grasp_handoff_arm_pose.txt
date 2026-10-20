@@ -1,0 +1,3 @@
+AppleArmPose-v1 run logs/rsl_rl/apple_arm_pose/2026-10-19_13-31-55/exported/policy.pt
+(the policy sim2real/toy_arm_pose.py runs on the robot, 2026-10-19); pinned 2026-10-19 as the
+frozen reach of AppleGraspArmPose-v1 (envs/apple_grasp_arm_pose_env_cfg.py). 35 in / 7 out.

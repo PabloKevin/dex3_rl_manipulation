@@ -10,6 +10,9 @@ imported unchanged; three of their pieces are swapped here:
   python3 sim2real/dual/run_toy.py reach  --policy P --speed 0.3 --target X Y Z
   python3 sim2real/dual/run_toy.py visible --policy P --speed 0.3 --target detection [--onboard]
                       an AppleReachVisible policy (37 in / 7 out, waist held) through the single toy
+  python3 sim2real/dual/run_toy.py harvest --policy P --speed 0.3 --target detection [--onboard]
+                      AUTONOMOUS: the lowest apple first, deposit in the basket, the waist scans right then
+                      left for more (toy_harvest.py); the dashboard's END button ends it
   python3 sim2real/dual/run_toy.py pose --policy P --speed 0.3 --target detection [--onboard]
                       the AppleArmPose policy through staging -> apple waypoints (toy_arm_pose.py; the
                       dashboard's "stage" field = the staging radius, 0.15 m by default)
@@ -78,6 +81,8 @@ CLOSER_CM = 0.0
 CALIB = None
 #: s of the stiffness ramp kp 100 -> v20's 400 before "bye" (see DualToyMixin.handover_to_hold)
 HANDOVER_S = 1.0
+#: s the arm is held while the hand opens at the end of a run (open_hand_at_end)
+HAND_OPEN_END_S = 1.0
 #: rad: corner rounding of the scripted joint paths (smooth_joint_path_traj)
 CORNER_BLEND_RAD = 0.20
 #: the paths home found by earlier runs (home_paths.json)
@@ -431,6 +436,8 @@ class DualToyMixin:
         a, io = self.args, self.io
         if hasattr(self, "at_home"):              # a toy's own step at home (toy_arm_pose: the thumb)
             self.at_home()
+        if hasattr(self, "auto_choose"):          # autonomous (toy_harvest): no click, its own choice
+            return self.auto_choose()
         tracks, n = [], 0
         t_start = io.now()
         self.brief("STEP", f"looking at the fruit for {a.detect_s:.0f} s (arm at home)")
@@ -661,6 +668,27 @@ class DualToyMixin:
         self.brief("INFO", f"stiffness handed to the robot's hold (kp {kp0:g} -> {V20_HOLD_KP:g} in {HANDOVER_S:g} s, "
                            f"target moved {np.max(np.abs(q - q_c)):.3f} rad so the arm stays put)", fold_s=0.0)
 
+    # ---- the hand never stays closed on a fruit ----
+    def open_hand_at_end(self):
+        """Whatever ends the run (Ctrl-C, a stop, the end): the right hand opens, so a held fruit is not left
+        in a closed hand (robot 2026-10-19: a safety stop right after the grasp, then Ctrl-C, ended with the
+        apple held). The arm is held where it is (when the toy still commands it) while the fingers open."""
+        io = self.io
+        hand = getattr(io, "hand", None)
+        if not getattr(io, "commands", False) or hand is None or self.args.hand == "keep":
+            return
+        hand.open_hands_for_new_grasp()
+        self._carrying = False
+        self.brief("INFO", f"the hand opens ({HAND_OPEN_END_S:g} s) before the run ends", fold_s=0.0)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < HAND_OPEN_END_S:
+            if io.estop_why is None and self.q_sent is not None and getattr(io, "_entered", False) \
+                    and not getattr(io, "_left", False):
+                if self.hold(self.q_sent, 0.1):
+                    time.sleep(0.05)
+            else:
+                time.sleep(0.05)
+
     # ---- always a log, whatever ends the run ----
     def finish(self, outcome, restore_mode=True):
         if self._finished:
@@ -677,6 +705,10 @@ class DualToyMixin:
             self.voice("finish_my_work", max_age_s=0.0)
         elif not getattr(self, "_said_help", False):
             self.voice("need_help", priority=True, max_age_s=0.0)
+        try:
+            self.open_hand_at_end()
+        except Exception as e:
+            self.brief("WARN", f"opening the hand at the end failed: {e}")
         try:
             self.handover_to_hold()
         except Exception as e:
@@ -727,8 +759,8 @@ def _main():
     global STRICT, VERBOSE
     install_ctrl_c()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "pose", "apple",
-                                                                   "grasp", "chain", "v1", "tree", "calib"):
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "pose", "harvest",
+                                                                   "apple", "grasp", "chain", "v1", "tree", "calib"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     kind, rest = argv[0], argv[1:]
@@ -765,8 +797,9 @@ def _main():
         del rest[i:i + 2]
     global ONBOARD
     if "--onboard" in rest:
-        if kind not in ("single", "pose"):
-            sys.exit("--onboard runs the single / visible reach and the arm-pose toy only (single, visible, pose)")
+        if kind not in ("single", "pose", "harvest"):
+            sys.exit("--onboard runs the single / visible reach and the arm-pose toys only (single, visible, pose, "
+                     "harvest)")
         ONBOARD = True
         rest.remove("--onboard")
     stop_cm = 1.0
@@ -794,7 +827,7 @@ def _main():
     T.PickerIO = DualIO
     T.Watch = LightWatch
     T.joint_path_traj = smooth_joint_path_traj
-    if kind not in ("single", "calib", "pose") and "--dds_default" in rest:   # the launcher adds it in --loopback
+    if kind not in ("single", "calib", "pose", "harvest") and "--dds_default" in rest:   # the launcher adds it in --loopback
         global DDS_DEFAULT
         DDS_DEFAULT = True
         rest.remove("--dds_default")
@@ -808,6 +841,11 @@ def _main():
         P.ToyArmPose = mix(P.ToyArmPose)
         sys.argv = [sys.argv[0]] + rest
         return P.main()
+    if kind == "harvest":
+        import toy_harvest as H
+        H.ToyHarvest = mix(H.ToyHarvest)
+        sys.argv = [sys.argv[0]] + rest
+        return H.main()
     if kind == "calib":
         import calib_reach as CR
         CR.CalibToy = mix(CR.CalibToy)

@@ -753,3 +753,31 @@ for _id, _env in (("AppleArmPose-v2", AppleArmPoseV2EnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPoseV2PPORunnerCfg},
         disable_env_checker=True,
     )
+
+# v3: everywhere reachable, any waist yaw (+ waist input)
+
+from .apple_arm_pose_env_cfg import AppleArmPoseV3EnvCfg, AppleArmPoseV3EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleArmPoseV3PPORunnerCfg
+
+for _id, _env in (("AppleArmPose-v3", AppleArmPoseV3EnvCfg),
+                  ("AppleArmPose-Play-v3", AppleArmPoseV3EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPoseV3PPORunnerCfg},
+        disable_env_checker=True,
+    )
+
+# tactile grasp behind the AppleArmPose waypoint reach, from scratch (apple_grasp_arm_pose_env_cfg.py)
+
+from .apple_grasp_arm_pose_env_cfg import AppleGraspArmPoseEnvCfg, AppleGraspArmPoseEnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspArmPosePPORunnerCfg
+
+for _id, _env in (("AppleGraspArmPose-v1", AppleGraspArmPoseEnvCfg),
+                  ("AppleGraspArmPose-Play-v1", AppleGraspArmPoseEnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspArmPosePPORunnerCfg},
+        disable_env_checker=True,
+    )

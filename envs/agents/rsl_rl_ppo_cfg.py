@@ -464,3 +464,21 @@ class AppleArmPoseV2PPORunnerCfg(AppleArmPosePPORunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class AppleArmPoseV3PPORunnerCfg(AppleArmPosePPORunnerCfg):
+    """AppleArmPose-v3: the A -> B arm policy everywhere reachable, at any
+    waist yaw (36 inputs), from scratch (v1's PPO settings). Own log folder
+    (logs/rsl_rl/apple_arm_pose_v3)."""
+    experiment_name = "apple_arm_pose_v3"
+    max_iterations = 6000
+
+
+@configclass
+class AppleGraspArmPosePPORunnerCfg(AppleGraspSingleV2PPORunnerCfg):
+    """AppleGraspArmPose-v1: the tactile grasp behind the frozen AppleArmPose
+    reach, from scratch (the grasp recipe's own PPO: init noise 0.8, entropy
+    0.005; no warm start). Own log folder (logs/rsl_rl/apple_grasp_arm_pose)."""
+    experiment_name = "apple_grasp_arm_pose"
+    max_iterations = 5000

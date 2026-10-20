@@ -164,6 +164,25 @@ def _reach_obs(
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
 
+    if layout == "arm_pose":
+        # AppleArmPose-v1/v2 (envs/apple_arm_pose_env_cfg.py): 35 = arm pos (7), vel (7),
+        # goal - pocket and goal - shoulder in the torso frame (3 + 3), goal palm normal
+        # and finger direction in the palm frame (3 + 3), flags (2), previous raw action
+        # (7); the goal is the waypoint arm_pose.waypoint_reach_step set this step
+        from . import arm_pose as ap
+
+        pk = waist["pocket_local"]
+        return torch.cat([
+            joint_pos_selected(env, arm_cfg),
+            joint_vel_selected(env, arm_cfg),
+            ap.obs_goal_delta(env, pk),
+            ap.obs_goal_position(env, pk),
+            ap.obs_goal_normal(env, pk),
+            ap.obs_goal_finger(env, pk),
+            ap.obs_goal_flags(env),
+            prev_raw_action,
+        ], dim=-1)
+
     if layout == "visible":
         # AppleReachVisible-v1 (envs/apple_reach_visible_env_cfg.py): waist held,
         # 37 = arm pos (7), vel (7), the PERCEIVED apple - palm in the torso's yaw
@@ -446,7 +465,13 @@ def update_reach_grasp_phase(
     elapsed = env.episode_length_buf.float() * env.step_dt
     switch = reaching & (elapsed >= handoff_time_s - 1e-6)
 
-    if handoff_mode == "converged":
+    if handoff_mode == "arm_pose":
+        # the waypoint reach (arm_pose.waypoint_reach_step): the apple goal
+        # reached (the arm-pose policy's own test) and kept hold_time
+        from .arm_pose import plan_state
+
+        switch = switch | (reaching & (plan_state(env).t_at_goal >= hold_time - 1e-6))
+    elif handoff_mode == "converged":
         from .reach_rewards import reach_neighbourhood
 
         inside = reach_neighbourhood(
@@ -669,8 +694,14 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
         waist_raw = None
         if self.cfg.drive_with_reach_policy and not bool(phase.all()):
             policy = _load_reach_policy(self.cfg.reach_policy_path, self.device)
+            if self.cfg.reach_obs_layout == "arm_pose":
+                from .arm_pose import waypoint_reach_step
+
+                waypoint_reach_step(self._env, ~phase.squeeze(-1), **self.cfg.reach_arm_pose)
             waist = {"ring_range": self.cfg.reach_ring_range} if self._waist_id is None else \
                 {"joint_cfg": self._waist_cfg, "prev_raw": self._waist_prev_raw, "ring_range": self.cfg.reach_ring_range}
+            if self.cfg.reach_arm_pose is not None:
+                waist["pocket_local"] = self.cfg.reach_arm_pose["pocket_local"]
             obs = _reach_obs(
                 self._env, self._reach_arm_cfg, self._palm_cfg, self._apple_cfg,
                 self.cfg.palm_local_offset, self._reach_prev_raw, layout=self.cfg.reach_obs_layout, waist=waist,
@@ -854,6 +885,10 @@ class ReachHandoffJointPositionActionCfg(RateLimitedJointPositionActionCfg):
     reach_waist_max_velocity: float = 1.0
     reach_waist_max_acceleration: float = 4.0
     reach_ring_range: float = 0.10
+    reach_arm_pose: dict | None = None
+    """Layout "arm_pose": the keyword arguments of arm_pose.waypoint_reach_step
+    (pocket_local, stage_radius, goal offsets, the arm-pose policy's track
+    params ...), called every reach-phase step before its inputs are built."""
     """Clearance-ring range of the reach policy's input (layout "waist")."""
     reach_offset: dict[str, float] | None = None
     """Joint name -> target held during the REACH phase when no reach policy

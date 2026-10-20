@@ -135,6 +135,10 @@ def _torso(env):
 #  Library
 # ─────────────────────────────────────────────
 
+#: balanced goal draws pre-sampled per yaw bracket
+BALANCED_POOL = 100_000
+
+
 class _Library:
     """The pose library on the device, with per-yaw-bracket index lists.
 
@@ -142,7 +146,8 @@ class _Library:
     as clear there when it is clear at both ends (the clearance changes
     smoothly with the yaw: only the legs move relative to the arm)."""
 
-    def __init__(self, env, path: str, start_clearance: float, goal_clearance: float, task_filter: dict):
+    def __init__(self, env, path: str, start_clearance: float, goal_clearance: float, task_filter: dict,
+                 balance_voxel: float = 0.0):
         robot = env.scene["robot"]
         dev = env.device
         lib = np.load(path)
@@ -170,6 +175,21 @@ class _Library:
             "goal_task": self._pack((bclear >= goal_clearance) & task.unsqueeze(-1)),
         }
         self.n_brackets = bclear.shape[1]
+        # "goal_bal": goal_any weighted by 1 / (poses in the same pocket voxel), per bracket -- even
+        # over the reachable SPACE (uniform joint sampling crowds some places, e.g. the arm's side)
+        self.weights = {}
+        if balance_voxel > 0.0:
+            pad, counts = self.sets["goal_any"]
+            vox = torch.floor(self.pocket / balance_voxel).long()
+            key = (vox[:, 0] * 1000003 + vox[:, 1] * 1009 + vox[:, 2])
+            # drawn once into a pool per bracket (sampling it is then a plain index;
+            # torch.multinomial per bracket every step halved the env's speed)
+            pool = torch.zeros(self.n_brackets, BALANCED_POOL, dtype=torch.long, device=dev)
+            for b in range(self.n_brackets):
+                idx = pad[b, :int(counts[b])]
+                _, inv, cnt = torch.unique(key[idx], return_inverse=True, return_counts=True)
+                pool[b] = idx[torch.multinomial(1.0 / cnt[inv].float(), BALANCED_POOL, replacement=True)]
+            self.sets["goal_bal"] = (pool, torch.full((self.n_brackets,), BALANCED_POOL, device=dev))
         sizes = {k: v[1].tolist() for k, v in self.sets.items()}
         print(f"[arm_pose] library {path}: {len(self.q)} poses, task-like {int(task.sum())}; "
               f"per yaw bracket: {sizes}")
@@ -208,6 +228,7 @@ def reset_arm_pose(
     goal_clearance: float = 0.03,
     task_filter: dict | None = None,
     hand_targets: dict | None = None,
+    balance_voxel: float = 0.0,
 ) -> None:
     """mode="reset": waist yaw for the episode (random bracket, uniform in
     it, joint + PD target), arm teleported to a library start pose that is
@@ -217,7 +238,7 @@ def reset_arm_pose(
     robot = env.scene["robot"]
     dev = env.device
     if not hasattr(env, "_arm_pose_lib"):
-        env._arm_pose_lib = _Library(env, library_file, start_clearance, goal_clearance, task_filter)
+        env._arm_pose_lib = _Library(env, library_file, start_clearance, goal_clearance, task_filter, balance_voxel)
     L = env._arm_pose_lib
     P = pose_state(env)
     ids = torch.as_tensor(env_ids, device=dev, dtype=torch.long)
@@ -284,6 +305,7 @@ def advance_goals(
     hold_forever_prob: float = 0.0,
     push_prob: float = 0.0,
     push_max_n: float = 0.0,
+    balanced: bool = False,
 ) -> None:
     """mode="interval" (every step, after the rewards): a new goal where the
     episode just started (first step), the goal was reached this step, or it
@@ -316,7 +338,7 @@ def advance_goals(
     idx = None
     for _ in range(4):
         use_task = torch.rand(n, device=dev) < task_prob
-        cand = torch.where(use_task, L.sample("goal_task", b), L.sample("goal_any", b))
+        cand = torch.where(use_task, L.sample("goal_task", b), L.sample("goal_bal" if balanced else "goal_any", b))
         tgt = tp[ids] + quat_apply(tq[ids], L.pocket[cand])
         nrm = quat_apply(tq[ids], L.normal[cand])
         far = ((tgt - pocket[ids]).norm(dim=-1) > 0.05) | ((nrm * normal[ids]).sum(-1) < math.cos(math.radians(30)))
@@ -404,6 +426,11 @@ def obs_goal_finger(env: "ManagerBasedRLEnv", pocket_local) -> torch.Tensor:
     _, _, fin, _ = _live_target(env, pocket_local)
     q = env.scene["robot"].data.body_quat_w[:, _bid(env, PALM)]
     return quat_apply_inverse(q, fin) * P.finger_on.float().unsqueeze(-1)
+
+
+def obs_waist_yaw(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """[N, 1] waist yaw (rad): where the legs are relative to the arm (AppleArmPose-v3)."""
+    return env.scene["robot"].data.joint_pos[:, _jid(env, WAIST)].unsqueeze(-1)
 
 
 def obs_goal_flags(env: "ManagerBasedRLEnv") -> torch.Tensor:
@@ -693,3 +720,137 @@ def draw_goal(env: "ManagerBasedRLEnv", env_ids) -> None:
     if not hasattr(env, "_arm_pose_viz"):
         env._arm_pose_viz = GoalViz(env)
     env._arm_pose_viz.update()
+
+
+# ─────────────────────────────────────────────
+#  Waypoint reach inside another task (AppleGraspArmPose-v1's reach phase)
+# ─────────────────────────────────────────────
+
+class _Plan:
+    def __init__(self, env):
+        N, d = env.num_envs, env.device
+        self.wp = torch.full((N,), -1, dtype=torch.long, device=d)       # -1 none, 0 staging, 1 apple
+        self.t_wp = torch.zeros(N, device=d)
+        self.t_at_goal = torch.zeros(N, device=d)                          # s since the apple goal was reached
+        self.goal = torch.zeros(N, 3, device=d)
+        self.apple = torch.zeros(N, 3, device=d)                           # the perceived apple aimed at
+
+
+def plan_state(env: "ManagerBasedRLEnv") -> _Plan:
+    if not hasattr(env, "_arm_pose_plan"):
+        env._arm_pose_plan = _Plan(env)
+    return env._arm_pose_plan
+
+
+def waypoint_reach_step(
+    env: "ManagerBasedRLEnv",
+    reaching: torch.Tensor,
+    pocket_local,
+    stage_radius: tuple[float, float] = (0.24, 0.24),
+    min_stage_back: float = 0.08,
+    stage_advance_d: float = 0.05,
+    stage_advance_deg: float = 30.0,
+    stage_advance_s: float = 2.4,
+    goal_offset_axial: tuple[float, float] = (0.0, 0.0),
+    goal_offset_cross: float = 0.0,
+    track: dict | None = None,
+) -> None:
+    """Once per control step, before the frozen arm-pose policy's inputs are
+    built: the robot's waypoint reach (sim2real/toy_arm_pose.py,
+    arm_pose_io.make_plan, scripts/play_arm_pose_reach.py) for the envs still
+    `reaching`. On an episode's second step (body poses fresh after the
+    reset): the plan from the PERCEIVED apple (env._apple_meas, else the
+    true one) -- STAGING at the goal's height, stage_radius (sampled) from
+    the torso axis horizontally on the torso -> apple line (pulled in to
+    min_stage_back short of the goal), then the APPLE: the pocket on the
+    apple centre moved by a calibration-like offset (axial along the
+    approach, U(goal_offset_axial); sideways / vertical U(+-goal_offset_
+    cross)); the palm normal along that horizontal line, fingers free, both
+    stop goals. Staging is left once within stage_advance_d /
+    stage_advance_deg, when reached, or after stage_advance_s (the robot's
+    STAGE_ADVANCE_*). plan.t_at_goal counts the time since the apple goal was
+    reached (track_goal), for the hand-off."""
+    P = pose_state(env)
+    S = plan_state(env)
+    dev = env.device
+    buf = env.episode_length_buf
+    fresh = buf <= 0
+    if bool(fresh.any()):
+        S.wp[fresh] = -1
+        S.t_wp[fresh] = 0.0
+        S.t_at_goal[fresh] = 0.0
+        P.pending[fresh] = True
+        P.arrived[fresh] = False
+        P.hold[fresh] = 0.0
+    todo = (S.wp < 0) & (buf >= 1) & reaching
+    if bool(todo.any()):
+        ids = todo.nonzero(as_tuple=True)[0]
+        n = len(ids)
+        meas = getattr(env, "_apple_meas", None)
+        apple = meas[ids] if meas is not None else env.scene["apple"].data.root_pos_w[ids]
+        tp, _ = _torso(env)
+        axis = tp[ids]
+        u = apple - axis
+        u[:, 2] = 0.0
+        u = u / u.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        side = torch.stack([-u[:, 1], u[:, 0], torch.zeros_like(u[:, 0])], dim=-1)
+        up = torch.zeros_like(u)
+        up[:, 2] = 1.0
+        lo, hi = goal_offset_axial
+        ax = lo + (hi - lo) * torch.rand(n, device=dev)
+        cr = (2 * torch.rand(n, 2, device=dev) - 1) * goal_offset_cross
+        goal = apple + ax.unsqueeze(-1) * u + cr[:, :1] * side + cr[:, 1:] * up
+        d_goal = ((goal - axis) * u).sum(-1)
+        r = stage_radius[0] + (stage_radius[1] - stage_radius[0]) * torch.rand(n, device=dev)
+        r = torch.minimum(r, d_goal - min_stage_back)
+        stage = axis + r.unsqueeze(-1) * u
+        stage[:, 2] = goal[:, 2]
+        S.goal[ids], S.apple[ids] = goal, apple
+        P.target[ids], P.normal[ids] = stage, u
+        P.finger[ids] = hand_frame(env, pocket_local)[2][ids]
+        P.finger_on[ids] = False
+        P.via[ids] = False
+        P.start[ids] = hand_frame(env, pocket_local)[0][ids]
+        P.pending[ids] = False
+        P.arrived[ids] = False
+        P.hold[ids] = 0.0
+        S.wp[ids] = 0
+        S.t_wp[ids] = 0.0
+    live = reaching & (S.wp >= 0)
+    if not bool(live.any()):
+        return
+    track_goal(env, pocket_local, **(track or {}))
+    dt = env.step_dt
+    S.t_wp = S.t_wp + dt * live.float()
+    d, ang, _, _ = errors(env, pocket_local)
+    adv = live & (S.wp == 0) & (((d < stage_advance_d) & (ang < math.radians(stage_advance_deg)))
+                                | P.success | (S.t_wp >= stage_advance_s))
+    if bool(adv.any()):
+        ids = adv.nonzero(as_tuple=True)[0]
+        P.start[ids] = hand_frame(env, pocket_local)[0][ids]
+        P.target[ids] = S.goal[ids]
+        P.arrived[ids] = False
+        P.success[ids] = False
+        P.hold[ids] = 0.0
+        S.wp[ids] = 1
+        S.t_wp[ids] = 0.0
+    at = live & (S.wp == 1) & P.arrived
+    S.t_at_goal = torch.where(at, S.t_at_goal + dt, torch.zeros_like(S.t_at_goal))
+
+
+def set_arm_start(env: "ManagerBasedRLEnv", env_ids: torch.Tensor, joint_pos: dict[str, float]) -> None:
+    """mode="reset" (after the joint resets): the named joints teleported to
+    joint_pos, at rest, PD targets on it -- the robot's start pose."""
+    robot = env.scene["robot"]
+    ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    if not hasattr(env, "_arm_start_ids"):
+        env._arm_start_ids = torch.tensor([robot.joint_names.index(j) for j in joint_pos], device=env.device)
+        env._arm_start_vals = torch.tensor(list(joint_pos.values()), device=env.device)
+    jp = robot.data.joint_pos[ids].clone()
+    jv = robot.data.joint_vel[ids].clone()
+    tgt = robot.data.joint_pos_target[ids].clone()
+    jp[:, env._arm_start_ids] = env._arm_start_vals
+    jv[:, env._arm_start_ids] = 0.0
+    tgt[:, env._arm_start_ids] = env._arm_start_vals
+    robot.write_joint_state_to_sim(jp, jv, env_ids=ids)
+    robot.set_joint_position_target(tgt, env_ids=ids)
