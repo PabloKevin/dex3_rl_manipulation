@@ -80,9 +80,23 @@
   "block_s": 0.4,
   "_help": "REACTIVE FALLBACK during the APPROACH (onboard): BLOCKED when, with the palm still more than block_far_m from the apple's surface, TWO fingers' pads press >= block_n each (robot 2026-10-20: a single pad read 1.1-1.6 N on two approaches that were not blocked, and 30 N on an empty hand), or the arm lags its command beyond its gravity sag by >= block_lead_rad on a shoulder / elbow joint for block_s (real approaches 2026-10-19/20: at most 0.072 rad: the motion's own lag). The approach stops, the arm backs off; the next try comes from the side (the trunk check's free side, else one side then the other). A detach that stalls (a trunk in the hand does not come off) counts as blocked too. Thresholds not yet seen on a real trunk contact: logged."
  },
- "reach_thumb": {
-  "_help": "the thumb during the reach (and the way to the apple): fully open; the grasp closes it. Dex3 rad: thumb_1 (+ = away from the palm, max 0.72, the cup had 0.15), thumb_2 (0 = straight = its open limit, the cup had -0.34).",
+ "twist": {
+  "_help": "after the grasp, before the pull (user 2026-10-21): the hand turned by deg about the PALM NORMAL through the grasp pocket (the apple turns on its stem axis), held hold_s, turned back; scripted (small Jacobian steps on the URDF, planned before moving). The direction with more joint room first, min_deg if deg does not fit; every joint kept margin_rad inside its limits; the path checked against the body cover; speed_rad_s the joints' peak speed. enabled false = no twist.",
+  "enabled": true,
+  "deg": 45.0,
+  "min_deg": 25.0,
+  "margin_rad": 0.08,
+  "speed_rad_s": 0.8,
+  "hold_s": 0.2
+ },
+ "reach_hand": {
+  "_help": "REACH fully open -> PREGRASP at the apple (cup_s, the arm held) -> grasp (user 2026-10-21). Reach: index/middle 0 (open limit), thumb_2 0 (straight), thumb_1 + = away from the palm (max 0.72); thumb_0 is the picker's (--thumb_deg). Pregrasp: the earlier reaches' cup (index/middle_1 1.396) with this thumb, or with --grasp_mode policy the cup that policy was trained from.",
   "thumb_1": 0.15,
-  "thumb_2": 0.0
+  "thumb_2": 0.0,
+  "index_0": 0.0,
+  "index_1": 0.0,
+  "middle_0": 0.0,
+  "middle_1": 0.0,
+  "cup_s": 1.0
  }
 }

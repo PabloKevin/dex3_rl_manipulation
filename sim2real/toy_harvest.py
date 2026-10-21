@@ -150,6 +150,10 @@ def parse_args():
     p.add_argument("--trunk_side", choices=["off", "shadow", "act"], default="act",
                    help="apple beside the trunk (sim2real/trunk_side.py: depth + colour): act = reach from its free side "
                         "(the palm turned up to 60 deg), shadow = only log / save the picture, off")
+    p.add_argument("--grasp_mode", choices=["picker", "policy"], default="picker",
+                   help="the close at the apple: the picker's scripted close (default), or the RL grasp policy "
+                        "(--grasp_policy, AppleGraspSpindle-v2 model 1499 by default: FINGERS only, the arm held still; "
+                        "--grip_n / --grasp_s / --grip_stop_n as toy_grasp)")
     p.add_argument("--max_trunks", type=int, default=3,
                    help="at most this many trees (trunks) in the scene: per picture and in the trunk map (3 trees now)")
     p.add_argument("--reactive", choices=["off", "on"], default="on",
@@ -621,6 +625,108 @@ class ToyHarvest(TA.ToyArmPose):
                 self.args.move_speed = keep
         return err
 
+    # ---- TWIST: the apple turned on its stem before the pull (user 2026-10-21), then turned back ----
+    @staticmethod
+    def _rotvec(Rm):
+        c = float(np.clip((np.trace(Rm) - 1.0) / 2.0, -1.0, 1.0))
+        th = math.acos(c)
+        if th < 1e-9:
+            return np.zeros(3)
+        w = np.array([Rm[2, 1] - Rm[1, 2], Rm[0, 2] - Rm[2, 0], Rm[1, 0] - Rm[0, 1]])
+        return w * (th / (2.0 * math.sin(th))) if th < math.pi - 1e-6 else w
+
+    def twist_plan(self, q0, w3, deg, steps=6):
+        """Joint waypoints that turn the hand by `deg` about the PALM NORMAL through the grasp POCKET (the apple
+        turns on its own stem axis instead of swinging), from q0. Small damped-least-squares steps on the URDF
+        (numeric Jacobian, a scripted move -- not the reach). -> ([q per step], why) or (None, why): the pocket
+        must stay within 1 cm and the angle within 3 deg, every joint inside its limits by margin_rad."""
+        Tw = self.hcfg["twist"]
+        margin = float(Tw.get("margin_rad", 0.08))
+        q0 = np.asarray(q0, float)
+        # margin_rad inside the limits; a joint that STARTS inside the margin (the reach ends with the wrist roll
+        # at its limit, robot 2026-10-20) may stay there but not go deeper
+        lo = np.minimum(np.asarray(self.lo, float) + margin, q0)
+        hi = np.maximum(np.asarray(self.hi, float) - margin, q0)
+
+        def pose(q):
+            fr = self.kin.frames(w3, q)
+            return AP.hand_frame(fr)[0], fr.palm_R
+        p0, R0 = pose(q0)
+        n0 = self.kin.frames(w3, q0).palm_normal
+        n0 = n0 / np.linalg.norm(n0)
+        q = np.asarray(q0, float).copy()
+        out = []
+        for k in range(1, steps + 1):
+            a_k = math.radians(deg) * k / steps
+            K = np.array([[0, -n0[2], n0[1]], [n0[2], 0, -n0[0]], [-n0[1], n0[0], 0]])
+            Rt = (np.eye(3) + math.sin(a_k) * K + (1 - math.cos(a_k)) * K @ K) @ R0
+            for _ in range(40):
+                p, Rq = pose(q)
+                e = np.concatenate([p0 - p, self._rotvec(Rt @ Rq.T)])
+                if np.linalg.norm(e[:3]) < 1e-3 and np.linalg.norm(e[3:]) < math.radians(0.5):
+                    break
+                J = np.zeros((6, 7))
+                for j in range(7):
+                    dq = np.zeros(7)
+                    dq[j] = 1e-4
+                    pj, Rj = pose(q + dq)
+                    J[:3, j] = (pj - p) / 1e-4
+                    J[3:, j] = self._rotvec(Rj @ Rq.T) / 1e-4
+                lam = 0.02
+                q = np.clip(q + J.T @ np.linalg.solve(J @ J.T + lam * np.eye(6), e), lo, hi)
+            p, Rq = pose(q)
+            if np.linalg.norm(p - p0) > 0.01 or np.linalg.norm(self._rotvec(Rt @ Rq.T)) > math.radians(3):
+                return None, f"cannot turn {deg:+.0f} deg in place (at {math.degrees(a_k):+.0f} deg the pocket " \
+                             f"moved {np.linalg.norm(p - p0) * 100:.1f} cm)"
+            out.append(q.copy())
+        return out, "ok"
+
+    def twist(self):
+        """GRASP -> TWIST -> back -> DETACH: the hand (the apple gripped) turned about the palm normal by twist.deg,
+        held hold_s, turned back the same way. The direction with the most joint room first; smaller angles when a
+        full one does not fit the limits; every path checked against the body cover (joint_move), at the toy's
+        own speed / acceleration watch. -> None (done or skipped) or an error that stops the run."""
+        Tw = self.hcfg.get("twist") or {}
+        if not Tw.get("enabled", False):
+            return None
+        s = self.io.read()
+        w3 = np.asarray(s.waist_q, float)
+        q0 = np.asarray(self.q_sent if self.q_sent is not None else s.arm_q, float).copy()
+        tries = []
+        for deg in (float(Tw.get("deg", 45.0)), float(Tw.get("min_deg", 25.0))):
+            for sign in (+1.0, -1.0):
+                tries.append(sign * deg)
+        plan, why_all = None, []
+        best = None
+        for d in tries:
+            pts, why = self.twist_plan(q0, w3, d)
+            if pts is None:
+                why_all.append(why)
+                continue
+            room = float(np.min(np.minimum(np.asarray(pts) - self.lo, self.hi - np.asarray(pts))))
+            if best is None or abs(d) > abs(best[0]) or (abs(d) == abs(best[0]) and room > best[2]):
+                best = (d, pts, room)
+        if best is None:
+            self.brief("WARN", "twist skipped: " + "; ".join(why_all[:2]), fold_s=0.0)
+            return None
+        d, pts, room = best
+        self.hset("DETACH", f"twisting the apple {d:+.0f} deg on its stem")
+        self.brief("STEP", f"twist {d:+.0f} deg about the palm normal, then back (the apple turned on its stem)")
+        keep = self.hcfg["moves"]["speed_rad_s"]
+        self.hcfg["moves"]["speed_rad_s"] = float(Tw.get("speed_rad_s", 0.8))
+        try:
+            err = self.joint_move(pts, f"twist {d:+.0f} deg")
+            if err:
+                if "collides" in err:
+                    self.brief("WARN", f"twist skipped: {err}", fold_s=0.0)
+                    return None
+                return err
+            self.hold(self.q_sent, float(Tw.get("hold_s", 0.2)))
+            err = self.joint_move(list(reversed(pts[:-1])) + [q0], "twist back")
+            return err
+        finally:
+            self.hcfg["moves"]["speed_rad_s"] = keep
+
     # ---- DETACH: the apple off its stem without the snap ----
     def replay_path(self, pull_m):
         """The approach leg's own measured arm path (the onboard runner's 25 Hz state, or the laptop leg's rows),
@@ -926,17 +1032,197 @@ class ToyHarvest(TA.ToyArmPose):
         if app is not None and getattr(self, "_grip_kp0", None) is not None:
             app.hand_kp_vec = list(self._grip_kp0)
 
+    # ---- the close: the RL grasp policy, fingers only (--grasp_mode policy) ----
+    def grasp_close(self):
+        if getattr(self.args, "grasp_mode", "picker") != "policy":
+            return super().grasp_close()
+        return self.grasp_policy_close()
+
+    def grasp_policy_close(self):
+        """The hand-only grasp policy (toy_reach.grasp_phase's inputs and limiters) closing the FINGERS on the apple:
+        the arm held where the reach left it (the policy's arm outputs ignored), the hand from where it is, until a
+        grip (two finger groups > 0.5 N for 0.3 s) has been kept grasp_hold_s, or grasp_s without one. The fingers
+        then stay at their last command through the twist / pull / way home (the picker's open releases them).
+        Pad force over grip_stop_n: the fingers stop where they are. -> "grasp ..." or "E-STOP: ..."."""
+        a, io = self.args, self.io
+        if not getattr(io, "commands", False) or a.hand == "keep":
+            return "grasp skipped (no hand output)"
+        if getattr(self, "_gpol", None) is None:
+            self._gpol = R.GraspPolicy(a.grasp_policy)
+            self.brief("INFO", f"grasp policy {os.path.basename(a.grasp_policy)} loaded (fingers only)", fold_s=0.0)
+        apple = np.asarray(getattr(self, "_grasp_apple", None) if getattr(self, "_grasp_apple", None) is not None
+                           else self.apple, float)
+        pads = getattr(self, "_pads", None)
+        feats = R.TactileFeatures()
+        L = R.make_grasp_limiters()
+        s = io.read()
+        hq_art = R.hand_dex3_to_art(s.hand_q if s.hand_q is not None else
+                                    np.array([R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER]))
+        hq_art[R.HAND_ART_ORDER.index("thumb_0")] = R.REACH_HAND_PRESHAPE["right_hand_thumb_0_joint"]
+        L["hand"].prev, L["hand"].vel, L["hand"].k = hq_art.copy(), np.zeros(7), L["hand"].ANCHOR_STEPS
+        lo_h = np.array([R.HAND_LIMITS[n][0] for n in R.HAND_ART_ORDER])
+        hi_h = np.array([R.HAND_LIMITS[n][1] for n in R.HAND_ART_ORDER])
+        q_hold = self.q_sent if self.q_sent is not None else self.gravity_hold(s)
+        spd = a.grasp_speed or a.speed
+        self.set_phase("GRASP")
+        self.ctx["doing"] = "grasp policy closing the fingers"
+        prev_raw = np.zeros(7)
+        t0 = io.now()
+        t_next = t0
+        grip_since = held_since = None
+        lvl = np.zeros(3)
+        peak = 0.0
+        hand_dex = R.hand_art_to_dex3(hq_art)
+        result = None
+        while True:
+            if io.estop_why is not None:
+                return f"E-STOP: {io.estop_why}"
+            s = io.read()
+            fr = self.frames(s)
+            t = io.now() - t0
+            if pads is not None and s.pads is not None and getattr(self, "_pads_ok", False):
+                taxels, pooled, _ = pads.taxels(s.pads)
+            else:
+                taxels, pooled = np.zeros(9), 0.0
+            slip, bal, lvl = feats.step(taxels)
+            peak = max(peak, float(pooled))
+            hq = np.array(s.hand_q if s.hand_q is not None else R.hand_art_to_dex3(L["hand"].prev), float)
+            hdq = np.zeros(7) if s.hand_dq is None else np.asarray(s.hand_dq, float)
+            hq[0] = float(R.hand_art_to_dex3(L["hand"].prev)[0])        # thumb_0: the policy's own (the picker locks it)
+            hdq[0] = 0.0
+            obs = R.build_grasp_obs(hq, hdq, slip, bal, lvl, a.grip_n, R.apple_in_palm_frame(fr, apple), prev_raw,
+                                    R.gravity_in_palm(fr))
+            raw = self._gpol(obs)
+            if float(pooled) > a.grip_stop_n:
+                hand_dex = np.asarray(s.hand_q, float) if s.hand_q is not None else hand_dex
+                io.hand_cmd(hand_dex)
+                result = f"grasp policy: pad force {float(pooled):.1f} N > {a.grip_stop_n:g} N -- the fingers stopped there"
+                break
+            hand_dex = R.hand_art_to_dex3(np.clip(L["hand"].step(raw[7:14], None, spd), lo_h, hi_h))
+            io.hand_cmd(hand_dex)
+            io.send_arm(q_hold)
+            self.q_sent = q_hold
+            prev_raw = raw[7:14].copy()
+            grip_now = int(np.sum(np.asarray(lvl) > 0.5)) >= 2
+            grip_since = (grip_since if grip_since is not None else t) if grip_now else None
+            gripped = grip_since is not None and t - grip_since >= 0.3
+            held_since = (held_since if held_since is not None else t) if gripped else None
+            if held_since is not None and t - held_since >= a.grasp_hold_s:
+                result = (f"grasp policy: GRIP held {a.grasp_hold_s:g} s (finger forces thumb / index / middle "
+                          f"{np.round(lvl, 1).tolist()} N, pad peak {peak:.1f} N)")
+                break
+            if held_since is None and t >= a.grasp_s:
+                result = (f"grasp policy: NO GRIP in {a.grasp_s:g} s (finger forces {np.round(lvl, 1).tolist()} N, "
+                          f"index_1 {hq[4]:+.2f} middle_1 {hq[6]:+.2f} rad)")
+                break
+            self.status(s, extra="GRASP (policy)")
+            t_next += R.DT
+            if io.now() - t_next > R.DT:
+                t_next = io.now()
+            io.sleep_until(t_next)
+        self._grasp_hand_hold = hand_dex
+        self.brief("INFO" if "GRIP held" in result else "WARN", result, fold_s=0.0)
+        return result
+
+    def reach_hand_q(self):
+        """The hand during the reach (user 2026-10-21): FULLY OPEN -- index / middle straight (0, their open limit),
+        thumb_1 / thumb_2 from harvest_config "reach_hand" (thumb_2 0 = straight); thumb_0 is the picker's. The
+        arm-pose policy does not see the hand. The grasp policy's cup is set at the apple (grasp_policy_close)."""
+        q = np.array([AP.HAND_CUP[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER], float)
+        h = self.hcfg.get("reach_hand") or {}
+        for k, n in enumerate(R.DEX3_ORDER):
+            if n in h:
+                q[k] = float(h[n])
+        return q
+
+    def pregrasp(self):
+        """REACH fully open -> PREGRASP -> grasp (user 2026-10-21): at the apple, the arm held, the hand closes to the
+        pregrasp cup the earlier reaches carried (index / middle curled 80 deg; the thumb from reach_hand) -- or,
+        with --grasp_mode policy, the cup that policy was trained from (thumb tip in -0.34) -- and waits cup_s."""
+        io = self.io
+        if not (getattr(io, "commands", False) and self.args.hand != "keep"):
+            return
+        h = self.hcfg.get("reach_hand") or {}
+        if getattr(self.args, "grasp_mode", "picker") == "policy":
+            q = np.array([R.REACH_HAND_PRESHAPE[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER], float)
+        else:
+            q = np.array([AP.HAND_CUP[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER], float)
+            for k, n in enumerate(R.DEX3_ORDER):
+                if n.startswith("thumb") and n in h:
+                    q[k] = float(h[n])
+        self.set_phase("GRASP")
+        self.ctx["doing"] = "closing to the pregrasp"
+        self.hset("GRASP", "closing the hand to the pregrasp")
+        io.hand_cmd(q)
+        s = io.read()
+        self.hold(self.q_sent if self.q_sent is not None else self.gravity_hold(s), float(h.get("cup_s", 0.6)))
+        s = io.read()
+        if s.hand_q is not None:
+            self.brief("INFO", "pregrasp: index_1 / middle_1 " + f"{s.hand_q[4]:+.2f} / {s.hand_q[6]:+.2f} rad "
+                               f"(target {q[4]:+.2f} / {q[6]:+.2f})", fold_s=0.0)
+
     def hand_cup(self):
-        """The reach's cup, but the THUMB fully open (user 2026-10-21: open during the reach, closed only by the
-        grasp): thumb_1 / thumb_2 from harvest_config "reach_thumb" (thumb_2 0 = straight, its open limit; the cup
-        had it curled -0.34). The index / middle keep the cup the policy was trained with; thumb_0 is the picker's."""
+        """The reach's hand: fully open (reach_hand_q)."""
         if not (getattr(self.io, "commands", False) and self.args.hand != "keep"):
             return
-        q = np.array([AP.HAND_CUP[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER], float)
-        th = self.hcfg.get("reach_thumb") or {}
-        q[1] = float(th.get("thumb_1", 0.15))
-        q[2] = float(th.get("thumb_2", 0.0))
-        self.io.hand_cmd(q)
+        self.io.hand_cmd(self.reach_hand_q())
+
+    def reseat_fingers(self, tol_deg=8.0, max_s=1.5):
+        """The index and middle to the reach hand (fully open) before EVERY reach (user 2026-10-21: "the index seems to be bad
+        sometimes"; robot logs: index_0 / middle_0 dropped out of control 2-3x): a motor reporting mode 0 gets the
+        picker's re-arm (its writer resends the mode for a few frames), a joint more than tol_deg from its cup
+        target its kp doubled (max 1.5) for at most max_s, then restored. Logged when anything was off."""
+        io = self.io
+        app = getattr(io, "app", None)
+        if not getattr(io, "commands", False) or app is None or self.args.hand == "keep":
+            return
+        J = (3, 4, 5, 6)                                           # index_0, index_1, middle_0, middle_1 (Dex3 order)
+        names = [R.DEX3_ORDER[j] for j in J]
+        q_t = self.reach_hand_q()[list(J)]
+
+        def state():
+            hs = getattr(app, "right_hand_state", None)
+            ms = getattr(hs, "motor_state", None) if hs is not None else None
+            if ms is None or len(ms) < 7:
+                return None, None
+            return np.array([float(ms[j].q) for j in J]), [int(getattr(ms[j], "mode", 1)) for j in J]
+        self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.6)    # the cup command reaching them
+        q, modes = state()
+        if q is None:
+            return
+        off = [n for n, m in zip(names, modes) if m == 0]
+        if off:                                                    # re-arm the dropped motors (the picker's writer)
+            try:
+                for j, m in zip(J, modes):
+                    if m == 0:
+                        app._mode_rearm_frames_left["right"][j] = max(int(app._mode_rearm_frames_left["right"][j]), 12)
+                        app._mode_rearm_armed["right"][j] = False
+            except Exception as e:
+                self.brief("WARN", f"fingers: {off} out of control, re-arm failed ({e})", fold_s=0.0)
+        err = np.degrees(np.abs(q - q_t))
+        if not off and float(err.max()) <= tol_deg:
+            return
+        kp0 = list(getattr(app, "hand_kp_vec", None) or [float(getattr(app, "hand_kp", 0.5))] * 7)
+        kp = list(kp0)
+        for j in J:
+            kp[j] = min(1.5, 2.0 * kp0[j])
+        app.hand_kp_vec = kp
+        t0 = time.monotonic()
+        try:
+            while time.monotonic() - t0 < max_s:
+                self.hold(self.q_sent if self.q_sent is not None else R.HOME_Q, 0.1)
+                q2, m2 = state()
+                if q2 is not None and float(np.degrees(np.abs(q2 - q_t)).max()) <= tol_deg and min(m2) > 0:
+                    break
+        finally:
+            app.hand_kp_vec = kp0
+        q2, m2 = state()
+        e2 = np.degrees(np.abs(q2 - q_t)) if q2 is not None else err
+        ok = float(e2.max()) <= tol_deg and (m2 is None or min(m2) > 0)
+        self.brief("INFO" if ok else "WARN",
+                   "fingers re-seated" + (f" (re-armed {off})" if off else "") + ": off by "
+                   + ", ".join(f"{n} {a:.0f}->{b:.0f}" for n, a, b in zip(names, err, e2)) + " deg"
+                   + f" in {time.monotonic() - t0:.1f} s", fold_s=0.0)
 
     def release_at_home(self):
         out = super().release_at_home()
@@ -1264,6 +1550,7 @@ class ToyHarvest(TA.ToyArmPose):
         back[0].target = stage.copy()
 
     def harvest_one(self, p, r, heading=0.0):
+        self._grasp_apple = np.asarray(p, float).copy()           # the apple centre, for --grasp_mode policy
         """APPROACH, GRASP, DETACH, RETURN, DEPOSIT (RELEASE) for the apple at p (pelvis), the palm turned
         heading deg from the approach rule (reach_map). -> (outcome, stop)"""
         a, io = self.args, self.io
@@ -1296,8 +1583,12 @@ class ToyHarvest(TA.ToyArmPose):
             self.turn_plan(plan, back, heading, fr)
             self.brief("INFO", f"palm turned {heading:+.0f} deg from the approach line (+ = left; the staging point on "
                                f"the turned line)", fold_s=0.0)
+        # the thumb to its target before EVERY reach (the hand open, the arm home or at ready): the grasps and the
+        # drops push it off and its own gain does not bring it back (toy_arm_pose.reseat_thumb)
+        self.reseat_thumb()
         self.hset("APPROACH", "arm-pose policy: staging, then the apple")
         self.hand_cup()
+        self.reseat_fingers()
         self.approach_watch_start()
         out_a, stopped = self.legs(plan, "approach")
         self._leg_approach = list(getattr(self, "_leg_rec", []) or [])
@@ -1317,12 +1608,16 @@ class ToyHarvest(TA.ToyArmPose):
         elif str(out_a).startswith("APPLE"):
             self.hset("GRASP", "closing the hand (the picker's close)")
             self.say_rl("rl_grasping")
+            self.pregrasp()
             self.grasp_baseline()
             self.grip_apply()
             out_g = self.grasp_close()
             if out_g.startswith("E-STOP"):
                 return out_g, True
             snap = self.grasp_snapshot(plan[-1].target)
+            err_t = self.twist()
+            if err_t:
+                return err_t, True
             self.hset("DETACH", "pulling the apple off its stem (slow, stiff, the snap caught)")
             self.say_rl("rl_pulling")
             out_d = self.detach()
@@ -1394,9 +1689,6 @@ class ToyHarvest(TA.ToyArmPose):
                 out_dp, stop = self.deposit()
                 if stop:
                     return out_dp, True
-                # the thumb back to its target after every deposit (the hand open, the arm home): the grasp and the
-                # drop push it off and its own gain does not bring it back (toy_arm_pose.reseat_thumb)
-                self.reseat_thumb()
             else:
                 self.hset("RELEASE", "opening the hand at home")
                 self.release_at_home()
