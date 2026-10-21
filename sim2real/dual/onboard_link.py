@@ -234,6 +234,13 @@ def run_policy_onboard(toy, extra=None, tick=None):
             if io.estop_why is not None:
                 link.stop(f"E-STOP: {io.estop_why}")
             s = link.state
+            # the runner's one DONE message can be lost (robot 2026-10-21: twice the toy waited forever after
+            # "BASKET / READY REACHED" while the runner sat idle): its idle state repeats the last result
+            last = s.get("last") if s.get("phase") == "IDLE" else None
+            if isinstance(last, dict) and last.get("id") == ep_id and last.get("outcome"):
+                res = dict(last)
+                say("WARN", "the runner's DONE message was lost: its result taken from its idle state", fold_s=0.0)
+                break
             if s.get("id") == ep_id and s.get("q") is not None and s.get("t") is not None:
                 rec = toy.__dict__.setdefault("_leg_rec", [])
                 if not rec or rec[-1][0] != s["t"]:          # the leg's measured arm path (25 Hz), for replays

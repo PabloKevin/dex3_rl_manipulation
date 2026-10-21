@@ -16,6 +16,10 @@ imported unchanged; three of their pieces are swapped here:
   python3 sim2real/dual/run_toy.py pose --policy P --speed 0.3 --target detection [--onboard]
                       the AppleArmPose policy through staging -> apple waypoints (toy_arm_pose.py; the
                       dashboard's "stage" field = the staging radius, 0.15 m by default)
+  python3 sim2real/dual/run_toy.py follow --speed 0.3
+                      FOLLOW the apple in a person's hand with the arm-pose policy (live goal, laptop), the waist
+                      turning in parallel to keep it in view; "reach" / "grasp" / "end" by the laptop microphone or
+                      typed + ENTER (toy_follow.py; default --policy: the robot's AppleArmPose v1 export)
   python3 sim2real/dual/run_toy.py apple|grasp|chain ...     (as toy_apple / toy_grasp / toy_chain)
   python3 sim2real/dual/run_toy.py calib --policy P --speed 0.3 --target detection
                       the single toy + a calibration session after the policy stops: jog / float the
@@ -771,7 +775,7 @@ def _main():
     global STRICT, VERBOSE
     install_ctrl_c()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "pose", "harvest",
+    if not argv or argv[0] in ("-h", "--help") or argv[0] not in ("reach", "single", "visible", "pose", "harvest", "follow",
                                                                    "apple", "grasp", "chain", "v1", "tree", "calib"):
         print(__doc__)
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
@@ -843,7 +847,7 @@ def _main():
     T.PickerIO = DualIO
     T.Watch = LightWatch
     T.joint_path_traj = smooth_joint_path_traj
-    if kind not in ("single", "calib", "pose", "harvest") and "--dds_default" in rest:   # the launcher adds it in --loopback
+    if kind not in ("single", "calib", "pose", "harvest", "follow") and "--dds_default" in rest:   # the launcher adds it in --loopback
         global DDS_DEFAULT
         DDS_DEFAULT = True
         rest.remove("--dds_default")
@@ -857,6 +861,16 @@ def _main():
         P.ToyArmPose = mix(P.ToyArmPose)
         sys.argv = [sys.argv[0]] + rest
         return P.main()
+    if kind == "follow":
+        import toy_follow as F
+        F.ToyFollow = mix(F.ToyFollow)
+        for flag, val in {"--target": ["detection"],
+                          "--policy": [os.path.join(os.path.dirname(SIM2REAL), "logs", "rsl_rl", "apple_arm_pose",
+                                                    "2026-10-19_13-31-55", "exported", "policy.pt")]}.items():
+            if flag not in rest:
+                rest = rest + [flag] + val
+        sys.argv = [sys.argv[0]] + rest
+        return F.main()
     if kind == "harvest":
         import toy_harvest as H
         H.ToyHarvest = mix(H.ToyHarvest)

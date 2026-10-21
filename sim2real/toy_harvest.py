@@ -358,9 +358,12 @@ class ToyHarvest(TA.ToyArmPose):
         excl = float(self.hcfg["basket"].get("exclude_radius_m", 0.0))
         out = []
         seen = list(snap.seen_stamps) + [0.0] * len(snap.apples_all)
+        lag = self._stamp_lag()
+        n_stale = 0
         radii = list(snap.radii) + [None] * len(snap.apples_all)
         for i, pt in enumerate(snap.apples_all):
-            if now - float(seen[i]) > FRESH_S:
+            if now - float(seen[i]) - lag > FRESH_S:
+                n_stale += 1
                 continue
             p = fr.torso_R @ np.asarray(pt, float) + fr.torso_pos
             if excl > 0.0 and np.hypot(*(p - self.basket_B)[:2]) < excl:
@@ -380,7 +383,28 @@ class ToyHarvest(TA.ToyArmPose):
                         self._too_far_new = True
                     continue                                # out of the arm's reach at every yaw of the scan
             out.append(x)
+        if n_stale and not out and len(snap.apples_all) and not getattr(self, "_stale_warned", False):
+            self._stale_warned = True
+            self.brief("WARN", f"{n_stale} apple(s) dropped as old sightings (> {FRESH_S:g} s after the robot-clock "
+                               f"correction {lag:+.2f} s): is the robot's clock far off the laptop's?")
         return out
+
+    def _stamp_lag(self):
+        """The robot clock's lag behind the laptop's, as the detector sees it: the median of (arrival - capture
+        stamp) of its recent messages, minus a typical 0.15 s of transport. The sightings' times are the CAPTURE
+        stamps (robot clock) whenever the picker trusts them (0..3 s old), so a robot clock behind the laptop's
+        made every apple look stale here (robot 2026-10-21: 1.45 s behind after the whole-second clock sync ->
+        nothing was ever tried). 0 when the stamps are not usable (the picker then uses the arrival time)."""
+        try:
+            ages = sorted(float(a) for a in list(self.io.node.detection._ages)[-50:])
+        except Exception:
+            return 0.0
+        if len(ages) < 5:
+            return 0.0
+        med = ages[len(ages) // 2]
+        if not (0.0 < med < 3.0):                 # the picker's own window for trusting the stamps
+            return 0.0
+        return max(0.0, med - 0.15)
 
     def _memo(self, p, create=False):
         for m in self.memory:
@@ -824,8 +848,11 @@ class ToyHarvest(TA.ToyArmPose):
             return False, txt
         return None, txt + " (not clear)"
 
-    def travel_verdict(self):
+    def travel_verdict(self, empty_at=None):
+        """The fingers' travel -> (True held / False empty / None n/a, text): empty from empty_at (default
+        travel_empty) of the full open -> close travel on (the fingers closed past where an apple stops them)."""
         G = self.hcfg["grasp_check"]
+        empty_at = float(G["travel_empty"] if empty_at is None else empty_at)
         tv = None
         try:
             tv = self.io.hand.grasp_travel_frac("right")
@@ -833,7 +860,7 @@ class ToyHarvest(TA.ToyArmPose):
             pass
         if tv is None:
             return None, "travel n/a"
-        return bool(float(G["travel_min"]) <= tv < float(G["travel_empty"])), f"travel {tv * 100:.0f}%"
+        return bool(float(G["travel_min"]) <= tv < empty_at), f"travel {tv * 100:.0f}%"
 
     def vision_verdict(self):
         """At READY the hand is in the head camera's picture (bottom right): the detector's red apple at the grasp
@@ -899,6 +926,18 @@ class ToyHarvest(TA.ToyArmPose):
         if app is not None and getattr(self, "_grip_kp0", None) is not None:
             app.hand_kp_vec = list(self._grip_kp0)
 
+    def hand_cup(self):
+        """The reach's cup, but the THUMB fully open (user 2026-10-21: open during the reach, closed only by the
+        grasp): thumb_1 / thumb_2 from harvest_config "reach_thumb" (thumb_2 0 = straight, its open limit; the cup
+        had it curled -0.34). The index / middle keep the cup the policy was trained with; thumb_0 is the picker's."""
+        if not (getattr(self.io, "commands", False) and self.args.hand != "keep"):
+            return
+        q = np.array([AP.HAND_CUP[f"right_hand_{n}_joint"] for n in R.DEX3_ORDER], float)
+        th = self.hcfg.get("reach_thumb") or {}
+        q[1] = float(th.get("thumb_1", 0.15))
+        q[2] = float(th.get("thumb_2", 0.0))
+        self.io.hand_cmd(q)
+
     def release_at_home(self):
         out = super().release_at_home()
         self.grip_restore()
@@ -960,8 +999,10 @@ class ToyHarvest(TA.ToyArmPose):
         """The palm heading for apple x: AIM's, unless the trunk is beside it (or an earlier try was blocked): then
         from its free side."""
         a = self.args
+        if a.trunk_side == "off":                                  # the approach of 8cc0c16: AIM's heading, always
+            return h_aim
         m = self._memo(x["p"], create=True)
-        verdict, txt = ("n/a", "off") if a.trunk_side == "off" else self.trunk_check(x["p"], x["r"])
+        verdict, txt = self.trunk_check(x["p"], x["r"])
         if verdict != "n/a":
             self.brief("INFO", f"trunk check: {verdict} ({txt})", fold_s=0.0)
         sign = {"left": +1.0, "right": -1.0}.get(verdict, 0.0)     # trunk left -> from the right -> palm turned left
@@ -1339,7 +1380,9 @@ class ToyHarvest(TA.ToyArmPose):
         if err:
             return err, True
         if held and grasped:
-            v, trav = self.travel_verdict()
+            # only a hand closed (almost) fully counts as dropped here (robot 2026-10-20 18:49: a held apple, seen by
+            # the camera at ready, read 63 % and was thrown away by a 60 % threshold; held grasps read 47-88 %)
+            v, trav = self.travel_verdict(self.hcfg["grasp_check"].get("travel_dropped", 0.92))
             if v is False:
                 self.brief("WARN", f"the apple was lost on the way home ({trav}): no deposit, the next apple")
                 self.say_rl("rl_dropped")
@@ -1351,6 +1394,9 @@ class ToyHarvest(TA.ToyArmPose):
                 out_dp, stop = self.deposit()
                 if stop:
                     return out_dp, True
+                # the thumb back to its target after every deposit (the hand open, the arm home): the grasp and the
+                # drop push it off and its own gain does not bring it back (toy_arm_pose.reseat_thumb)
+                self.reseat_thumb()
             else:
                 self.hset("RELEASE", "opening the hand at home")
                 self.release_at_home()

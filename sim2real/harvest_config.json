@@ -65,12 +65,13 @@
   "held_n": 0.3,
   "empty_n": 0.1,
   "travel_min": 0.15,
-  "travel_empty": 0.6,
-  "_help": "IS THE APPLE IN THE HAND: decided once the arm is back at READY after the detach -- not right after it (robot 2026-10-20: 'held' after the detach, then it fell; and an empty hand read 30 N on the thumb pad alone) -- after settle_s: the hand is in the head camera's picture there, a detector red_apple whose BOX covers the grasp pocket's pixel (FK + the detector's camera calibration, +- vision_px) with its centre within vision_m of the pocket, over vision_s = HELD, none = EMPTY (robot 2026-10-20 recordings: held -> a red_apple box at the hand; empty -> none). No detector messages: the fingers' travel decides (held between travel_min and travel_empty; camera-labelled grasps with the thumb at the picker's 30 deg: held 50-54 %, empty 65-88 %; -> 0.60; a --thumb_deg other than 30 leaves the thumb out of the travel and reads ~1.1x higher: re-check then). Back at home before the deposit the travel checks again (an apple dropped on the way: the fingers close further). The pads are only LOGGED (thumb / index / middle N; HELD by them would need 2 fingers >= held_n, EMPTY all < empty_n): unreliable on this hand. EMPTY: the hand opens, no deposit, the next apple / the scan.",
+  "travel_empty": 0.85,
+  "_help": "IS THE APPLE IN THE HAND: decided once the arm is back at READY after the detach -- not right after it (robot 2026-10-20: 'held' after the detach, then it fell; and an empty hand read 30 N on the thumb pad alone) -- after settle_s: the hand is in the head camera's picture there, a detector red_apple whose BOX covers the grasp pocket's pixel (FK + the detector's camera calibration, +- vision_px) with its centre within vision_m of the pocket, over vision_s = HELD, none = EMPTY (robot 2026-10-20 recordings: held -> a red_apple box at the hand; empty -> none). No detector messages: the fingers' travel decides (held between travel_min and travel_empty; camera-labelled grasps with the thumb at the picker's 30 deg: held 50-54 %, empty 65-88 %; -> 0.60; a --thumb_deg other than 30 leaves the thumb out of the travel and reads ~1.1x higher: re-check then). Back at home before the deposit the travel checks again, empty only from travel_dropped (0.92: the hand closed almost fully; a 0.60 threshold threw away a held apple at 18:49). The pads are only LOGGED (thumb / index / middle N; HELD by them would need 2 fingers >= held_n, EMPTY all < empty_n): unreliable on this hand. EMPTY: the hand opens, no deposit, the next apple / the scan.",
   "vision_s": 0.6,
   "vision_m": 0.05,
   "vision_px": 10,
-  "settle_s": 0.5
+  "settle_s": 0.5,
+  "travel_dropped": 0.92
  },
  "reactive": {
   "block_far_m": 0.05,
@@ -78,5 +79,10 @@
   "block_lead_rad": 0.12,
   "block_s": 0.4,
   "_help": "REACTIVE FALLBACK during the APPROACH (onboard): BLOCKED when, with the palm still more than block_far_m from the apple's surface, TWO fingers' pads press >= block_n each (robot 2026-10-20: a single pad read 1.1-1.6 N on two approaches that were not blocked, and 30 N on an empty hand), or the arm lags its command beyond its gravity sag by >= block_lead_rad on a shoulder / elbow joint for block_s (real approaches 2026-10-19/20: at most 0.072 rad: the motion's own lag). The approach stops, the arm backs off; the next try comes from the side (the trunk check's free side, else one side then the other). A detach that stalls (a trunk in the hand does not come off) counts as blocked too. Thresholds not yet seen on a real trunk contact: logged."
+ },
+ "reach_thumb": {
+  "_help": "the thumb during the reach (and the way to the apple): fully open; the grasp closes it. Dex3 rad: thumb_1 (+ = away from the palm, max 0.72, the cup had 0.15), thumb_2 (0 = straight = its open limit, the cup had -0.34).",
+  "thumb_1": 0.15,
+  "thumb_2": 0.0
  }
 }
