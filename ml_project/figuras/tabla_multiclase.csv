@@ -1,0 +1,7 @@
+modelo,exactitud,exactitud balanceada,F1 macro,F1 macro VC (entren.)
+Trivial,0.422,0.167,0.099,0.088
+Regresión logística,0.414,0.464,0.412,0.419
+k-NN,0.574,0.388,0.385,0.409
+SVM (RBF),0.476,0.447,0.424,0.457
+Bosque aleatorio,0.591,0.464,0.461,0.497
+Gradient boosting,0.627,0.454,0.455,0.48
