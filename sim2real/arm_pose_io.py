@@ -36,6 +36,10 @@ POCKET = np.array([0.073, 0.057, 0.0])
 PALM_NORMAL = np.array([0.0, 1.0, 0.0])
 PALM_FINGER = np.array([1.0, 0.0, 0.0])
 N_IN, N_OUT = 35, 7
+#: AppleArmPose-v5 (envs/apple_arm_pose_v5_env_cfg.py, 2026-11-13): the 35 inputs with a third flag (the goal is a
+#: FRUIT: the cupped hand must let it in through its opening, nothing else may pass through it) and the waist yaw
+#: appended. build_obs(..., n_in=N_IN_V5). Trained inside the robot's shoulder-roll limit.
+N_IN_V5 = 37
 #: the goal tracker of the env (track_goal params)
 TRACK = dict(pos_tol=0.02, ang_tol_deg=15.0, finger_tol_deg=25.0, speed_tol=0.08, hold_time=0.2,
              via_pos_tol=0.03, via_ang_tol_deg=25.0)
@@ -74,20 +78,22 @@ class Goal:
     advance_s: float = 0.0
     #: s before the next goal comes anyway (0 = the caller's waypoint timeout)
     timeout_s: float = 0.0
+    #: (AppleArmPose-v5 only) the goal is a fruit hanging at `target`: the detected apple, not a staging / basket / home goal
+    fruit: bool = False
 
     def to_dict(self) -> dict:
         return {"name": self.name, "target": np.asarray(self.target, float).tolist(),
                 "normal": np.asarray(self.normal, float).tolist(), "finger": np.asarray(self.finger, float).tolist(),
                 "finger_on": bool(self.finger_on), "via": bool(self.via), "advance_d": float(self.advance_d),
                 "advance_deg": float(self.advance_deg), "advance_s": float(self.advance_s),
-                "timeout_s": float(self.timeout_s)}
+                "timeout_s": float(self.timeout_s), "fruit": bool(self.fruit)}
 
     @staticmethod
     def from_dict(d: dict) -> "Goal":
         return Goal(str(d["name"]), np.asarray(d["target"], float), np.asarray(d["normal"], float),
                     np.asarray(d["finger"], float), bool(d.get("finger_on", False)), bool(d.get("via", False)),
                     float(d.get("advance_d", 0.0)), float(d.get("advance_deg", 180.0)), float(d.get("advance_s", 0.0)),
-                    float(d.get("timeout_s", 0.0)))
+                    float(d.get("timeout_s", 0.0)), bool(d.get("fruit", False)))
 
 
 def hand_frame(fr: "R.Frames"):
@@ -95,9 +101,29 @@ def hand_frame(fr: "R.Frames"):
     return fr.palm_pos + fr.palm_R @ POCKET, fr.palm_R @ PALM_NORMAL, fr.palm_R @ PALM_FINGER
 
 
-def build_obs(q, dq, fr: "R.Frames", g: Goal, prev_raw) -> np.ndarray:
+def waist_yaw_of(fr: "R.Frames") -> float:
+    """The waist yaw (rad) from the torso's rotation in the pelvis frame (waist roll / pitch locked at 0)."""
+    return math.atan2(float(fr.torso_R[1, 0]), float(fr.torso_R[0, 0]))
+
+
+def build_obs(q, dq, fr: "R.Frames", g: Goal, prev_raw, n_in: int = N_IN, waist_yaw: float | None = None) -> np.ndarray:
+    """n_in = 35: AppleArmPose-v1/v2/v4; 37: AppleArmPose-v5 (+ the fruit flag after the two flags, + the waist
+    yaw at the end -- from the torso's rotation when not given)."""
     pocket, _, _ = hand_frame(fr)
     Rt, Rp = fr.torso_R, fr.palm_R
+    if n_in == N_IN_V5:
+        parts = [
+            np.asarray(q, float) - R.ARM_DEFAULT,
+            np.asarray(dq, float),
+            Rt.T @ (g.target - pocket),
+            Rt.T @ (g.target - fr.shoulder_pos),
+            Rp.T @ g.normal,
+            (Rp.T @ g.finger) * (1.0 if g.finger_on else 0.0),
+            [1.0 if g.finger_on else 0.0, 1.0 if g.via else 0.0, 1.0 if g.fruit else 0.0],
+            np.asarray(prev_raw, float)[:7],
+            [waist_yaw_of(fr) if waist_yaw is None else float(waist_yaw)],
+        ]
+        return np.concatenate([np.asarray(p, float).ravel() for p in parts]).astype(np.float32)
     parts = [
         np.asarray(q, float) - R.ARM_DEFAULT,
         np.asarray(dq, float),
@@ -177,6 +203,22 @@ def make_return_plan(approach, home: Goal, speed: float):
                               st.advance_deg if st.advance_d else STAGE_ADVANCE_DEG,
                               st.advance_s * speed if st.advance_s else STAGE_ADVANCE_S)
     return [stage, Goal("home", home.target.copy(), home.normal.copy(), home.finger.copy(), True, False)]
+
+
+def make_fruit_plan(fr: "R.Frames", apple: np.ndarray, normal: np.ndarray | None = None, apple_offset: float = 0.0):
+    """AppleArmPose-v5: ONE fruit goal, no staging -- the pocket on the apple centre (moved apple_offset along the
+    approach), the palm normal `normal` (pelvis frame; e.g. aim_map.AimMap.choose's normal_torso turned by the
+    torso's rotation), or the horizontal torso -> apple line when None; fingers free. The policy comes in along
+    the palm normal by itself (scripts/play_harvest_robot.py --arm_layout v5 --stage none)."""
+    _, _, finger_now = hand_frame(fr)
+    axis = np.asarray(fr.torso_pos, float)
+    u = np.asarray(apple, float) - axis
+    u[2] = 0.0
+    u = u / max(float(np.linalg.norm(u)), 1e-6)
+    n = u if normal is None else np.asarray(normal, float) / max(float(np.linalg.norm(normal)), 1e-9)
+    goal = np.asarray(apple, float) + apple_offset * n
+    return [Goal("apple", goal, n.copy(), finger_now.copy(), False, False, fruit=True)], \
+        f"fruit goal, palm normal {np.round(n, 2).tolist()}"
 
 
 def make_plan(fr: "R.Frames", apple: np.ndarray, stage_radius: float = STAGE_RADIUS,

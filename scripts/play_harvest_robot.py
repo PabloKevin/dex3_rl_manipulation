@@ -127,6 +127,39 @@ p.add_argument("--lean_deg", type=float, nargs=2, default=[2.0, 7.0],
 p.add_argument("--stand_h", type=float, default=0.42, help="height of the box under the basket, m (basket.py 0.58)")
 p.add_argument("--open_s", type=float, default=0.8, help="the hand opens over this long at the basket (a snap-open "
                "flings the squeezed sim apple out)")
+# ── 2026-11-13: the retrained chain (AppleArmPose-v5 fruit reach, AppleGraspArmPose-v2 grasp, the aim map) ──
+p.add_argument("--arm_layout", choices=["v1", "v5"], default="v1",
+               help="v5: --arm_policy is an AppleArmPose-v5 export (37 inputs: + fruit flag + waist yaw; the robot's "
+                    "shoulder-roll limit); the apple goal is a FRUIT goal")
+p.add_argument("--stage", choices=["stop", "via", "none"], default="stop",
+               help="the staging waypoint before the apple: a stop goal (the robot's), a pass-through goal, or none "
+                    "(v5 comes in along the palm normal by itself)")
+p.add_argument("--detach_path", choices=["raw", "monotone"], default="raw",
+               help="the pull's end pose on the recorded approach: raw = --pull_m of PATH LENGTH back (the jitter of a "
+                    "reach that hovered at the goal uses it up: the hand hardly moves, 'the stem held'); monotone = "
+                    "the first recorded pose --pull_m AWAY from the grasp pose (the robot's monotone-away samples)")
+p.add_argument("--track", type=int, default=0,
+               help="1: the head camera keeps tracking the apple (visible_tracking: ~10 Hz, latency, noise, missed "
+                    "frames, hidden by the arm) and the apple goal follows it; 0: one detection before the reach")
+p.add_argument("--learned_grasp", default=None,
+               help="an AppleGraspArmPose-v2 export (65 in / 14 out): it drives the fingers AND small arm adjustments "
+                    "from the reach's end until two fingers hold, then keeps the fingers while the arm pulls and carries "
+                    "(overrides --grasp)")
+p.add_argument("--learned_arm", type=int, default=0,
+               help="(--learned_grasp) 1: the grasp policy's arm outputs move the arm (0.05 rad / unit) in the GRASP state; "
+                    "0: fingers only (AppleGraspArmPose-v2 as trained)")
+p.add_argument("--learned_hold", choices=["policy", "freeze_after_grasp", "freeze_after_detach"], default="policy",
+               help="(--learned_grasp) who holds the fruit after the grip: the policy all the way to the basket, or the "
+                    "fingers frozen at their last command once the grip is held / once the detach is over")
+p.add_argument("--aim", default=None,
+               help="aim map (.pt, scripts/build_aim_map.py): the waist yaw and the palm heading / tilt for each apple "
+                    "are chosen from it before the reach (default: the tree's waist yaw, the palm along the torso -> "
+                    "apple line)")
+p.add_argument("--aim_waist", type=int, default=1, help="(--aim) 0: keep the tree's waist yaw, choose only the palm direction")
+p.add_argument("--skip_q", type=float, default=0.0,
+               help="(--aim) skip an apple whose best predicted reach success (aim map Q, waist turn included) is "
+                    "below this -- out of the arm's reach; counted as 'skipped: out of reach' (2026-11-14: 0.5)")
+p.add_argument("--csv", default=None, help="append one row per episode (outcome, geometry) to this CSV")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--diag", action="store_true", help="per-state motion stats (joint speed, lag, palm detour) at the end")
 p.add_argument("--max_s", type=float, default=300.0, help="simulated seconds at most")
@@ -153,6 +186,9 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse  # noqa: E402
 import envs  # noqa: E402,F401
 from envs.apple_arm_pose_env_cfg import POCKET  # noqa: E402
 from envs.apple_grasp_arm_pose_env_cfg import AppleGraspArmPoseEnvCfg  # noqa: E402
+from envs.apple_grasp_arm_pose_v2_env_cfg import AppleGraspArmPoseV2EnvCfg  # noqa: E402
+from envs.apple_reach_visible_v2_env_cfg import SHOULDER_ROLL_MAX  # noqa: E402
+from envs.mdp import arm_pose_fruit as apf  # noqa: E402
 from envs.apple_grasp_env_cfg import RIGHT_ARM_JOINTS  # noqa: E402
 from envs.apple_grasp_tree_env_cfg import HandOnlyObservationsCfg  # noqa: E402
 from envs.apple_reach_spindle_env_cfg import ARM_TARGET_CLIP, REACH_HAND_PRESHAPE  # noqa: E402
@@ -175,7 +211,7 @@ REACH_HAND = HC["reach_hand"]
 # arm_pose_io / toy_arm_pose / toy_harvest constants
 STAGE_RADIUS, MIN_STAGE_BACK = 0.24, 0.08
 STAGE_ADV_D, STAGE_ADV_DEG, STAGE_ADV_S = 0.05, 30.0, 2.4
-WAYPOINT_TIMEOUT = 4.0 / args.speed
+WAYPOINT_TIMEOUT = (5.0 if args.arm_layout == "v5" else 4.0) / args.speed     # the policies' own goal budgets
 TRACK = dict(pos_tol=0.02, ang_tol_deg=15.0, finger_tol_deg=25.0, speed_tol=0.08, hold_time=0.2,
              via_pos_tol=0.03, via_ang_tol_deg=25.0)
 GRASP_MAX_ERR = 0.05
@@ -188,7 +224,27 @@ WAIST_SPEED = math.radians(30.0)
 from envs import apple_grasp_tree_env_cfg as tree_cfg_mod  # noqa: E402
 
 tree_cfg_mod.APPLES_PER_TREE = args.apples[1]                 # read by the scene / event cfgs below
-cfg = AppleGraspArmPoseEnvCfg()
+LEARNED = args.learned_grasp is not None
+if LEARNED:
+    args.grasp = "policy"
+NEW_CHAIN = args.arm_layout == "v5" or LEARNED or bool(args.track)
+if NEW_CHAIN:
+    # the world of the retrained chain: + camera tracking, the fruit-in-pocket input zero once held
+    os.environ.setdefault("ARM_POSE_V5_POLICY", args.arm_policy if args.arm_layout == "v5" else "")
+    cfg = AppleGraspArmPoseV2EnvCfg()
+    if args.arm_layout != "v5":
+        base = AppleGraspArmPoseEnvCfg()
+        for k in ("reach_policy_path", "reach_obs_layout", "reach_arm_pose", "clip"):
+            setattr(cfg.actions.right_arm, k, getattr(base.actions.right_arm, k))
+    else:
+        cfg.actions.right_arm.reach_policy_path = args.arm_policy
+    cfg.events.arm_ready_start = AppleGraspArmPoseEnvCfg().events.arm_ready_start
+    cfg.actions.right_arm.scale = 0.05                     # this script drives the arm through that action (the task: 0)
+    cfg.events.camera_tracking_reset.params["frozen_prob"] = 0.0 if args.track else 1.0
+    cfg.curriculum.handoff = None
+    cfg.events.record_handoff = None
+else:
+    cfg = AppleGraspArmPoseEnvCfg()
 cfg.scene.num_envs = args.num_envs
 cfg.seed = args.seed
 cfg.episode_length_s = 1.0e5
@@ -228,7 +284,7 @@ bk.FLOOR_Z = bk.STAND_SIZE[2] + bk.FLOOR_THICKNESS
 bk.RIM_Z = bk.FLOOR_Z + bk.DEPTH
 if not args.probe:
     bk.add_to_scene(cfg.scene)
-if args.grasp == "scripted":
+if args.grasp == "scripted" and not args.learned_grasp:
     cfg.scene.robot.actuators["right_hand"].stiffness = args.hand_kp
 if args.video:
     cfg.viewer.resolution = tuple(args.video_res)
@@ -256,6 +312,8 @@ def q_term(q):
 HOME, READY, VIA, DEPS = q_term(HOME_Q), q_term(READY_Q), q_term(VIA_Q), q_term(DEP_Q)
 CLIP_LO = torch.tensor([ARM_TARGET_CLIP[n][0] for n in arm_names], device=dev)
 CLIP_HI = torch.tensor([ARM_TARGET_CLIP[n][1] for n in arm_names], device=dev)
+if args.arm_layout == "v5":
+    CLIP_HI[arm_names.index("right_shoulder_roll_joint")] = SHOULDER_ROLL_MAX      # the robot's limit (v5 trained in it)
 ARM_DEFAULT = arm._offset if isinstance(arm._offset, torch.Tensor) else robot.data.default_joint_pos[:, arm_ids]
 
 
@@ -272,12 +330,21 @@ H_REACH = hand_q({**REACH_HAND_PRESHAPE, **{f"right_hand_{k}_joint": v for k, v 
 H_CUP = hand_q(REACH_HAND_PRESHAPE) if args.grasp == "policy" else hand_q(
     {**REACH_HAND_PRESHAPE, **{f"right_hand_{k}_joint": v for k, v in REACH_HAND.items() if k.startswith("thumb")}})
 H_OPEN = robot.data.default_joint_pos[0, hand._joint_ids].clone()
+if LEARNED:
+    H_CUP = hand_q(REACH_HAND_PRESHAPE)
 if args.reach_hand == "cup":
     H_REACH = H_CUP.clone()
 
 arm_pol = torch.jit.load(args.arm_policy, map_location=dev).eval()
-grasp_pol = torch.jit.load(args.grasp_policy, map_location=dev).eval() if args.grasp == "policy" else None
+grasp_pol = torch.jit.load(args.learned_grasp if LEARNED else args.grasp_policy, map_location=dev).eval() \
+    if args.grasp == "policy" else None
+GRASP_OBS = "policy" if LEARNED else "grasp"
 P = ap.pose_state(env)
+FR = apf.fruit_state(env)
+AIM = None
+if args.aim:
+    from envs.mdp import aim as aim_mod
+    AIM = aim_mod.load(args.aim, dev)
 ik = hv.DifferentialIK(robot, "right_hand_palm_link", arm_ids)
 c_local = torch.tensor(POCKET, device=dev).expand(N, 3)
 UP = torch.tensor([0.0, 0.0, 1.0], device=dev)
@@ -396,6 +463,11 @@ n_deposits = 0
 DIAG, SEG = {}, [None] * N
 reaimed = [False] * N
 REAIM_S = 2.5
+learn_arm = torch.zeros(N, dtype=torch.bool, device=dev)     # the learned grasp also drives the arm (GRASP state)
+sr_flag = torch.ones(N, dtype=torch.bool, device=dev)        # env._stem_released: False = the fruit still hangs free
+aim_n = [None] * N                                           # the approach normal chosen for this apple (torso frame)
+aim_w = [None] * N                                           # the waist move to the chosen yaw (w0, w1, T, t)
+ep_info = [dict() for _ in range(N)]
 
 
 def where(i):
@@ -452,6 +524,7 @@ def set_goal(i, g):
     P.hold[i] = 0.0
     P.success[i] = False
     P.arrived[i] = False
+    FR.on[i] = args.arm_layout == "v5" and name.startswith("apple")
     t_leg[i] = 0.0
 
 
@@ -463,7 +536,20 @@ def start_legs(i, goals):
 
 def aim_point(i):
     a = apple.data.root_pos_w[i]
+    if args.track and getattr(env, "_apple_meas", None) is not None:
+        return env._apple_meas[i].clone()                 # the latest detection (bias, noise, latency, occlusion)
     return a + meas_bias[i] if args.perceived_apple else a
+
+
+def approach_dir(i, a):
+    """The palm normal for this apple: along the horizontal torso -> apple line, or the aim map's choice."""
+    tp, tq, sh = frames()
+    u = a - tp[i]
+    u[2] = 0.0
+    u = u / u.norm().clamp(min=1e-6)
+    if aim_n[i] is not None:
+        return quat_apply(tq[i:i + 1], aim_n[i].view(1, 3))[0], u
+    return u, u
 
 
 def make_plan(i):
@@ -471,16 +557,19 @@ def make_plan(i):
     tp, tq, sh = frames()
     a = aim_point(i)
     axis = tp[i]
-    u = a - axis
-    u[2] = 0.0
-    u = u / u.norm().clamp(min=1e-6)
+    nrm_a, u = approach_dir(i, a)
     d_goal = float(((a - axis) * u).sum())
     r = min(STAGE_RADIUS, d_goal - MIN_STAGE_BACK)
     stage = axis + r * u
     stage[2] = a[2]
+    if aim_n[i] is not None:
+        stage = a - (d_goal - r) * nrm_a              # straight back along the chosen approach
+    u = nrm_a
     pk, nrm, fin = pocket_now()
-    plan = [("staging", stage, u.clone(), fin[i].clone(), False, False, True),
+    plan = [("staging", stage, u.clone(), fin[i].clone(), False, args.stage == "via", True),
             ("apple", a.clone(), u.clone(), fin[i].clone(), False, False, False)]
+    if args.stage == "none":
+        plan = plan[1:]
     ready_frame[i] = (pk[i].clone(), nrm[i].clone(), fin[i].clone())
     back = [("staging back", stage, u.clone(), fin[i].clone(), False, False, True)]
     if args.full_cycle:
@@ -520,6 +609,11 @@ def start_detach(i):
     dist = torch.cat([torch.zeros(1, device=dev), (ps[1:] - ps[:-1]).norm(dim=-1).cumsum(0)])
     k = int((dist < DETACH["pull_m"]).sum())
     k = max(2, min(k + 1, len(qs)))
+    if args.detach_path == "monotone":
+        away = (ps - ps[0]).norm(dim=-1)
+        far = (away >= DETACH["pull_m"]).nonzero(as_tuple=True)[0]
+        k = int(far[0]) + 1 if len(far) else len(qs)
+        k = max(2, k)
     L = float(dist[k - 1]) if k - 1 < len(dist) else float(dist[-1])
     Tm = max(1.0, 1.875 * max(L, 0.02) / DETACH["pull_speed_m_s"])
     # ONE smooth joint move to the pose 8 cm back along the approach (replaying the recorded path replayed the
@@ -635,6 +729,40 @@ def begin_apple(i, new_tree):
         w_cmd[i] = w_ep[i]
         m = getattr(env, "_apple_meas", None)
         meas_bias[i] = (m[i] - apple.data.root_pos_w[i]) if m is not None else 0.0
+        tp_, tq_, sh_ = frames()
+        rel_ = quat_apply_inverse(tq_[i:i + 1], (apple.data.root_pos_w[i] - sh_[i]).view(1, 3))[0]
+        ep_info[i] = dict(seed=args.seed, env=i, yaw_deg=round(math.degrees(float(w_ep[i])), 2),
+                          x_sh=round(float(rel_[0]), 4), y_sh=round(float(rel_[1]), 4), z_sh=round(float(rel_[2]), 4),
+                          dist_sh=round(float(rel_.norm()), 4), seen=int(seen))
+        aim_n[i], aim_w[i] = None, None
+        if AIM is not None:
+            # the aim map: waist yaw + palm direction for this apple (no kinematics: a rotation and a look-up)
+            res = AIM.choose((aim_point(i) - tp_[i]).view(1, 3), w_ep[i].view(1), turn_waist=bool(args.aim_waist))
+            aim_n[i] = res["normal_torso"][0].clone()
+            yaw_t = float(res["yaw"][0])
+            ep_info[i].update(aim_yaw_deg=round(math.degrees(yaw_t), 1),
+                              aim_heading_deg=round(math.degrees(float(res["heading"][0])), 1),
+                              aim_tilt_deg=round(math.degrees(float(res["tilt"][0])), 1),
+                              aim_q=round(float(res["q"][0]), 3))
+            note(i, f"AIM: waist {math.degrees(float(w_ep[i])):+.0f} -> {math.degrees(yaw_t):+.0f} deg, palm heading "
+                    f"{math.degrees(float(res['heading'][0])):+.0f} / tilt {math.degrees(float(res['tilt'][0])):+.0f} deg, "
+                    f"Q {float(res['q'][0]):.2f} (at the tree's yaw: {float(res['q_now'][0]):.2f})")
+            if float(res["q"][0]) < args.skip_q:
+                # beyond the arm at any waist yaw the robot may use: the robot leaves it (step closer / squat)
+                why = f"skipped: out of reach (Q {float(res['q'][0]):.2f} < {args.skip_q:g})"
+                note(i, why.upper())
+                outcome[i] = why
+                if args.one_try:
+                    go(i, S_DONE)
+                else:
+                    T().new_tree[i] = True
+                    T().next_request[i] = True
+                    go(i, S_START)
+                return
+            if abs(yaw_t - float(w_ep[i])) > math.radians(1.0):
+                w0 = float(w_ep[i])
+                aim_w[i] = (w0, yaw_t, max(0.6, 1.875 * abs(yaw_t - w0) / WAIST_SPEED), 0.0)
+                w_ep[i] = yaw_t
     tries[i] += 1
     path[i] = []
     reaimed[i] = False
@@ -651,6 +779,8 @@ def fail(i, why):
     note(i, f"MISS: {why}")
     h_cmd[i] = H_OPEN
     use_policy_hand[i] = False
+    learn_arm[i] = False
+    sr_flag[i] = True
     holding[i] = False
     outcome[i] = why
 
@@ -700,7 +830,7 @@ while app.is_running():
         # inputs for this step
         env._target_grip_level = grip_level.clone()
         phase_ok = env._grasp_phase_active.clone()
-        env._stem_released[:] = True                       # the whole arm follows the commands
+        env._stem_released[:] = sr_flag                    # True: the whole arm follows the commands
         d, ang, _, _ = ap.errors(env, POCKET)
 
         # B, once (waist 0 is not where the robots stand: computed from the shoulder rotated back)
@@ -731,7 +861,8 @@ while app.is_running():
         in_leg = torch.tensor([s in (S_APPROACH, S_RETURN, S_DEPOSIT, S_BACK) for s in st.tolist()], device=dev)
         if bool(in_leg.any()):
             ro = ga._reach_obs(env, arm._reach_arm_cfg, arm._palm_cfg, arm._apple_cfg, arm.cfg.palm_local_offset,
-                               prev_raw, layout="arm_pose", waist={"pocket_local": POCKET})
+                               prev_raw, layout="arm_pose_v5" if args.arm_layout == "v5" else "arm_pose",
+                               waist={"pocket_local": POCKET})
             raw = arm_pol(ro)
             desired = torch.clamp(raw * 0.5 + ARM_DEFAULT, CLIP_LO, CLIP_HI)
             vmax, amax = ARM_VMAX * args.speed, ARM_AMAX * args.speed ** 2
@@ -756,13 +887,20 @@ while app.is_running():
 
         # actions
         a = torch.zeros(N, AD + HD, device=dev)
+        if LEARNED:
+            # outside its GRASP state the arm action is 0 about a moving anchor (what the grasp policy saw
+            # in training: its own small arm offsets), the commanded target the same
+            arm._anchor[:] = torch.where(learn_arm.unsqueeze(-1), arm._anchor, q_cmd)
         a[:, :AD] = (q_cmd - arm._anchor) / arm._scale
         h_raw = (h_cmd - hand._grasp_offset) / hand._scale
         gp = use_policy_hand
         if bool(gp.any()):
-            graw = grasp_pol(obs["grasp"])[:, AD:AD + HD]
+            gout = grasp_pol(obs[GRASP_OBS])
+            graw = gout[:, AD:AD + HD]
             h_raw = torch.where(gp.unsqueeze(-1), graw, h_raw)
             grasp_prev = torch.where(gp.unsqueeze(-1), graw, grasp_prev)
+            if LEARNED:
+                a[:, :AD] = torch.where(learn_arm.unsqueeze(-1), gout[:, :AD], a[:, :AD])
         a[:, AD:] = h_raw
         hand.speed_scale[:] = torch.where(gp, torch.full_like(w_cmd, args.speed), torch.ones_like(w_cmd)).unsqueeze(-1)
         a = torch.where(phase_ok.unsqueeze(-1), a, torch.zeros_like(a))
@@ -775,6 +913,8 @@ while app.is_running():
             palm_prev = robot.data.body_pos_w[:, palm_id].clone()
 
         obs, _, term, trunc, _ = env.step(a)
+        if LEARNED and bool(learn_arm.any()):
+            q_cmd = torch.where(learn_arm.unsqueeze(-1), arm._prev_target, q_cmd)
         step += 1
         sim_t += dt
         t_st += dt
@@ -808,6 +948,8 @@ while app.is_running():
             q_cmd[i] = robot.data.joint_pos[i, arm_ids]
             h_cmd[i] = H_REACH
             use_policy_hand[i] = False
+            learn_arm[i] = False
+            sr_flag[i] = True
             holding[i] = False
             w_cmd[i] = env._fixed_waist_yaw[i]
             choose_apples(i)
@@ -858,6 +1000,14 @@ while app.is_running():
                     w_move[i] = (w0, w1, Tw, tw0)
                     w_cmd[i] = w0 + (w1 - w0) * float(hv.smoothstep(torch.tensor(min(tw0 / Tw, 1.0))))
                     w_ok = tw0 >= Tw + 0.3
+                if s == S_TO_READY and aim_w[i] is not None:
+                    w0, w1, Tw, tw0 = aim_w[i]
+                    tw0 += dt
+                    aim_w[i] = (w0, w1, Tw, tw0)
+                    w_cmd[i] = w0 + (w1 - w0) * float(hv.smoothstep(torch.tensor(min(tw0 / Tw, 1.0))))
+                    w_ok = tw0 >= Tw + 0.3
+                    if w_ok:
+                        aim_w[i] = None
                 if (seg[i] < len(chain[i]) and chain_step(i)) or (seg[i] >= len(chain[i]) and w_ok):
                     if not w_ok:
                         continue
@@ -888,6 +1038,10 @@ while app.is_running():
                         finish_fail(i)
             elif s == S_APPROACH:
                 path[i].append((q_cmd[i].clone(), pk[i].clone()))
+                if args.track and legs[i][leg[i]][0].startswith("apple"):
+                    a_now = aim_point(i)                       # the goal follows the detections
+                    P.target[i] = a_now
+                    apple_goal[i] = a_now
                 ev = legs_step(i, d, ang)
                 if ev is not None and args.reaim and not reaimed[i] and bool(T().target_stem.active[i]) \
                         and not bool(T().target_stem.broken[i]) and float(fruit_to_pocket()[i]) > 0.025:
@@ -920,7 +1074,7 @@ while app.is_running():
                         h_cmd[i] = H_CUP
                         go(i, S_PREGRASP)
             elif s == S_PREGRASP:
-                if t >= float(REACH_HAND.get("cup_s", 1.0)):
+                if t >= (0.1 if (LEARNED and args.reach_hand == "cup") else float(REACH_HAND.get("cup_s", 1.0))):
                     note(i, f"GRASP ({args.grasp}) after the cup {where(i)}")
                     grip_since[i] = float("nan")
                     held_since[i] = float("nan")
@@ -929,12 +1083,17 @@ while app.is_running():
                     if args.grasp == "policy":
                         use_policy_hand[i] = True
                         grasp_prev[i] = 0.0
+                    if LEARNED:
+                        learn_arm[i] = bool(args.learned_arm)
+                        sr_flag[i] = False                      # the fruit-in-pocket input is live until the grip
+                        arm._anchor[i] = q_cmd[i]
                     go(i, S_GRASP)
             elif s == S_GRASP:
                 done = False
                 if args.grasp == "policy":
-                    lvl = obs["grasp"][i, 26:29]
-                    if float(lvl.sum()) > args.grip_stop_n:
+                    lvl = obs[GRASP_OBS][i, 26:29]
+                    hold_s = 0.5 if LEARNED else args.grasp_hold_s
+                    if float(lvl.sum()) > args.grip_stop_n and not LEARNED:
                         h_cmd[i] = robot.data.joint_pos[i, hand._joint_ids]
                         use_policy_hand[i] = False
                         note(i, f"grasp policy: pad force {float(lvl.sum()):.1f} N > {args.grip_stop_n:g}: fingers stop")
@@ -951,13 +1110,19 @@ while app.is_running():
                             held_since[i] = t
                         if not gripped:
                             held_since[i] = float("nan")
-                        if not math.isnan(float(held_since[i])) and t - float(held_since[i]) >= args.grasp_hold_s:
+                        if not math.isnan(float(held_since[i])) and t - float(held_since[i]) >= hold_s:
                             note(i, f"grasp policy: GRIP held (levels {np.round(lvl.cpu().numpy(), 1).tolist()} N)")
                             done = True
                         elif math.isnan(float(held_since[i])) and t >= args.grasp_s:
                             note(i, f"grasp policy: NO GRIP in {args.grasp_s:g} s (levels {np.round(lvl.cpu().numpy(), 1).tolist()} N)")
                             done = True
-                    if done and use_policy_hand[i]:
+                    if done and LEARNED:
+                        learn_arm[i] = False                    # the arm back to the script; the policy keeps the fingers
+                        sr_flag[i] = True
+                        if args.learned_hold == "freeze_after_grasp":
+                            h_cmd[i] = hand._processed_actions[i].clone()
+                            use_policy_hand[i] = False
+                    elif done and use_policy_hand[i]:
                         # the fingers stay at their last command (the hand term's current target)
                         h_cmd[i] = hand._processed_actions[i].clone()
                         use_policy_hand[i] = False
@@ -1011,6 +1176,9 @@ while app.is_running():
                     else:
                         note(i, "detached, in the hand: RETURN")
                         outcome[i] = ""
+                        if LEARNED and args.learned_hold == "freeze_after_detach" and bool(use_policy_hand[i]):
+                            h_cmd[i] = hand._processed_actions[i].clone()
+                            use_policy_hand[i] = False
                     start_legs(i, tw[i]["back"])
                     go(i, S_RETURN)
             elif s == S_RETURN:
@@ -1049,6 +1217,9 @@ while app.is_running():
                 if ev is not None:
                     note(i, f"over the basket ({ev}, {float(d[i]) * 100:.1f} cm): RELEASE")
                     holding[i] = False
+                    if bool(use_policy_hand[i]):
+                        h_cmd[i] = hand._processed_actions[i].clone()
+                        use_policy_hand[i] = False
                     tw[i]["h_closed"] = h_cmd[i].clone()
                     go(i, S_RELEASE)
             elif s == S_RELEASE:
@@ -1113,6 +1284,22 @@ print(f"[harvest sim] deposited {n_deposits}/{N}; tries per env {tries}", flush=
 for i in range(N):
     print(f"  env {i}: " + ("deposited" if deposited[i] else f"NOT deposited ({NAMES[int(st[i])]})") +
           f", {tries[i]} tries this tree", flush=True)
+from collections import Counter as _Counter
+print("[harvest sim] outcomes: " + json.dumps(dict(_Counter("deposited" if deposited[i] else (outcome[i] or NAMES[int(st[i])])
+                                                           for i in range(N)))), flush=True)
+if args.csv:
+    import csv
+    new_file = not os.path.exists(args.csv)
+    os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
+    keys = ["seed", "env", "yaw_deg", "x_sh", "y_sh", "z_sh", "dist_sh", "seen", "aim_yaw_deg", "aim_heading_deg",
+            "aim_tilt_deg", "aim_q", "deposited", "outcome"]
+    with open(args.csv, "a", newline="") as fh:
+        wr = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
+        if new_file:
+            wr.writeheader()
+        for i in range(N):
+            wr.writerow({**ep_info[i], "deposited": int(deposited[i]),
+                         "outcome": "deposited" if deposited[i] else (outcome[i] or NAMES[int(st[i])])})
 if args.diag:
     print(f"[diag] waist term in the arm action: {getattr(arm, '_waist_id', None) is not None}")
     print(f"{'state':12s} {'max|qd|':>8s} {'max lag':>8s} {'waist err':>9s}  palm path/disp per segment (cm)")

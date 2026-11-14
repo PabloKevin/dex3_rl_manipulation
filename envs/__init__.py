@@ -795,3 +795,46 @@ for _id, _env in (("AppleArmPose-v4", AppleArmPoseV4EnvCfg),
         kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPoseV4PPORunnerCfg},
         disable_env_checker=True,
     )
+
+# v5: fruit-aware goals + hold + the robot's roll limit + waist yaw input, from scratch (apple_arm_pose_v5_env_cfg.py)
+
+from .apple_arm_pose_v5_env_cfg import AppleArmPoseV5EnvCfg, AppleArmPoseV5EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleArmPoseV5PPORunnerCfg
+
+for _id, _env in (("AppleArmPose-v5", AppleArmPoseV5EnvCfg),
+                  ("AppleArmPose-Play-v5", AppleArmPoseV5EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleArmPoseV5PPORunnerCfg},
+        disable_env_checker=True,
+    )
+
+# tactile grasp behind the fruit-aware v5 reach, camera tracking, from scratch (apple_grasp_arm_pose_v2_env_cfg.py)
+
+from .apple_grasp_arm_pose_v2_env_cfg import AppleGraspArmPoseV2EnvCfg, AppleGraspArmPoseV2EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspArmPoseV2PPORunnerCfg
+
+for _id, _env in (("AppleGraspArmPose-v2", AppleGraspArmPoseV2EnvCfg),
+                  ("AppleGraspArmPose-Play-v2", AppleGraspArmPoseV2EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspArmPoseV2PPORunnerCfg},
+        disable_env_checker=True,
+    )
+
+# 2026-11-14: the grasp shaped like its harvest use (frozen at the bench's grip, pull + carry), reachable targets
+# only, warm start from v2 model_300 (apple_grasp_arm_pose_v3_env_cfg.py)
+
+from .apple_grasp_arm_pose_v3_env_cfg import AppleGraspArmPoseV3EnvCfg, AppleGraspArmPoseV3EnvCfg_PLAY
+from .agents.rsl_rl_ppo_cfg import AppleGraspArmPoseV3PPORunnerCfg
+
+for _id, _env in (("AppleGraspArmPose-v3", AppleGraspArmPoseV3EnvCfg),
+                  ("AppleGraspArmPose-Play-v3", AppleGraspArmPoseV3EnvCfg_PLAY)):
+    gym.register(
+        id=_id,
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        kwargs={"env_cfg_entry_point": _env, "rsl_rl_cfg_entry_point": AppleGraspArmPoseV3PPORunnerCfg},
+        disable_env_checker=True,
+    )

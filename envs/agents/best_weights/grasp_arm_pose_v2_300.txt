@@ -1,0 +1,1 @@
+AppleGraspArmPose-v2 run 2026-11-13_13-42-31 model_300 (fingers only, warm-started from warmstart_spindle_v3); bench: --learned_grasp <this> --learned_hold freeze_after_grasp

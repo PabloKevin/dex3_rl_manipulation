@@ -1,0 +1,3 @@
+modelo,AUC prueba (5 semillas),AUC mín–máx,entrenamiento [s],predicción de 1 manzana [ms],tamaño
+Bosque aleatorio,0.814 ± 0.001,0.812–0.816,0.78,10.39,41868 nodos (300 árboles)
+Red neuronal (MLP),0.767 ± 0.007,0.761–0.781,0.27,0.13,1153 pesos

@@ -492,3 +492,73 @@ class AppleArmPoseV4PPORunnerCfg(AppleArmPoseV2PPORunnerCfg):
     v2's fine-tune PPO settings). Own log folder (logs/rsl_rl/apple_arm_pose_v4)."""
     experiment_name = "apple_arm_pose_v4"
     max_iterations = 1500
+
+
+@configclass
+class AppleArmPoseV5PPORunnerCfg(AppleArmPosePPORunnerCfg):
+    """AppleArmPose-v5: the fruit-aware A -> B arm policy (37 inputs), from scratch. v1's network and PPO
+    settings on 4096 envs x 32 steps (131k samples per iteration, 8 mini-batches): ~1400 iterations give the
+    samples of v1's 4000 at 1024 envs in about 80 min on the laptop. Own log folder (logs/rsl_rl/apple_arm_pose_v5)."""
+    experiment_name = "apple_arm_pose_v5"
+    max_iterations = 1400
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.005,
+        num_learning_epochs=5,
+        num_mini_batches=8,
+        learning_rate=3.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+@configclass
+class AppleGraspArmPoseV2PPORunnerCfg(AppleGraspArmPosePPORunnerCfg):
+    """AppleGraspArmPose-v2: the tactile grasp behind the frozen AppleArmPose-v5 fruit reach, fingers only, fine-tuned from
+    the AppleGraspSpindle-v3 grasp (warmstart_spindle_v3/model_0.pt, std 0.2; entropy 0.001), on
+    1024 envs x 32 steps (32k samples per iteration; the earlier grasps: 32 envs x 64 = 2k). Own log folder
+    (logs/rsl_rl/apple_grasp_arm_pose_v2)."""
+    experiment_name = "apple_grasp_arm_pose_v2"
+    num_steps_per_env = 32
+    max_iterations = 2000
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=0.2,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256, 128, 64],
+        critic_hidden_dims=[256, 128, 64],
+        activation="elu",
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.001,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=3.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+@configclass
+class AppleGraspArmPoseV3PPORunnerCfg(AppleGraspArmPoseV2PPORunnerCfg):
+    """AppleGraspArmPose-v3 (frozen at the bench's grip, pull + carry, reachable targets): warm start from v2
+    model_300 (logs/rsl_rl/apple_grasp_arm_pose_v3/warmstart_v2_300/model_0.pt), 1024 envs x 48 steps."""
+    experiment_name = "apple_grasp_arm_pose_v3"
+    num_steps_per_env = 48
+    max_iterations = 500
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.entropy_coef = 0.0005
+        self.algorithm.gamma = 0.995

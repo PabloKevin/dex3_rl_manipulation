@@ -164,6 +164,26 @@ def _reach_obs(
         sensor_cfg.resolve(env.scene)
         env._autoplay_sensor_cfg = sensor_cfg
 
+    if layout == "arm_pose_v5":
+        # AppleArmPose-v5 (envs/apple_arm_pose_v5_env_cfg.py): 37 = the "arm_pose" 35 with a third
+        # flag (the goal is a fruit) and the waist yaw appended; the goal is the fruit goal
+        # arm_pose_fruit.fruit_reach_step set this step
+        from . import arm_pose as ap
+        from . import arm_pose_fruit as apf
+
+        pk = waist["pocket_local"]
+        return torch.cat([
+            joint_pos_selected(env, arm_cfg),
+            joint_vel_selected(env, arm_cfg),
+            ap.obs_goal_delta(env, pk),
+            ap.obs_goal_position(env, pk),
+            ap.obs_goal_normal(env, pk),
+            ap.obs_goal_finger(env, pk),
+            apf.obs_goal_flags(env),
+            prev_raw_action,
+            ap.obs_waist_yaw(env),
+        ], dim=-1)
+
     if layout == "arm_pose":
         # AppleArmPose-v1/v2 (envs/apple_arm_pose_env_cfg.py): 35 = arm pos (7), vel (7),
         # goal - pocket and goal - shoulder in the torso frame (3 + 3), goal palm normal
@@ -698,6 +718,10 @@ class ReachHandoffJointPositionAction(RateLimitedJointPositionAction):
                 from .arm_pose import waypoint_reach_step
 
                 waypoint_reach_step(self._env, ~phase.squeeze(-1), **self.cfg.reach_arm_pose)
+            elif self.cfg.reach_obs_layout == "arm_pose_v5":
+                from .arm_pose_fruit import fruit_reach_step
+
+                fruit_reach_step(self._env, ~phase.squeeze(-1), **self.cfg.reach_arm_pose)
             waist = {"ring_range": self.cfg.reach_ring_range} if self._waist_id is None else \
                 {"joint_cfg": self._waist_cfg, "prev_raw": self._waist_prev_raw, "ring_range": self.cfg.reach_ring_range}
             if self.cfg.reach_arm_pose is not None:
