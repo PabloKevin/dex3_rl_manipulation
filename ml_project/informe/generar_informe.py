@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Genera el informe del proyecto final (formato APA 7, en español) como .docx editable y lo convierte a PDF
-con LibreOffice. Lee las tablas y figuras que produce analisis_cosecha.ipynb (carpeta figuras/) y, si existen,
-las corridas del experimento de cintura (datos_cintura/).
+"""Genera el informe del proyecto final (formato APA 7, en español, versión condensada) como .docx editable y lo
+convierte a PDF con LibreOffice. Lee las tablas y figuras de analisis_cosecha.ipynb y analisis_v5.py (carpeta
+figuras/), las corridas del experimento de cintura (datos_cintura/) y de la cadena v5 (datos_v5/). La Figura 1 la
+genera informe/diagrama_modelos.py.
 
     <python con python-docx y pandas> ml_project/informe/generar_informe.py
 """
@@ -309,464 +310,260 @@ for linea in (AUTOR,
     par(linea, centro=True)
 salto()
 
+mejor_b = tb.drop("Trivial")["AUC-ROC"].idxmax()
+ic = lambda s: s.replace(".", ",").replace(", ", "; ")      # "[0.78, 0.85]" -> "[0,78; 0,85]"
+
 # ═════════════════════════ RESUMEN ═════════════════════════
 titulo("Resumen", 1)
-mejor_b = tb.drop("Trivial")["AUC-ROC"].idxmax()
 res_txt = (
-    "Un robot humanoide Unitree G1 con mano Dex3 cosecha manzanas mediante políticas de aprendizaje por refuerzo, "
-    "pero muchos intentos fallan. Este trabajo estudia si es posible predecir, antes de intentar, si la manzana "
-    "terminará en la canasta y en qué etapa fallará el intento, usando solo información que el robot conoce de "
-    f"antemano. Se generó un conjunto de datos propio en simulación (Isaac Lab) con {n_total} intentos de cosecha "
-    "completos sobre árboles aleatorios, con 18 variables de entrada (posición de la manzana respecto al hombro, "
-    "píxel y profundidad en la cámara, y manzanas vecinas visibles). Se compararon seis modelos supervisados de "
-    "scikit-learn (regresión logística, k vecinos más cercanos, máquina de vectores de soporte, bosque aleatorio, "
-    "gradient boosting y una red neuronal multicapa) frente a un clasificador trivial, con hiperparámetros elegidos "
-    "por validación cruzada y evaluación en una corrida de simulación independiente. "
-    f"El bosque aleatorio obtuvo el mejor desempeño binario (AUC-ROC = {f3(tb.loc[mejor_b, 'AUC-ROC'])}, exactitud = "
-    f"{f3(tb.loc[mejor_b, 'exactitud'])} frente a {f3(tb.loc['Trivial', 'exactitud'])} del trivial) y superó "
-    "significativamente a la red neuronal. La etapa de fallo solo se predice bien cuando depende de la geometría "
-    "(alcance y agarre). Al aplicar modelos geométricos entrenados en simulación a 190 intentos del robot real, la "
-    f"regresión logística mantuvo su desempeño (AUC = {f3(treal.loc['Regresión logística', 'AUC robot real'])}) "
-    "mientras que los modelos más flexibles perdieron capacidad, lo que evidencia la brecha entre simulación y "
-    "realidad. ")
+    "Un robot humanoide cosecha manzanas con un brazo y una mano de tres dedos, pero muchos intentos fallan. "
+    "Este trabajo estudia si se puede predecir, antes de cada intento y solo con lo que el robot ya sabe "
+    "(dónde está la manzana y qué manzanas vecinas ve su cámara), si la fruta llegará a la canasta y en qué "
+    f"etapa fallará el intento. Se generó en simulación un conjunto de datos propio de {n_total} intentos, con 18 "
+    "variables de entrada, y se compararon seis clasificadores supervisados de scikit-learn frente a un "
+    f"clasificador trivial. El bosque aleatorio fue el mejor (AUC-ROC = {f3(tb.loc[mejor_b, 'AUC-ROC'])}); la "
+    "etapa del fallo solo se anticipa bien cuando depende de la geometría. En 190 intentos del robot real, el "
+    "modelo más simple (regresión logística) fue el que mejor conservó su desempeño. ")
 if CINT and "modelo" in CINT and "mantener" in CINT:
     d, lo, hi, pv = comp("modelo", "mantener")
-    res_txt += (f"Finalmente, usar el modelo para elegir el giro de cintura antes de cada intento elevó la tasa de "
-                f"éxito simulada de {pc(CINT['mantener']['exito'])} a {pc(CINT['modelo']['exito'])} "
-                f"({sg(d)} puntos porcentuales, IC 95 % [{sg(lo)}; {sg(hi)}], {fp(pv)}), mientras que girar al azar "
-                f"no produjo una mejora significativa.")
+    res_txt += (f"Usado para elegir el giro de cintura antes de intentar, el modelo elevó el éxito simulado de "
+                f"{pc(CINT['mantener']['exito'])} a {pc(CINT['modelo']['exito'])} ({fp(pv)}). ")
 if V5:
-    res_txt += (f" Con esa información se diseñó después una nueva cadena de políticas (v5) que, en el mismo mundo "
-                f"simulado, eleva el éxito de {pc(VIS.exito.mean())} a {pc(V5['exito'])}; un predictor reentrenado "
-                f"para ella alcanzó AUC = {f3(V5['t'].loc[V5['mejor'], 'AUC-ROC'])}, con probabilidades bien "
-                "calibradas, mientras que el modelo de la cadena anterior conserva el orden pero subestima el éxito, "
-                "por lo que el predictor debe reentrenarse con cada cambio de políticas.")
+    res_txt += (f"Con lo aprendido se diseñó una nueva versión de las políticas del robot, que cosecha el "
+                f"{pc(V5['exito'])} de las manzanas; su predictor reentrenado logró AUC = "
+                f"{f3(V5['t'].loc[V5['mejor'], 'AUC-ROC'])} con probabilidades bien calibradas.")
 par(res_txt, sangria=False)
 p = par("", sangria=True)
 p.add_run("Palabras clave: ").italic = True
-p.add_run("cosecha robótica, clasificación supervisada, bosque aleatorio, simulación, transferencia simulación-realidad")
+p.add_run("cosecha robótica, clasificación supervisada, bosque aleatorio, simulación")
 salto()
 
 # ═════════════════════════ INTRODUCCIÓN ═════════════════════════
 par(TITULO, centro=True, negrita=True)
-par("La cosecha de fruta es una de las tareas agrícolas que más mano de obra requiere, y su automatización es un "
-    "problema abierto de la robótica. En una revisión de 50 proyectos de cosecha robótica, Bac et al. (2014) "
-    "reportaron un éxito medio de cosecha del 66 % y tiempos de ciclo de unos 33 s por fruto, lejos de lo que "
-    "exige la producción comercial. Los sistemas específicos para manzanas mejoraron estos valores (Silwal et al., "
-    "2017), pero las revisiones recientes coinciden en que la variabilidad del entorno (oclusiones, frutos "
-    "agrupados, ramas) sigue siendo la principal causa de fallos (Zhou et al., 2022).")
-par("Este proyecto parte de un sistema real desarrollado en una tesis de grado: un robot humanoide Unitree G1 con "
-    "mano de tres dedos Dex3 y una cámara RGB-D Intel RealSense D435i en la cabeza. La cámara detecta las "
-    "manzanas; una política de aprendizaje por refuerzo (Sutton y Barto, 2018) lleva el brazo hasta la fruta; la "
-    "mano la agarra, se desprende del pedúnculo tirando hacia atrás y se lleva a una canasta lateral. En las "
-    "pruebas del robot real solo alrededor de un tercio de los intentos terminó con la manzana en la canasta. "
-    "Saber de antemano qué intentos tienen pocas probabilidades de éxito permitiría ordenar las manzanas, evitar "
-    "intentos inútiles y orientar el desarrollo hacia las etapas que más fallan.")
-par("Predecir el resultado de una manipulación a partir de la percepción es un enfoque establecido: la síntesis "
-    "de agarres basada en datos aprende qué configuraciones tienen éxito a partir de ejemplos (Bohg et al., 2014), "
-    "y modelos de aprendizaje automático han predicho la calidad de un agarre a partir de la imagen (Lenz et al., "
-    "2015). Como generar miles de intentos con el robot real no es viable, los datos se generan en simulación "
-    "física, una práctica habitual en robótica (Mittal et al., 2023) que, sin embargo, enfrenta la brecha entre "
-    "simulación y realidad (Tobin et al., 2017; Zhao et al., 2020). Para datos tabulares de tamaño moderado, los "
-    "conjuntos de árboles suelen igualar o superar a las redes neuronales (Grinsztajn et al., 2022), lo que "
-    "orienta la elección de modelos.")
-par("El objetivo general es desarrollar una herramienta de clasificación que, antes de cada intento y con la "
-    "información disponible para el robot, estime (a) si la manzana llegará a la canasta y (b) en qué etapa "
-    "fallará el intento. Los objetivos específicos son: construir el conjunto de datos y caracterizar sus "
-    "variables; definir el tipo de problema y elegir al menos tres modelos adecuados; compararlos con métricas "
-    "justificadas e intervalos de confianza; verificar cualitativamente la transferencia al robot real con sus "
-    "registros; y evaluar si el modelo puede usarse para tomar una decisión que mejore la cosecha (el giro de "
-    "cintura previo al intento).")
+par("La cosecha de fruta requiere mucha mano de obra y automatizarla sigue siendo difícil: en una revisión de 50 "
+    "proyectos de robots cosechadores, el éxito medio fue del 66 % (Bac et al., 2014). Este trabajo usa un sistema "
+    "desarrollado en una tesis de grado: un robot humanoide Unitree G1 con una mano de tres dedos (Dex3) y una "
+    "cámara de profundidad en la cabeza. Para cada manzana, la cámara la localiza, una red neuronal entrenada por "
+    "refuerzo lleva el brazo hasta ella, la mano la agarra, el brazo tira para cortar el pedúnculo y la lleva a una "
+    "canasta. En el robot real, solo un tercio de los intentos terminaba con la manzana en la canasta.")
+par("Si el robot supiera de antemano qué intentos van a fallar, podría saltear manzanas imposibles, ordenar las "
+    "demás y decidir mejor cómo posicionarse; y los desarrolladores sabrían qué etapa mejorar. El objetivo de este "
+    "proyecto es construir ese predictor: un clasificador que, **antes de cada intento**, estime (a) la "
+    "probabilidad de que la manzana llegue a la canasta y (b) la etapa en que fallaría. Como generar miles de "
+    "intentos reales no es viable, los datos se generan en un simulador físico (Mittal et al., 2023), sabiendo que "
+    "lo aprendido en simulación no siempre se transfiere a la realidad (Tobin et al., 2017). Por eso el modelo se "
+    "contrasta, además, con registros del robot real.")
 
 # ═════════════════════════ MÉTODO ═════════════════════════
 titulo("Método", 1)
-titulo("Plataforma y secuencia de cosecha", 2)
-par("Los datos se generaron en Isaac Lab (Mittal et al., 2023) con el modelo del robot G1 (pelvis fija, control "
-    "a 50 Hz, física a 200 Hz) y con la misma secuencia y las mismas políticas que ejecuta el robot real "
-    "(script ml_project/recolectar_dataset.py, copia del simulador de cosecha de la tesis). Cada intento sigue "
-    "las etapas: alcance (la política lleva la mano a un punto de preparación y luego a la manzana), agarre "
-    "(preforma de la mano y cierre controlado por fuerza), desprendimiento (giro y tirón de 8 cm hacia atrás), "
-    "retorno a la pose de espera, transporte hasta la canasta y depósito. El pedúnculo se modela como una unión "
-    "que se rompe al superar un límite de fuerza, y la posición de la manzana que usa el robot incluye el error de "
-    "percepción de la cámara.")
-titulo("Generación del conjunto de datos", 2)
-par(f"Cada intento se realiza sobre un árbol nuevo generado al azar, con entre 2 y 5 manzanas separadas al "
-    f"menos 6 cm, y el robot tiene un único intento por árbol. Se registró una fila por intento: {n_total} intentos "
-    "en tres corridas independientes (semillas aleatorias 0, 1 y 2). Las corridas 0 y 2 forman el conjunto de "
-    f"entrenamiento y la corrida 1 el de prueba, de modo que la evaluación se hace sobre árboles nunca vistos. Se "
-    f"descartaron {n_total - n_vis} intentos cuya manzana objetivo no se veía entera en la cámara (el robot real no "
-    f"los intentaría), quedando {n_tr} intentos de entrenamiento (éxito {pc(exito_tr)}) y {n_te} de prueba (éxito "
-    f"{pc(exito_te)}). Hay respuesta real para cada observación (el simulador registra el resultado), por lo que "
-    "el problema admite aprendizaje supervisado.")
-titulo("Variables", 2)
-par("Las entradas son únicamente lo que el robot conoce antes de actuar (Tabla 1). Por decisión de diseño se "
-    "excluyó la distancia al tronco, que el robot real todavía no estima con fiabilidad, y solo cuentan como "
-    "vecinas las manzanas que la cámara ve enteras. Dos variables registradas se eliminaron por no aportar "
-    "información: el radio de la manzana (constante por entorno de simulación) y el número de vecinas a menos de "
-    "15 cm (siempre cero por la separación mínima). Cuando no hay vecina visible, la distancia a la más cercana se "
-    "fija en 0,5 m y su desplazamiento en cero, con un indicador binario aparte.")
-VARS = [
-    ("yaw_cintura_deg", "Giro de la cintura (°)", "continua"),
-    ("x/y/z_hombro_m", "Posición de la manzana respecto al hombro derecho, marco del torso (m)", "continua"),
-    ("dist_hombro_m, dist_horiz_m", "Distancia 3D y horizontal hombro-manzana (m)", "continua"),
-    ("azimut_deg, elevacion_deg", "Ángulos de la manzana vistos desde el hombro (°)", "continua"),
-    ("u_px, v_px", "Píxel del centro de la manzana en la imagen de 424 × 240", "continua"),
-    ("prof_cam_m", "Profundidad medida por la cámara (m)", "continua"),
-    ("n_vecinos_vis", "Manzanas vecinas vistas enteras por la cámara", "discreta"),
-    ("dist_vecino_min_m", "Distancia a la vecina visible más cercana (m)", "continua"),
-    ("vec_dx/dy/dz_m", "Posición de esa vecina respecto al objetivo (m)", "continua"),
-    ("n_vecinos_vis_debajo", "Vecinas visibles debajo del objetivo", "discreta"),
-    ("hay_vecino_vis", "1 si la cámara ve al menos una vecina", "discreta (binaria)"),
-    ("exito", "1 = manzana depositada en la canasta", "discreta (binaria) — dependiente"),
-    ("etapa", "Etapa donde terminó el intento (7 clases)", "discreta (categórica) — dependiente"),
-]
-tabla("Variables del conjunto de datos", [list(v) for v in VARS], ["Variable", "Descripción", "Tipo"],
-      nota="Las 18 primeras (filas 1 a 11) son independientes (entradas); las dos últimas son las variables "
-           "dependientes (salidas).", anchos=[4.2, 8.3, 3.8])
-titulo("Tipo de problema", 2)
-par("Ambas salidas son categóricas, por lo que el problema es de clasificación: binaria para el éxito y "
-    "multiclase para la etapa de fallo. Como cada intento tiene su resultado registrado, se usa aprendizaje "
-    "supervisado; los enfoques no supervisados o semisupervisados (Chapelle et al., 2006) no se justifican cuando "
-    "todas las observaciones están etiquetadas.")
-titulo("Modelos", 2)
-par("Se eligieron modelos de naturaleza distinta, todos disponibles en scikit-learn (Pedregosa et al., 2011), "
-    "siguiendo el flujo de trabajo habitual de preparación, ajuste y validación (Bishop, 2006; Géron, 2019; "
-    "Igual y Seguí, 2017), dentro de una tubería con estandarización de las entradas (Tabla 2). Como referencia mínima se usó un "
-    "clasificador trivial que siempre predice la clase más frecuente.")
+titulo("Datos", 2)
+par(f"Los datos se generaron en el simulador Isaac Lab con el modelo del robot y las mismas políticas que usa el "
+    "robot real (script recolectar_dataset.py). Cada intento recorre las etapas de alcance (la mano va a la "
+    "manzana), agarre (la mano se cierra), desprendimiento (el brazo tira hasta romper el pedúnculo), retorno, "
+    "transporte y depósito en la canasta. Cada intento se hace sobre un árbol nuevo, generado al azar con 2 a 5 "
+    "manzanas, y se guarda como una fila: las entradas medidas antes de empezar y el resultado. Se hicieron tres "
+    f"corridas independientes ({n_total} intentos): dos para entrenar ({n_tr} intentos útiles, éxito "
+    f"{pc(exito_tr)}) y una para la prueba final ({n_te}, éxito {pc(exito_te)}), de modo que el modelo se evalúa "
+    f"en árboles nunca vistos. Se descartaron {n_total - n_vis} intentos cuya manzana no se veía entera en la "
+    "cámara, porque el robot real no los intentaría.")
+titulo("Variables, tipo de problema y modelos", 2)
+par("La Figura 1 resume la arquitectura completa. Las 18 entradas (variables independientes) son solo información "
+    "disponible antes de intentar: la posición de la manzana respecto al hombro derecho, su posición y "
+    "profundidad en la imagen, el giro de la cintura y las manzanas vecinas que la cámara ve. Son 15 continuas y 3 "
+    "discretas. Las salidas (variables dependientes) son el éxito (binaria) y la etapa donde terminó el intento "
+    "(categórica). Variables que solo existen en simulación o que se conocen después del intento no se usan, para "
+    "no filtrar información del resultado. Como todas las filas tienen su resultado registrado, el problema es de "
+    "**clasificación supervisada**; un enfoque no supervisado solo tendría sentido sin etiquetas.")
+figura("arquitectura_modelos.png", "Arquitectura del predictor: entradas, preprocesamiento, modelos, salidas y uso",
+       nota="Todos los modelos reciben el mismo vector de entradas estandarizado y se entrenan por separado para "
+            "cada salida. P es la probabilidad de éxito predicha.", ancho=15)
+par("Se compararon seis modelos de naturaleza distinta, todos de scikit-learn (Pedregosa et al., 2011), dentro de "
+    "una tubería con estandarización de las entradas (Tabla 1), más un clasificador trivial que siempre predice la "
+    "clase más frecuente como referencia mínima.")
 MODS = [
-    ("Regresión logística (L2)", "Línea de base lineal e interpretable; probabilidades bien calibradas",
-     "C ∈ {0,01; 0,1; 1; 10; 100}"),
-    ("k vecinos más cercanos", "El éxito depende de la zona del espacio de trabajo (Cover y Hart, 1967)",
-     "k ∈ {5; 11; 21; 41}, pesos"),
-    ("SVM, núcleo RBF", "Frontera no lineal suave; el espacio alcanzable del brazo es curvo (Cortes y Vapnik, 1995)",
-     "C ∈ {0,3; 1; 3; 10}, γ"),
-    ("Bosque aleatorio", "Interacciones entre variables y robustez a la colinealidad (Breiman, 2001)",
-     "profundidad, hojas mínimas"),
-    ("Gradient boosting", "Muy preciso en datos tabulares; permite ver el desempeño por iteración (Friedman, 2001)",
-     "árboles, tasa, profundidad"),
-    ("Red neuronal (MLP)", "Aproximador no lineal general; ReLU, Adam (Kingma y Ba, 2015), parada temprana",
-     "capas ocultas, α (L2)"),
+    ("Regresión logística", "Línea de base lineal e interpretable", "C (regularización)"),
+    ("k vecinos más cercanos", "El éxito depende de la zona del espacio de trabajo", "k, pesos"),
+    ("SVM (núcleo RBF)", "Frontera no lineal suave", "C, γ"),
+    ("Bosque aleatorio", "Interacciones entre variables; robusto (Breiman, 2001)", "profundidad, hojas"),
+    ("Gradient boosting", "Muy preciso en datos tabulares", "árboles, tasa, profundidad"),
+    ("Red neuronal (MLP)", "Aproximador no lineal general, con parada temprana", "capas, α (L2)"),
 ]
-tabla("Modelos comparados y su justificación", [list(m) for m in MODS], ["Modelo", "Justificación", "Hiperparámetros"],
-      anchos=[3.8, 8.0, 4.5])
+tabla("Modelos comparados", [list(m) for m in MODS], ["Modelo", "Por qué se eligió", "Hiperparámetros ajustados"],
+      anchos=[4.2, 7.6, 4.5])
 titulo("Validación y métricas", 2)
-par("Los hiperparámetros se eligieron con búsqueda en grilla y validación cruzada estratificada de 5 "
-    "particiones, solo sobre el conjunto de entrenamiento; el conjunto de prueba se usó una única vez al final. "
-    "Como la salida es categórica, no corresponden las métricas de regresión (MSE, RMSE, R²). Para la salida "
-    "binaria se usaron: el área bajo la curva ROC (AUC-ROC; Fawcett, 2006), que mide la capacidad de ordenar los "
-    "intentos de más a menos probables sin depender de un umbral y es la métrica principal, porque el uso previsto "
-    "es priorizar manzanas; la exactitud, la precisión, la exhaustividad y la F1 con umbral 0,5; y la puntuación "
-    "de Brier (Brier, 1950), que es el error cuadrático medio de las probabilidades y mide su calibración. Los "
-    "intervalos de confianza del 95 % se obtuvieron por remuestreo bootstrap del conjunto de prueba (Efron y "
-    "Tibshirani, 1993), y la comparación entre dos modelos se hizo con bootstrap pareado sobre los mismos intentos. "
-    "Para la salida multiclase, desbalanceada, se usaron la F1 macro (promedio sin ponderar de la F1 de cada clase) "
-    "y la exactitud balanceada, con pesos de clase balanceados en el entrenamiento; las clases con menos del 3 % de "
-    "los intentos se agruparon como «otro».")
-par("El desempeño según la cantidad de entrenamiento se estudió con curvas de aprendizaje y, para los modelos "
-    "iterativos, con el AUC por iteración del gradient boosting y por época de la red neuronal. La importancia de "
-    "las variables se midió por permutación en el conjunto de prueba.")
-titulo("Verificación con el robot real", 2)
-par("Los registros de las corridas de cosecha autónoma del robot real (octubre de 2026, misma política del brazo) "
-    "se procesaron con ml_project/intentos_reales.py: para cada manzana intentada se tomó la posición detectada por "
-    "la cámara, el giro de cintura y el resultado, y con la cinemática del robot (modelo URDF) se calcularon las "
-    f"mismas variables geométricas. Se obtuvieron {len(REAL)} intentos de {REAL.corrida.nunique()} corridas (éxito "
-    f"{pc(REAL.exito.mean())}). Como las vecinas y el píxel no se registraron igual que en la simulación, se "
-    "reentrenaron los modelos con solo las siete variables geométricas y se evaluaron sobre los intentos reales.")
-titulo("Experimento de decisión: giro de cintura", 2)
-par("Para evaluar el uso del modelo en la toma de decisiones se programó una variante del simulador "
-    "(ml_project/cosecha_cintura.py). Al comenzar cada árbol, el bosque aleatorio evalúa los giros de cintura "
-    "entre −15° y +15° (el rango de los datos, cada 2,5°), recalculando las entradas para cada giro con el árbol "
-    "quieto; solo se consideran los giros en que la cámara ve la manzana entera. Se compararon tres grupos de 600 "
-    "intentos con la misma semilla: «mantener» (el giro inicial, como en el conjunto de datos; línea base), "
-    "«modelo» (el giro de mayor probabilidad predicha) y «aleatorio» (un giro visible al azar, como control). La "
-    "diferencia de tasas de éxito se evaluó con intervalo bootstrap y prueba z de dos proporciones.")
-
-if V5:
-    titulo("Cadena de políticas v5 y predictor reentrenado", 2)
-    par("Los resultados del primer modelo (qué manzanas fallan y en qué etapa) orientaron el diseño posterior de "
-        "una nueva cadena de políticas del robot, llamada v5: un alcance que tiene en cuenta la fruta para no "
-        "empujarla, un mapa de apuntado que elige el giro de cintura (de −45° a +15°) y la dirección de la palma "
-        "para cada manzana, el agarre aprendido con los dedos fijos una vez cerrados, un giro de muñeca de 60° y "
-        "dedos más rígidos antes de tirar del pedúnculo. El mapa de apuntado es a su vez un modelo aprendido: una "
-        "red que estima la probabilidad Q de que el alcance llegue a la manzana, ajustada con decenas de miles de "
-        "alcances simulados; solo mira la etapa de alcance.")
-    par("Con esa cadena se generó un segundo conjunto de datos (ml_project/cosecha_v5.py) con el mismo mundo "
-        "simulado y las mismas 18 entradas, calculadas con la cintura ya girada al ángulo elegido; todas las "
-        f"manzanas se intentan, sin descartar las de Q baja. Se obtuvieron {V5['n']} intentos válidos en tres "
-        f"corridas (semillas {', '.join(str(s) for s in V5['semillas'])}): las dos primeras para entrenamiento "
-        f"({V5['n_tr']}) y la última para prueba ({V5['n_te']}). Se reentrenaron los mismos modelos con la misma "
-        "búsqueda de hiperparámetros y se compararon con dos referencias: la Q del mapa de apuntado y el bosque "
-        "aleatorio de la cadena anterior aplicado sin reentrenar.")
+par("Los hiperparámetros se eligieron con búsqueda en grilla y validación cruzada de 5 particiones sobre el "
+    "conjunto de entrenamiento; el de prueba se usó una sola vez. La métrica principal es el **AUC-ROC** "
+    "(Fawcett, 2006): la probabilidad de que el modelo asigne mayor P a un intento exitoso que a uno fallido, es "
+    "decir, qué tan bien ordena las manzanas (0,5 = azar, 1 = perfecto). Se reportan también la exactitud, la "
+    "precisión, la exhaustividad y la F1 con umbral 0,5, y la puntuación de **Brier**, el error cuadrático medio de "
+    "la probabilidad, que mide si P se puede leer como una tasa de éxito real (calibración; menor es mejor). Los "
+    "intervalos de confianza del 95 % (IC 95 %) se obtuvieron por *bootstrap* del conjunto de prueba (Efron y "
+    "Tibshirani, 1993), pareado cuando se comparan dos modelos. Para la etapa del fallo, cuyas clases están "
+    "desbalanceadas, se usó la F1 macro (promedio de la F1 de cada clase).")
+titulo("Tres pruebas adicionales", 2)
+par("(1) **Robot real:** de los registros de 50 sesiones de cosecha autónoma se extrajeron "
+    f"{len(REAL)} intentos (éxito {pc(REAL.exito.mean())}); como no se registraron las vecinas ni el píxel, se "
+    "reentrenaron los modelos con las 7 variables geométricas y se evaluaron sobre esos intentos. (2) **Uso para "
+    "decidir:** antes de cada intento, el bosque evaluó los giros de cintura de −15° a +15° y eligió el de mayor "
+    "P; se comparó contra mantener el giro inicial y contra un giro al azar (600 intentos simulados cada uno). "
+    "(3) **Nuevas políticas:** con lo aprendido se diseñó una cadena de políticas nueva (v5, descrita en "
+    "Resultados); se generaron 1800 intentos con ella y se reentrenaron los modelos.")
 
 # ═════════════════════════ RESULTADOS ═════════════════════════
 titulo("Resultados", 1)
 titulo("Análisis de las variables", 2)
-filas_et = [[e, int(n), pc(n / len(VIS))] for e, n in etapas.items()]
-tabla("Resultado de los intentos simulados (etapa en la que terminó)", filas_et, ["Etapa", "Intentos", "Proporción"],
-      nota="«exito»: la manzana llegó a la canasta; el resto son etapas de fallo (alcance: la mano no llegó a menos "
-           "de 5 cm; agarre: no quedó nada entre los dedos; desprendimiento: el pedúnculo resistió o la fruta se "
-           "resbaló; retorno y transporte: cayó después de arrancarla; depósito: cayó fuera de la canasta).",
-      anchos=[5, 3, 3])
-par("Las clases están desbalanceadas: el éxito y los fallos de agarre y desprendimiento concentran el 84 % de los "
-    "intentos, mientras que retorno y depósito no llegan al 3 %. Las distribuciones individuales (en el cuaderno) "
-    "muestran que la mayoría de las entradas son continuas y aproximadamente unimodales, y que la altura de la "
-    "manzana respecto al hombro es la que mejor separa éxitos de fracasos (Figura 1): por debajo de 0,42 m bajo el "
-    "hombro ningún intento tuvo éxito, y las manzanas más altas se cosecharon en torno al 75 % de las veces.")
-figura("exito_vs_altura.png", "Tasa de éxito según la altura de la manzana respecto al hombro",
-       nota="Intentos simulados agrupados en ocho intervalos de igual ancho; n = intentos por intervalo.", ancho=15)
-par("El mapa de correlaciones (Figura 2) confirma la relación con la altura (r = 0,44), la profundidad de la "
-    "cámara (r = −0,42), la elevación (r = 0,40) y la distancia al hombro (r = −0,40). También muestra fuertes "
-    "correlaciones entre entradas que describen la misma posición en sistemas distintos (por ejemplo, la altura y "
-    "la fila del píxel), una colinealidad que afecta a los modelos lineales pero no a los basados en árboles.")
-figura("correlaciones.png", "Mapa de correlaciones de Pearson entre las entradas y el éxito", ancho=13.5)
+par(f"De los intentos simulados, el {pc(etapas.get('exito', 0) / len(VIS))} terminó en la canasta; los fallos más "
+    f"comunes fueron el agarre ({pc(etapas.get('agarre', 0) / len(VIS))}) y el desprendimiento "
+    f"({pc(etapas.get('desprendimiento', 0) / len(VIS))}), seguidos del alcance "
+    f"({pc(etapas.get('alcance', 0) / len(VIS))}) y el transporte ({pc(etapas.get('transporte', 0) / len(VIS))}). "
+    "La variable que mejor separa éxitos de fracasos es la altura de la manzana respecto al hombro (Figura 2): por "
+    "debajo de 0,42 m bajo el hombro ningún intento tuvo éxito. El mapa de correlaciones (Figura 3) muestra la "
+    "misma relación (altura r = 0,44; distancia al hombro r = −0,40) y correlaciones fuertes entre entradas que "
+    "describen la misma posición de formas distintas (por ejemplo, la altura y la fila del píxel); esto afecta a "
+    "los modelos lineales pero no a los basados en árboles.")
+figura("exito_vs_altura.png", "Tasa de éxito según la altura de la manzana respecto al hombro", ancho=12.5)
+figura("correlaciones.png", "Correlaciones de Pearson entre las entradas y el éxito", ancho=12)
 
-titulo("Clasificación binaria", 2)
+titulo("Predicción del éxito", 2)
 filas_b = []
 for m, r in tb.iterrows():
     fila = [m, f3(r["exactitud"]), f3(r["precisión"]), f3(r["exhaustividad"]), f3(r["F1"]),
-            f"{f3(r['AUC-ROC'])} {r['IC95 AUC'].replace('.', ',').replace(', ', '; ')}", f3(r["Brier"])]
-    if m == mejor_b:
-        fila = [(x,) for x in fila]
-    filas_b.append(fila)
-tabla("Desempeño de los modelos en el conjunto de prueba (salida binaria)", filas_b,
+            f"{f3(r['AUC-ROC'])} {ic(r['IC95 AUC'])}", f3(r["Brier"])]
+    filas_b.append([(x,) for x in fila] if m == mejor_b else fila)
+tabla("Desempeño en el conjunto de prueba (¿llega a la canasta?)", filas_b,
       ["Modelo", "Exactitud", "Precisión", "Exhaust.", "F1", "AUC-ROC [IC 95 %]", "Brier"],
-      nota=f"Conjunto de prueba: {n_te} intentos de una corrida independiente. En negrita, el mejor modelo por "
-           "AUC-ROC. Brier: menor es mejor.", anchos=[3.6, 1.8, 1.8, 1.8, 1.5, 3.8, 1.5], tam=9)
-par(f"Todos los modelos superaron claramente al clasificador trivial (Tabla 4). El bosque aleatorio obtuvo el mayor "
-    f"AUC-ROC ({f3(tb.loc[mejor_b, 'AUC-ROC'])}), la mayor exactitud ({f3(tb.loc[mejor_b, 'exactitud'])}) y la "
-    "mejor calibración (Brier = " + f3(tb.loc[mejor_b, "Brier"]) + "), seguido por el gradient boosting y la red "
-    "neuronal. La regresión logística fue la más débil, lo que indica que la relación entre las entradas y el "
-    "éxito no es lineal. Los intervalos de confianza de los mejores modelos se solapan, por lo que las diferencias "
-    "pequeñas entre ellos no son concluyentes con 592 intentos de prueba. Las curvas ROC se muestran en la "
-    "Figura 3.")
-figura("roc.png", "Curvas ROC de los modelos en el conjunto de prueba", ancho=11)
-par("Las curvas de aprendizaje (Figura 4) muestran que el bosque aleatorio ya está cerca de su techo con unos "
-    "1000 intentos, mientras que el gradient boosting y la red neuronal siguen mejorando al aumentar los datos: "
-    "más simulación podría acortar las diferencias. En el gradient boosting, el AUC de prueba se estabiliza tras "
-    "unas 150 iteraciones mientras el de entrenamiento sigue subiendo, una señal de sobreajuste moderado.")
-figura("curvas_aprendizaje.png", "Curvas de aprendizaje (AUC en validación cruzada según el tamaño del entrenamiento)",
-       nota="Las bandas indican ± una desviación estándar entre las cinco particiones.", ancho=14)
-par("La importancia por permutación del bosque aleatorio (Figura 5) coloca en primer lugar la distancia de la "
-    "manzana al hombro, seguida de su posición lateral, la profundidad medida por la cámara y los ángulos. Las "
-    "variables de las vecinas aportan poco, y el giro de cintura no aporta nada; esto último se explica porque, "
-    "en la simulación, el árbol se genera girado junto con el torso, de modo que el giro no cambia la geometría "
-    "relativa al brazo.")
-figura("importancia.png", "Importancia de las variables por permutación (bosque aleatorio)",
-       nota="Caída media del AUC-ROC de prueba al permutar cada variable (20 repeticiones); las barras de error "
-            "son una desviación estándar.", ancho=12)
-regla = pd.DataFrame({"u": np.linspace(0, 0.9, 19)})
-par("Como uso práctico, se evaluó una regla de decisión: intentar solo las manzanas cuya probabilidad predicha "
-    "supera un umbral (Figura 6). Con umbral 0,5, la tasa de éxito de los intentos realizados sube del 42 % al "
-    "68 %, a cambio de intentar el 38 % de las manzanas; con umbral 0,3, el éxito es del 61 % intentando el 62 %. "
-    "El umbral permite elegir el compromiso entre cosechar más fruta y no perder tiempo en intentos inviables.")
-figura("regla_decision.png", "Regla de decisión: éxito de los intentos realizados y fracción de manzanas intentadas",
-       nota="Conjunto de prueba, bosque aleatorio. La línea discontinua es la tasa de éxito sin regla (intentar todo).",
-       ancho=13)
+      nota=f"{n_te} intentos de prueba. En negrita, el mejor modelo.", anchos=[3.6, 1.8, 1.8, 1.8, 1.5, 3.8, 1.5],
+      tam=9)
+par(f"Todos los modelos superaron al trivial (Tabla 2). El bosque aleatorio fue el mejor en AUC "
+    f"({f3(tb.loc[mejor_b, 'AUC-ROC'])}), exactitud ({f3(tb.loc[mejor_b, 'exactitud'])} frente a "
+    f"{f3(tb.loc['Trivial', 'exactitud'])} del trivial) y calibración; la regresión logística fue la más débil, "
+    "señal de que la relación no es lineal; las curvas ROC están en la Figura 4. La importancia por permutación confirma que el bosque se apoya sobre "
+    "todo en la distancia y la posición de la manzana respecto al hombro; las vecinas aportan poco. Como regla "
+    "práctica, intentar solo las manzanas con P ≥ 0,5 sube el éxito de los intentos realizados del 42 % al 68 %, a "
+    "cambio de intentar el 38 % de las manzanas.")
+figura("roc.png", "Curvas ROC en el conjunto de prueba", ancho=10)
+par("La red neuronal (dos capas ocultas de 32 y 16 neuronas) obtuvo AUC = "
+    f"{f3(tb.loc['Red neuronal (MLP)', 'AUC-ROC'])}; la diferencia con el bosque es de +0,029 a su favor, IC 95 % "
+    "[+0,011; +0,047], significativa. Su curva por época (Figura 5) muestra que la pérdida de entrenamiento "
+    "sigue bajando mientras el AUC de prueba se estanca en torno a 0,79: entrenar más solo la sobreajusta, y la "
+    "parada temprana la detuvo en la época 151. Que los árboles superen a la red en datos tabulares de este tamaño "
+    "coincide con lo reportado en la literatura (Grinsztajn et al., 2022).")
+figura("red_epocas.png", "Red neuronal: pérdida de entrenamiento y AUC por época", ancho=14)
 
-titulo("Red neuronal frente a bosque aleatorio", 2)
-rf, rn = trn.loc["Bosque aleatorio"], trn.loc["Red neuronal (MLP)"]
-par("La red seleccionada por validación cruzada tiene dos capas ocultas de 32 y 16 neuronas con α = 1,0 y se "
-    "detuvo en la época 151 por parada temprana. Su AUC de prueba fue " + f3(tb.loc["Red neuronal (MLP)", "AUC-ROC"])
-    + " frente a " + f3(tb.loc["Bosque aleatorio", "AUC-ROC"]) + " del bosque. El bootstrap pareado da una "
-    "diferencia de +0,029 a favor del bosque, con IC 95 % [+0,011; +0,047]: la red fue igual o mejor en solo el "
-    "0,1 % de los remuestreos, por lo que la diferencia es significativa. Además, la red es más sensible a la "
-    "inicialización aleatoria (Tabla 5) y, por época (Figura 7), su AUC de prueba se estanca en torno a 0,79 "
-    "mientras el de entrenamiento sigue subiendo, es decir, entrenar más solo la sobreajusta. Su ventaja es el "
-    "costo: es mucho más pequeña y rápida, aunque 10 ms por predicción del bosque son despreciables frente a un "
-    "intento de cosecha de unos 16 s. El resultado coincide con lo reportado para datos tabulares (Grinsztajn et "
-    "al., 2022).")
-tabla("Red neuronal frente a bosque aleatorio", [
-    ["AUC-ROC con 5 semillas", rf["AUC prueba (5 semillas)"].replace(".", ","), rn["AUC prueba (5 semillas)"].replace(".", ",")],
-    ["Tiempo de entrenamiento (s)", str(rf["entrenamiento [s]"]).replace(".", ","), str(rn["entrenamiento [s]"]).replace(".", ",")],
-    ["Predicción de una manzana (ms)", str(rf["predicción de 1 manzana [ms]"]).replace(".", ","),
-     str(rn["predicción de 1 manzana [ms]"]).replace(".", ",")],
-    ["Tamaño", rf["tamaño"], rn["tamaño"]]],
-    ["", "Bosque aleatorio", "Red neuronal"], anchos=[5.5, 5, 5])
-figura("red_epocas.png", "Red neuronal: pérdida de entrenamiento y AUC por época",
-       nota="La línea discontinua es el AUC de prueba del bosque aleatorio; la línea punteada, la época en que se "
-            "detuvo la parada temprana.", ancho=15.5)
-
-titulo("Clasificación multiclase: etapa del fallo", 2)
+titulo("Predicción de la etapa del fallo", 2)
 mejor_m = tm.drop("Trivial")["F1 macro"].idxmax()
 filas_m = []
 for m, r in tm.iterrows():
-    fila = [m, f3(r["exactitud"]), f3(r["exactitud balanceada"]), f3(r["F1 macro"]), f3(r["F1 macro VC (entren.)"])]
+    fila = [m, f3(r["exactitud"]), f3(r["exactitud balanceada"]), f3(r["F1 macro"])]
     filas_m.append([(x,) for x in fila] if m == mejor_m else fila)
-tabla("Desempeño en la predicción de la etapa del fallo (conjunto de prueba)", filas_m,
-      ["Modelo", "Exactitud", "Exactitud balanceada", "F1 macro", "F1 macro (validación cruzada)"],
-      nota="Seis clases: éxito, alcance, agarre, desprendimiento, transporte y «otro» (retorno + depósito). "
-           "El trivial predice siempre «éxito».", anchos=[4, 2.6, 3.2, 2.4, 3.8])
-par(f"El bosque aleatorio también fue el mejor en la salida multiclase (F1 macro = {f3(tm.loc[mejor_m, 'F1 macro'])} "
-    f"frente a {f3(tm.loc['Trivial', 'F1 macro'])} del trivial). Por clase (Figura 8), el desempeño es muy desigual: "
-    "los fallos de alcance se predicen casi perfectamente (F1 = 0,93), porque dependen de si la manzana está dentro "
-    "del espacio alcanzable; los de agarre razonablemente (F1 = 0,67); los de desprendimiento solo en parte "
-    "(F1 = 0,41); y las caídas durante el transporte o el retorno prácticamente no se pueden anticipar (F1 ≤ 0,09). "
-    "Estas últimas dependen de la calidad del agarre logrado, que no se conoce antes de intentar.")
-figura("confusion_multiclase.png", "Matriz de confusión normalizada por fila del bosque aleatorio (etapa del fallo)",
-       ancho=11)
+tabla("Desempeño en la predicción de la etapa (conjunto de prueba)", filas_m,
+      ["Modelo", "Exactitud", "Exactitud balanceada", "F1 macro"],
+      nota="Seis clases: éxito, alcance, agarre, desprendimiento, transporte y «otro». El trivial predice siempre "
+           "«éxito».", anchos=[4.5, 3, 4, 3])
+par(f"El bosque también fue el mejor aquí (F1 macro = {f3(tm.loc[mejor_m, 'F1 macro'])}, Tabla 3), pero con "
+    "resultados muy desiguales por clase: los fallos de alcance se predicen casi perfectamente (F1 = 0,93) y los "
+    "de agarre razonablemente (0,67), porque dependen de la geometría; los de desprendimiento solo en parte (0,41), "
+    "y las caídas durante el transporte casi nada (0,09), porque dependen de qué tan bien quedó agarrada la fruta, "
+    "algo que no se conoce antes de intentar.")
 
-titulo("Verificación con el robot real", 2)
+titulo("Robot real", 2)
 filas_r = []
 mejor_r = treal["AUC robot real"].idxmax()
 for m, r in treal.iterrows():
-    fila = [m, f3(r["AUC simulación (prueba)"]),
-            f"{f3(r['AUC robot real'])} {r['IC95 real'].replace('.', ',').replace(', ', '; ')}",
-            f3(r["Brier real"]), f3(r["P media predicha"])]
+    fila = [m, f3(r["AUC simulación (prueba)"]), f"{f3(r['AUC robot real'])} {ic(r['IC95 real'])}"]
     filas_r.append([(x,) for x in fila] if m == mejor_r else fila)
-tabla("Modelos geométricos entrenados en simulación, evaluados en simulación y en el robot real", filas_r,
-      ["Modelo", "AUC simulación", "AUC robot real [IC 95 %]", "Brier real", "P media predicha"],
-      nota=f"Robot real: {len(REAL)} manzanas intentadas, éxito observado {pc(REAL.exito.mean())}. Solo las siete "
-           "variables geométricas (posición respecto al hombro, distancias y ángulos).",
-      anchos=[3.8, 2.6, 4.6, 2.3, 2.7], tam=9)
-par("Todos los modelos ordenan los intentos reales mejor que el azar, pero el orden de los modelos se invierte "
-    "respecto de la simulación (Tabla 7, Figura 9). La regresión logística, la más débil en simulación, es la "
-    f"mejor en el robot real (AUC = {f3(treal.loc['Regresión logística', 'AUC robot real'])}) y mantiene su "
-    "desempeño; los modelos más flexibles (SVM, bosque, boosting) caen a valores entre 0,56 y 0,64. Una "
-    "interpretación es que estos modelos aprenden detalles propios del simulador (por ejemplo, el borde exacto "
-    "del espacio alcanzable) que no se cumplen en el robot real, mientras que la frontera suave de la regresión "
-    "logística captura la tendencia general —las manzanas bajas y lejanas fallan— que sí se transfiere. La "
-    "calibración en el robot real es pobre: los modelos sobreestiman el éxito, coherente con que el robot real "
-    "rinde peor que la simulación. Estos resultados son cualitativos: los intentos reales son pocos, mezclan "
-    "versiones del agarre e incluyen giros de cintura de hasta −45°, fuera del rango simulado.")
-figura("robot_real.png", "Transferencia al robot real: AUC por modelo y calibración del mejor modelo", ancho=15.5)
+tabla("Modelos geométricos: AUC en simulación y en el robot real", filas_r,
+      ["Modelo", "AUC simulación", "AUC robot real [IC 95 %]"],
+      nota=f"{len(REAL)} intentos reales, éxito {pc(REAL.exito.mean())}; 7 variables geométricas.", anchos=[5, 3.5, 5.5])
+par("En el robot real el orden de los modelos se invierte (Tabla 4): la regresión logística, la más débil en "
+    f"simulación, es la mejor (AUC = {f3(treal.loc['Regresión logística', 'AUC robot real'])}) y conserva su "
+    "desempeño, mientras que los modelos flexibles caen a 0,56–0,68. Estos aprenden detalles propios del "
+    "simulador que no se cumplen en la realidad; la frontera suave de la regresión logística capta solo la "
+    "tendencia general (las manzanas bajas y lejanas fallan), que sí se transfiere. Todos sobreestiman el éxito "
+    "real. Con 190 intentos de versiones mezcladas del sistema, esta conclusión es orientativa.")
 
 titulo("Uso del modelo para decidir el giro de cintura", 2)
 if CINT and all(k in CINT for k in ("modelo", "mantener")):
     filas_c = []
-    for modo in ("mantener", "modelo", "aleatorio"):
+    for modo, nombre in (("mantener", "Mantener el giro inicial"), ("modelo", "Giro elegido por el modelo"),
+                         ("aleatorio", "Giro al azar (control)")):
         if modo in CINT:
             c = CINT[modo]
-            filas_c.append([modo, c["n"], pc(c["exito"]), f"[{pc(c['lo'])}; {pc(c['hi'])}]", f3(c["p_usado"]),
-                            pc(c["giro"], 0)])
-    tabla("Tasa de éxito simulada según cómo se elige el giro de cintura", filas_c,
-          ["Grupo", "Intentos", "Éxito", "IC 95 %", "P predicha media", "Intentos con giro"],
-          nota="Misma semilla y mismo procedimiento en los tres grupos; árboles independientes.",
-          anchos=[2.8, 2, 2.2, 3.8, 3, 2.6])
-    txt = []
-    for a, b in (("modelo", "mantener"), ("modelo", "aleatorio"), ("aleatorio", "mantener")):
-        if a in CINT and b in CINT:
-            d, lo, hi, pv = comp(a, b)
-            txt.append(f"«{a}» − «{b}»: {sg(d)} puntos, IC 95 % [{sg(lo)}; {sg(hi)}], {fp(pv)}")
-    par("Las diferencias entre grupos fueron: " + "; ".join(txt) + ".")
-    cm, cb, ca = CINT["modelo"], CINT["mantener"], CINT.get("aleatorio")
-    par(f"Elegir el giro con el modelo aumentó la tasa de éxito de {pc(cb['exito'])} a {pc(cm['exito'])}, una mejora "
-        f"relativa del {100 * (cm['exito'] / cb['exito'] - 1):.0f} %. El control aleatorio no difiere "
-        "significativamente de la línea base y queda por debajo del modelo: la mejora proviene de la elección del "
-        "modelo y no del simple hecho de girar. La probabilidad predicha media coincidió con el éxito observado en "
-        f"los tres grupos ({f3(cb['p_usado'])} frente a {f3(cb['exito'])} en la línea base, {f3(cm['p_usado'])} "
-        f"frente a {f3(cm['exito'])} con el modelo" + (f" y {f3(ca['p_usado'])} frente a {f3(ca['exito'])} con el "
-        f"giro aleatorio" if ca else "") + "), es decir, el modelo anticipó correctamente cuánto iba a mejorar, aun "
-        "evaluando configuraciones (cintura girada con el árbol quieto) que no aparecían como tales en los datos de "
-        f"entrenamiento. El modelo giró la cintura en el {pc(cm['giro'], 0)} de los intentos, con una mediana de "
-        f"{cm['giro_abs']:.0f}° (Figura 10), y en uno de cada cinco eligió el borde del rango (−15°), lo que sugiere "
-        "que ampliar el rango podría mejorar más. La mejora se concentró en los fallos de agarre, que bajaron de 162 "
-        "a 91. Como cada grupo usa árboles distintos, la comparación no es pareada, pero el intervalo de confianza "
-        "excluye el cero con margen. El experimento es solo en simulación: no se probó en el robot real.")
-    figura("cintura.png", "Éxito observado y probabilidad predicha según la elección del giro de cintura", ancho=15)
-else:
-    par("[Resultados pendientes: el experimento se está ejecutando.]")
+            filas_c.append([nombre, c["n"], pc(c["exito"]), f"[{pc(c['lo'])}; {pc(c['hi'])}]", f3(c["p_usado"])])
+    tabla("Éxito simulado según cómo se elige el giro de cintura", filas_c,
+          ["Grupo", "Intentos", "Éxito", "IC 95 %", "P predicha media"], anchos=[5.2, 2, 2, 3.8, 3])
+    d, lo, hi, pv = comp("modelo", "mantener")
+    d2, _, _, pv2 = comp("aleatorio", "mantener")
+    par(f"Elegir el giro con el modelo subió el éxito de {pc(CINT['mantener']['exito'])} a "
+        f"{pc(CINT['modelo']['exito'])} ({sg(d)} puntos, IC 95 % [{sg(lo)}; {sg(hi)}], {fp(pv)}; Tabla 5), mientras "
+        f"que girar al azar no mejoró significativamente ({sg(d2)} puntos, {fp(pv2)}): la mejora se debe a la "
+        "elección del modelo y no al simple hecho de girar. Además, la probabilidad media predicha coincidió con "
+        "el éxito observado en los tres grupos, es decir, el modelo anticipó cuánto iba a mejorar.")
 
 if V5:
-    titulo("Predictor reentrenado para la cadena v5", 2)
+    titulo("Nuevas políticas (v5) y predictor reentrenado", 2)
     et5 = V5["et"]
-    par(f"La cadena v5 cosechó el {pc(V5['exito'])} de los intentos, frente al {pc(et5.loc['exito', 'cadena v1'])} de "
-        "la cadena original en el mismo mundo simulado. Los fallos de agarre bajaron de "
-        f"{pc(et5.loc['agarre', 'cadena v1'])} a {pc(et5.loc['agarre', 'cadena v5'])} y los de desprendimiento de "
-        f"{pc(et5.loc['desprendimiento', 'cadena v1'])} a {pc(et5.loc['desprendimiento', 'cadena v5'])}, justamente "
-        "las etapas que el primer modelo señalaba como más frecuentes.")
+    par("Los resultados anteriores mostraron que la mayoría de los fallos ocurrían en el agarre y el "
+        "desprendimiento, y que la posición de la manzana respecto al brazo era decisiva. Con esa información se "
+        "diseñó después una nueva cadena de políticas (v5): un mapa aprendido que elige el giro de cintura y la "
+        "dirección de la mano para cada manzana, un alcance que evita empujar la fruta, y un agarre y un "
+        "desprendimiento más firmes. El mapa trae su propia estimación de si el brazo llegará a la manzana, Q, que "
+        "sirve como referencia. En el mismo mundo simulado, la cadena v5 cosechó el "
+        f"{pc(V5['exito'])} de los intentos, frente al {pc(et5.loc['exito', 'cadena v1'])} de la original: los fallos "
+        f"de agarre bajaron de {pc(et5.loc['agarre', 'cadena v1'])} a {pc(et5.loc['agarre', 'cadena v5'])} y los de "
+        f"desprendimiento de {pc(et5.loc['desprendimiento', 'cadena v1'])} a "
+        f"{pc(et5.loc['desprendimiento', 'cadena v5'])} (Figura 6, izquierda).")
     t5 = V5["t"]
-    orden = [i for i in t5.index if i != "Trivial"] + ["Trivial"]
-    filas5 = [[i, f3(t5.loc[i, "AUC-ROC"]), t5.loc[i, "IC95 AUC"].replace(".", ",").replace(", ", "; "),
-               f3(t5.loc[i, "exactitud"]), f3(t5.loc[i, "exactitud balanceada"]), f3(t5.loc[i, "F1"]),
-               f3(t5.loc[i, "Brier"])] for i in orden]
-    tabla("Desempeño en el conjunto de prueba de la cadena v5 (salida binaria)", filas5,
-          ["Modelo", "AUC-ROC", "IC 95 % AUC", "Exactitud", "Exact. balanceada", "F1", "Brier"],
-          nota="Las dos filas de referencia no se entrenaron con los datos v5: la Q del mapa de apuntado es la "
-               "predicción de alcance que la cadena ya trae, y el bosque de la cadena v1 es el modelo de la "
-               "sección anterior aplicado tal cual.", anchos=[5.2, 1.7, 2.9, 1.8, 1.9, 1.4, 1.4], tam=9)
     mejor5 = V5["mejor"]
+    filas5 = []
+    for i, nombre in ((mejor5, f"{mejor5} reentrenado"), ("Regresión logística", "Regresión logística reentrenada"),
+                      ("Q del mapa de apuntado (referencia)", "Q del mapa (referencia)"),
+                      ("Bosque de la cadena v1, sin reentrenar", "Bosque anterior, sin reentrenar"),
+                      ("Trivial", "Trivial")):
+        r = t5.loc[i]
+        filas5.append([nombre, f"{f3(r['AUC-ROC'])} {ic(r['IC95 AUC'])}", f3(r["exactitud"]), f3(r["Brier"])])
+    tabla("Predicción del éxito con las políticas v5 (conjunto de prueba)", filas5,
+          ["Modelo", "AUC-ROC [IC 95 %]", "Exactitud", "Brier"],
+          nota=f"{V5['n_te']} intentos de prueba; el resto de los modelos reentrenados quedó entre AUC 0,84 y 0,86.",
+          anchos=[6, 4.5, 2.5, 2.2])
     c5 = V5["comp"].set_index("comparación")
     cq = c5.loc[f"{mejor5} − Q del mapa de apuntado"]
     cv1 = c5.loc[f"{mejor5} − Bosque de la cadena v1"]
-    tv, tq, tm = t5.loc["Bosque de la cadena v1, sin reentrenar"], t5.loc["Q del mapa de apuntado (referencia)"], t5.loc[mejor5]
-    ic = lambda x: x.replace(".", ",").replace(", ", "; ")
-    par(f"Todos los modelos reentrenados (Tabla {N_TABLA[0]}) quedaron entre AUC = {f3(t5.drop(['Trivial']).iloc[:6]['AUC-ROC'].min())} y "
-        f"{f3(t5.drop(['Trivial']).iloc[:6]['AUC-ROC'].max())}, con intervalos que se superponen; el mejor en validación "
-        f"cruzada fue el {mejor5.lower()} (AUC = {f3(tm['AUC-ROC'])}, exactitud {f3(tm['exactitud'])} frente a "
-        f"{f3(t5.loc['Trivial', 'exactitud'])} del trivial). Las dos referencias ordenan los intentos igual de bien: "
-        f"la Q del mapa de apuntado (AUC = {f3(tq['AUC-ROC'])}; diferencia {cq['diferencia AUC']:+.3f}".replace(".", ",") + f", "
-        f"IC 95 % {ic(cq['IC95'])}) y el bosque de la cadena anterior sin reentrenar (AUC = {f3(tv['AUC-ROC'])}; "
-        f"diferencia IC 95 % {ic(cv1['IC95'])}). Con las políticas v5 lo que se puede anticipar es, sobre todo, si "
-        "el brazo alcanza la manzana, y eso ya lo captan la geometría y el mapa.")
-    par(f"La diferencia está en la calibración (Figura {N_FIG[0] + 1}, panel derecho). El modelo reentrenado tiene la "
-        f"menor puntuación de Brier ({f3(tm['Brier'])}), significativamente menor que la de la Q del mapa "
-        f"({f3(tq['Brier'])}; diferencia IC 95 % {ic(cq['IC95 Brier'])}), que solo mide el alcance y sobreestima el "
-        f"éxito, y que la del bosque anterior ({f3(tv['Brier'])}; IC 95 % {ic(cv1['IC95 Brier'])}), que lo subestima "
-        "porque aprendió con una cadena que fallaba mucho más. Sus probabilidades, por lo tanto, se pueden leer "
-        "directamente como tasas de éxito esperadas, que es lo que hace falta para fijar un umbral de decisión o "
-        "estimar el rendimiento de una sesión de cosecha. Al cambiar las políticas cambia la relación entre las "
-        "entradas y el resultado: el orden se conserva, pero las probabilidades deben reentrenarse.")
     rg = V5["regla"].set_index("umbral")
-    filas_r5 = [[f"{u:.1f}".replace(".", ","), pc(r["intentados"], 0), pc(r["éxito de los intentados"]),
-                 pc(r["cosechas perdidas (de las posibles)"])] for u, r in rg.iterrows()]
-    tabla(f"Regla de decisión con {mejor5.lower()} en la cadena v5 (conjunto de prueba)", filas_r5,
-          ["Umbral de P", "Manzanas intentadas", "Éxito de los intentos", "Cosechas posibles perdidas"],
-          nota="Umbral 0: se intentan todas las manzanas (situación actual).", anchos=[3, 4, 4, 4.5])
     r5 = rg.loc[0.5]
-    par(f"Como regla de decisión (Tabla {N_TABLA[0]}), intentar solo las manzanas con P ≥ 0,5 sube el éxito de los "
-        f"intentos realizados de {pc(rg.loc[0.0, 'éxito de los intentados'])} a {pc(r5['éxito de los intentados'])}, "
-        f"intentando el {pc(r5['intentados'], 0)} de las manzanas y perdiendo solo el "
-        f"{pc(r5['cosechas perdidas (de las posibles)'])} de las cosechas posibles. Con la cadena v1 la misma regla "
-        "descartaba la mayoría de las manzanas; con la v5, al ser mucho más alto el éxito de base, el modelo sirve "
-        "sobre todo para descartar los casos claramente fuera de alcance y para estimar el rendimiento esperado.")
-    figura("cadena_v5.png", "Cadena v5: resultado de los intentos, curvas ROC y calibración del predictor reentrenado",
-           ancho=15.5)
+    par(f"Reentrenado con los datos v5, el {mejor5.lower()} alcanzó AUC = {f3(t5.loc[mejor5, 'AUC-ROC'])} (Tabla 6). "
+        "Ordena las manzanas igual que la Q del mapa y que el bosque anterior sin reentrenar (diferencias no "
+        "significativas), porque con las nuevas políticas lo que más se puede anticipar es si el brazo alcanza la "
+        "manzana. La ventaja está en la calibración (Figura 6, derecha): su Brier es significativamente menor que "
+        f"el de la Q (IC 95 % de la diferencia {ic(cq['IC95 Brier'])}), que sobreestima el éxito, y que el del bosque "
+        f"anterior ({ic(cv1['IC95 Brier'])}), que lo subestima porque aprendió con políticas que fallaban más. Es "
+        "decir, cuando cambian las políticas el orden se conserva, pero las probabilidades deben reentrenarse. Como "
+        f"regla, intentar solo con P ≥ 0,5 sube el éxito de los intentos de "
+        f"{pc(rg.loc[0.0, 'éxito de los intentados'])} a {pc(r5['éxito de los intentados'])}, perdiendo el "
+        f"{pc(r5['cosechas perdidas (de las posibles)'])} de las cosechas posibles.")
+    figura("cadena_v5.png", "Políticas v5: resultado de los intentos, curvas ROC y calibración", ancho=16)
 
-# ═════════════════════════ DISCUSIÓN Y CONCLUSIONES ═════════════════════════
-titulo("Discusión y conclusiones", 1)
-par("Es posible predecir, antes de intentar y con información disponible para el robot, si una cosecha "
-    "simulada terminará con la manzana en la canasta: el mejor modelo (bosque aleatorio) ordena los intentos "
-    "con AUC-ROC = " + f3(tb.loc[mejor_b, "AUC-ROC"]) + " y, como regla de decisión, eleva el éxito de los intentos "
-    "realizados del 42 % al 68 %. La geometría de la manzana respecto al hombro —sobre todo la altura y la "
-    "distancia— explica la mayor parte de lo predecible; la presencia de vecinas visibles aporta poco.")
-par("Los conjuntos de árboles fueron los mejores en simulación y superaron significativamente a la red neuronal, "
-    "lo que coincide con la literatura sobre datos tabulares. Sin embargo, la verificación con el robot real "
-    "muestra que el mejor modelo en simulación no es necesariamente el mejor en la realidad: la regresión "
-    "logística transfirió mejor. Para un uso en el robot conviene preferir modelos simples o regularizados, o "
-    "reentrenarlos con datos reales.")
-if CINT and "modelo" in CINT and "mantener" in CINT:
-    d, lo, hi, pv = comp("modelo", "mantener")
-    par("El modelo no solo sirve para predecir: usado para decidir el giro de cintura antes de cada intento, "
-        f"aumentó la tasa de éxito simulada en {sg(d)} puntos ({pc(CINT['mantener']['exito'])} → "
-        f"{pc(CINT['modelo']['exito'])}), con probabilidades predichas que coincidieron con el éxito observado. "
-        "Es una aplicación directa al robot, que ya puede girar la cintura, aunque falta validarla en el mundo real.")
-if V5:
-    par("El modelo también orientó el desarrollo: la cadena de políticas v5, diseñada después de identificar dónde "
-        f"fallaban los intentos, pasó de {pc(VIS.exito.mean())} a {pc(V5['exito'])} de éxito en simulación. Para esa cadena "
-        f"el predictor reentrenado alcanzó AUC = {f3(V5['t'].loc[V5['mejor'], 'AUC-ROC'])}, similar al del mapa de "
-        "apuntado y al del modelo anterior, pero con probabilidades bien calibradas, a diferencia de ambos. El "
-        "predictor está atado a las políticas con que se generaron los datos: el procedimiento (simular, "
-        "registrar, reentrenar) debe repetirse con cada versión.")
-par("La etapa del fallo solo es predecible cuando depende de la geometría (alcance y, en parte, agarre). Las "
-    "caídas después de arrancar la manzana dependen de la calidad del agarre logrado y no pueden anticiparse "
-    "con la información previa; para predecirlas haría falta información durante el intento (fuerzas en los "
-    "dedos), lo que convierte el problema en otro distinto.")
-titulo("Limitaciones", 2)
+# ═════════════════════════ CONCLUSIONES ═════════════════════════
+titulo("Conclusiones", 1)
+par("Se puede predecir, antes de intentar y con información que el robot ya tiene, si una cosecha simulada "
+    f"terminará bien: el bosque aleatorio ordena los intentos con AUC = {f3(tb.loc[mejor_b, 'AUC-ROC'])}, superó "
+    "significativamente a la red neuronal, y lo predecible se explica sobre todo por la posición de la manzana "
+    "respecto al hombro. La etapa del fallo solo se anticipa cuando depende de la geometría (alcance y agarre).")
+par("El modelo fue útil más allá de predecir. Usado para decidir el giro de cintura, mejoró la cosecha simulada "
+    "con probabilidades que coincidieron con lo observado; y el diagnóstico de dónde fallaban los intentos guió el "
+    + (f"diseño de nuevas políticas que llevaron el éxito simulado de {pc(VIS.exito.mean())} a {pc(V5['exito'])}. "
+       if V5 else "diseño de nuevas políticas. ") +
+    "Dos lecciones prácticas: en el robot real conviene un modelo simple, porque los flexibles aprenden detalles "
+    "del simulador; y cada vez que cambian las políticas, el predictor debe reentrenarse para que sus "
+    "probabilidades sigan siendo confiables.")
+titulo("Limitaciones y trabajo futuro", 2)
 lista([
-    "Los datos de entrenamiento son solo de simulación; la física del agarre y del pedúnculo es aproximada.",
-    "La verificación real usa pocos intentos (190), con versiones del código mezcladas y sin las variables de "
-    "vecinas ni de píxel; sus conclusiones son cualitativas.",
+    "Los datos de entrenamiento son simulados; la física del agarre y del pedúnculo es aproximada.",
+    "La prueba en el robot real es pequeña (190 intentos), mezcla versiones del sistema y no incluye las vecinas "
+    "ni el píxel; el uso del giro de cintura y las políticas v5 solo se probaron en simulación.",
     "No se usó la distancia al tronco ni las oclusiones entre manzanas, que en un huerto real influyen.",
-    "El modelo vale para las políticas actuales del robot: si se reentrena el brazo, hay que volver a generar datos.",
-    "Las clases poco frecuentes (retorno, depósito) no tienen ejemplos suficientes para aprenderse.",
-])
-titulo("Trabajo futuro", 2)
-lista([
-    "Registrar en el robot real las mismas variables que en simulación (vecinas, píxel) para validar el modelo "
-    "completo y reentrenarlo con datos reales.",
-    "Ampliar el rango de giros de cintura en la simulación y usar el modelo para elegir, además, la orientación "
-    "de la mano.",
-    "Incorporar información del propio intento (fuerzas del agarre) para anticipar las caídas en el transporte.",
+    "Próximos pasos: registrar en el robot real las mismas variables para reentrenar con datos reales, y sumar "
+    "información del propio intento (fuerzas en los dedos) para anticipar las caídas durante el transporte.",
 ])
 
 # ═════════════════════════ REFERENCIAS ═════════════════════════
@@ -776,31 +573,12 @@ REFS = [
     "Bac, C. W., van Henten, E. J., Hemming, J., y Edan, Y. (2014). Harvesting robots for high-value crops: "
     "State-of-the-art review and challenges ahead. *Journal of Field Robotics, 31*(6), 888–911. "
     "https://doi.org/10.1002/rob.21525",
-    "Bishop, C. M. (2006). *Pattern recognition and machine learning*. Springer.",
-    "Bohg, J., Morales, A., Asfour, T., y Kragic, D. (2014). Data-driven grasp synthesis—A survey. *IEEE "
-    "Transactions on Robotics, 30*(2), 289–309. https://doi.org/10.1109/TRO.2013.2289018",
     "Breiman, L. (2001). Random forests. *Machine Learning, 45*(1), 5–32. https://doi.org/10.1023/A:1010933404324",
-    "Brier, G. W. (1950). Verification of forecasts expressed in terms of probability. *Monthly Weather Review, "
-    "78*(1), 1–3.",
-    "Chapelle, O., Schölkopf, B., y Zien, A. (2006). *Semi-supervised learning*. MIT Press.",
-    "Cortes, C., y Vapnik, V. (1995). Support-vector networks. *Machine Learning, 20*(3), 273–297. "
-    "https://doi.org/10.1007/BF00994018",
-    "Cover, T., y Hart, P. (1967). Nearest neighbor pattern classification. *IEEE Transactions on Information "
-    "Theory, 13*(1), 21–27. https://doi.org/10.1109/TIT.1967.1053964",
     "Efron, B., y Tibshirani, R. J. (1993). *An introduction to the bootstrap*. Chapman & Hall.",
     "Fawcett, T. (2006). An introduction to ROC analysis. *Pattern Recognition Letters, 27*(8), 861–874. "
     "https://doi.org/10.1016/j.patrec.2005.10.010",
-    "Friedman, J. H. (2001). Greedy function approximation: A gradient boosting machine. *The Annals of "
-    "Statistics, 29*(5), 1189–1232. https://doi.org/10.1214/aos/1013203451",
-    "Géron, A. (2019). *Hands-on machine learning with Scikit-Learn, Keras, and TensorFlow* (2.ª ed.). O'Reilly Media.",
     "Grinsztajn, L., Oyallon, E., y Varoquaux, G. (2022). Why do tree-based models still outperform deep learning "
     "on typical tabular data? *Advances in Neural Information Processing Systems, 35*, 507–520.",
-    "Igual, L., y Seguí, S. (2017). *Introduction to data science: A Python approach to concepts, techniques and "
-    "applications*. Springer.",
-    "Kingma, D. P., y Ba, J. (2015). Adam: A method for stochastic optimization. En *Proceedings of the 3rd "
-    "International Conference on Learning Representations (ICLR)*.",
-    "Lenz, I., Lee, H., y Saxena, A. (2015). Deep learning for detecting robotic grasps. *The International "
-    "Journal of Robotics Research, 34*(4–5), 705–724. https://doi.org/10.1177/0278364914549607",
     "Mittal, M., Yu, C., Yu, Q., Liu, J., Rudin, N., Hoeller, D., Yuan, J. L., Singh, R., Guo, Y., Mazhar, H., "
     "Mandlekar, A., Babich, B., State, G., Hutter, M., y Garg, A. (2023). Orbit: A unified simulation framework "
     "for interactive robot learning environments. *IEEE Robotics and Automation Letters, 8*(6), 3740–3747. "
@@ -809,19 +587,9 @@ REFS = [
     "P., Weiss, R., Dubourg, V., Vanderplas, J., Passos, A., Cournapeau, D., Brucher, M., Perrot, M., y "
     "Duchesnay, É. (2011). Scikit-learn: Machine learning in Python. *Journal of Machine Learning Research, 12*, "
     "2825–2830.",
-    "Silwal, A., Davidson, J. R., Karkee, M., Mo, C., Zhang, Q., y Lewis, K. (2017). Design, integration, and "
-    "field evaluation of a robotic apple harvester. *Journal of Field Robotics, 34*(6), 1140–1159. "
-    "https://doi.org/10.1002/rob.21715",
-    "Sutton, R. S., y Barto, A. G. (2018). *Reinforcement learning: An introduction* (2.ª ed.). MIT Press.",
     "Tobin, J., Fong, R., Ray, A., Schneider, J., Zaremba, W., y Abbeel, P. (2017). Domain randomization for "
     "transferring deep neural networks from simulation to the real world. En *2017 IEEE/RSJ International "
     "Conference on Intelligent Robots and Systems (IROS)* (pp. 23–30). https://doi.org/10.1109/IROS.2017.8202133",
-    "Zhao, W., Queralta, J. P., y Westerlund, T. (2020). Sim-to-real transfer in deep reinforcement learning for "
-    "robotics: A survey. En *2020 IEEE Symposium Series on Computational Intelligence (SSCI)* (pp. 737–744). "
-    "https://doi.org/10.1109/SSCI47803.2020.9308468",
-    "Zhou, H., Wang, X., Au, W., Kang, H., y Chen, C. (2022). Intelligent robots for fruit harvesting: Recent "
-    "developments and future challenges. *Precision Agriculture, 23*(5), 1856–1907. "
-    "https://doi.org/10.1007/s11119-022-09913-3",
 ]
 for ref in REFS:
     p = doc.add_paragraph()
@@ -830,16 +598,15 @@ for ref in REFS:
     _runs(p, ref)
 
 # ═════════════════════════ ANEXO ═════════════════════════
-salto()
-titulo("Anexo: código fuente entregado", 1)
+titulo("Anexo: código entregado (carpeta ml_project)", 2)
 lista([
-    "recolectar_dataset.py — simulación de la cosecha y registro del conjunto de datos (una fila por intento).",
-    "analisis_cosecha.ipynb — análisis de variables, modelos, comparación, verificación real y experimento de cintura.",
+    "recolectar_dataset.py y cosecha_v5.py — simulación de la cosecha y registro de los datos (una fila por intento).",
+    "analisis_cosecha.ipynb (y su versión .py) — análisis de variables, modelos, comparación y pruebas adicionales.",
+    "analisis_v5.py — predictor reentrenado para las políticas v5.",
     "intentos_reales.py — extracción de los intentos del robot real a partir de sus registros.",
-    "exportar_bosque.py y bosque_np.py — exportación del bosque aleatorio para usarlo dentro de la simulación.",
-    "cosecha_cintura.py — experimento de elección del giro de cintura con el modelo.",
-    "cosecha_v5.py y analisis_v5.py — conjunto de datos de la cadena v5 y predictor reentrenado.",
-    "datos/, datos_reales/, datos_cintura/, datos_v5/ — conjuntos de datos generados (CSV).",
+    "cosecha_cintura.py, exportar_bosque.py y bosque_np.py — experimento del giro de cintura.",
+    "informe/diagrama_modelos.py — Figura 1.",
+    "datos/, datos_reales/, datos_cintura/, datos_v5/ — conjuntos de datos (CSV).",
 ])
 
 out = os.path.join(AQUI, "informe_proyecto_final.docx")
