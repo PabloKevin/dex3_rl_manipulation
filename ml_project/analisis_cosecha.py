@@ -783,7 +783,32 @@ else:
     plt.show()
 
 
-# ## 8. Conclusiones
+# ## 8. Cadena v5: un predictor reentrenado para las políticas nuevas
+# 
+# El primer modelo mostró que el fallo se puede anticipar y, sobre todo, **dónde** se concentra (manzanas lejanas
+# o bajas, fallas de agarre y de desprendimiento). Con esa información se diseñó después una cadena nueva de
+# políticas (v5): un alcance que tiene en cuenta la fruta (AppleArmPose-v5), un **mapa de apuntado** que elige el
+# giro de cintura y la dirección de la palma (una red que estima la probabilidad de que el alcance llegue, `Q`),
+# el agarre aprendido con los dedos congelados al cerrar, un giro de muñeca de 60° y dedos más rígidos antes de
+# tirar del pedúnculo.
+# 
+# Se recolectó un dataset nuevo con esa cadena (`cosecha_v5.py`, el mismo mundo y las mismas entradas que el
+# original, calculadas con la cintura ya girada al ángulo elegido; todas las manzanas se intentan). Semillas 20 y
+# 21 para entrenamiento y 22 para prueba. Se comparan los mismos modelos y dos referencias:
+# 
+# * la **Q del mapa de apuntado**, la predicción que la cadena ya trae (solo mira el alcance);
+# * el **bosque de la cadena v1 sin reentrenar**, para ver si el modelo viejo sigue sirviendo.
+
+# In[24]:
+
+
+import analisis_v5
+R5 = analisis_v5.correr(mostrar=display)
+from IPython.display import Image
+Image(os.path.join(FIG, "cadena_v5.png"))
+
+
+# ## 9. Conclusiones
 # 
 # * **Se puede predecir el éxito antes de intentar.** El bosque aleatorio ordena los intentos simulados con
 #   AUC-ROC 0,814 [0,78; 0,85] (exactitud 0,718 frente a 0,578 del clasificador trivial). Todos los modelos superan
@@ -803,12 +828,20 @@ else:
 # * **Uso para decidir:** elegir el giro de cintura con el bosque subió el éxito simulado de 31,3 % a 42,5 %
 #   (+11,2 puntos, IC 95 % [+5,7; +16,7], p < 0,001); girar al azar no mejora significativamente (+2,8, p = 0,30).
 #   Las probabilidades predichas coincidieron con el éxito observado en los tres grupos.
+# * **Cadena v5 (diseñada después del primer modelo):** en el mismo mundo simulado cosecha el 68,4 % (frente a
+#   37,2 %); los fallos de agarre bajan de 27 % a 7 % y los de desprendimiento de 19 % a 10 %. El predictor
+#   reentrenado (bosque, elegido por validación cruzada) logra AUC 0,853 [0,81; 0,89]; todos los modelos quedan en
+#   0,84–0,86 y ordenan igual que la Q del mapa de apuntado (0,862) y que el bosque viejo sin reentrenar (0,858).
+#   La ganancia está en la **calibración**: Brier 0,127 frente a 0,165 (Q) y 0,219 (bosque viejo), ambas
+#   diferencias significativas. Con P ≥ 0,5 se intenta el 73 % de las manzanas, con 83 % de éxito, perdiendo el 7 %
+#   de las cosechas posibles. Al cambiar las políticas, el orden se conserva pero las probabilidades se deben
+#   reentrenar.
 # * **Limitaciones:** datos de entrenamiento solo simulados (física del agarre y del pedúnculo aproximada); la
 #   verificación real es pequeña, con versiones mezcladas y sin vecinas ni píxel; no se usa la distancia al tronco;
-#   el modelo vale para las políticas actuales del robot; el experimento de cintura no se probó en el robot real.
+#   cada predictor vale para las políticas con que se generaron sus datos; el experimento de cintura no se probó en el robot real.
 # 
 
-# In[24]:
+# In[25]:
 
 
 print("Resumen binario (prueba):")

@@ -280,6 +280,23 @@ if arch:
         bs = [ya[rng.integers(0, n1, n1)].mean() - yb[rng.integers(0, n2, n2)].mean() for _ in range(4000)]
         return p1 - p2, np.percentile(bs, 2.5), np.percentile(bs, 97.5), pv
 
+# cadena v5 (si ya hay datos y tablas de analisis_v5.py)
+V5 = None
+_t5 = os.path.join(FIG, "tabla_binaria_v5.csv")
+_a5 = sorted(glob.glob(os.path.join(ML, "datos_v5", "cosecha_v5_seed*.csv")))
+if _a5 and os.path.exists(_t5):
+    _d5 = pd.concat([pd.read_csv(f) for f in _a5], ignore_index=True)
+    _d5 = _d5[_d5.objetivo_visible == 1]
+    V5 = dict(t=pd.read_csv(_t5, index_col=0), comp=pd.read_csv(os.path.join(FIG, "tabla_v5_comparacion.csv")),
+              regla=pd.read_csv(os.path.join(FIG, "tabla_regla_v5.csv")),
+              et=pd.read_csv(os.path.join(FIG, "tabla_etapas_v1_v5.csv"), index_col=0),
+              n=len(_d5), n_tr=int((_d5.semilla != 22).sum()), n_te=int((_d5.semilla == 22).sum()),
+              exito=_d5.exito.mean(), exito_te=_d5[_d5.semilla == 22].exito.mean(),
+              semillas=sorted(_d5.semilla.unique()))
+    _m = V5["t"].drop([i for i in V5["t"].index if i == "Trivial" or "referencia" in i or "sin reentrenar" in i
+                       or "+ Q" in i])
+    V5["mejor"] = _m["AUC-VC (entren.)"].idxmax()        # elegido por validación cruzada, como en analisis_v5.py
+
 # ═════════════════════════ PORTADA ═════════════════════════
 for _ in range(3):
     doc.add_paragraph()
@@ -318,6 +335,12 @@ if CINT and "modelo" in CINT and "mantener" in CINT:
                 f"éxito simulada de {pc(CINT['mantener']['exito'])} a {pc(CINT['modelo']['exito'])} "
                 f"({sg(d)} puntos porcentuales, IC 95 % [{sg(lo)}; {sg(hi)}], {fp(pv)}), mientras que girar al azar "
                 f"no produjo una mejora significativa.")
+if V5:
+    res_txt += (f" Con esa información se diseñó después una nueva cadena de políticas (v5) que, en el mismo mundo "
+                f"simulado, eleva el éxito de {pc(VIS.exito.mean())} a {pc(V5['exito'])}; un predictor reentrenado "
+                f"para ella alcanzó AUC = {f3(V5['t'].loc[V5['mejor'], 'AUC-ROC'])}, con probabilidades bien "
+                "calibradas, mientras que el modelo de la cadena anterior conserva el orden pero subestima el éxito, "
+                "por lo que el predictor debe reentrenarse con cada cambio de políticas.")
 par(res_txt, sangria=False)
 p = par("", sangria=True)
 p.add_run("Palabras clave: ").italic = True
@@ -457,6 +480,23 @@ par("Para evaluar el uso del modelo en la toma de decisiones se programó una va
     "intentos con la misma semilla: «mantener» (el giro inicial, como en el conjunto de datos; línea base), "
     "«modelo» (el giro de mayor probabilidad predicha) y «aleatorio» (un giro visible al azar, como control). La "
     "diferencia de tasas de éxito se evaluó con intervalo bootstrap y prueba z de dos proporciones.")
+
+if V5:
+    titulo("Cadena de políticas v5 y predictor reentrenado", 2)
+    par("Los resultados del primer modelo (qué manzanas fallan y en qué etapa) orientaron el diseño posterior de "
+        "una nueva cadena de políticas del robot, llamada v5: un alcance que tiene en cuenta la fruta para no "
+        "empujarla, un mapa de apuntado que elige el giro de cintura (de −45° a +15°) y la dirección de la palma "
+        "para cada manzana, el agarre aprendido con los dedos fijos una vez cerrados, un giro de muñeca de 60° y "
+        "dedos más rígidos antes de tirar del pedúnculo. El mapa de apuntado es a su vez un modelo aprendido: una "
+        "red que estima la probabilidad Q de que el alcance llegue a la manzana, ajustada con decenas de miles de "
+        "alcances simulados; solo mira la etapa de alcance.")
+    par("Con esa cadena se generó un segundo conjunto de datos (ml_project/cosecha_v5.py) con el mismo mundo "
+        "simulado y las mismas 18 entradas, calculadas con la cintura ya girada al ángulo elegido; todas las "
+        f"manzanas se intentan, sin descartar las de Q baja. Se obtuvieron {V5['n']} intentos válidos en tres "
+        f"corridas (semillas {', '.join(str(s) for s in V5['semillas'])}): las dos primeras para entrenamiento "
+        f"({V5['n_tr']}) y la última para prueba ({V5['n_te']}). Se reentrenaron los mismos modelos con la misma "
+        "búsqueda de hiperparámetros y se compararon con dos referencias: la Q del mapa de apuntado y el bosque "
+        "aleatorio de la cadena anterior aplicado sin reentrenar.")
 
 # ═════════════════════════ RESULTADOS ═════════════════════════
 titulo("Resultados", 1)
@@ -626,6 +666,62 @@ if CINT and all(k in CINT for k in ("modelo", "mantener")):
 else:
     par("[Resultados pendientes: el experimento se está ejecutando.]")
 
+if V5:
+    titulo("Predictor reentrenado para la cadena v5", 2)
+    et5 = V5["et"]
+    par(f"La cadena v5 cosechó el {pc(V5['exito'])} de los intentos, frente al {pc(et5.loc['exito', 'cadena v1'])} de "
+        "la cadena original en el mismo mundo simulado. Los fallos de agarre bajaron de "
+        f"{pc(et5.loc['agarre', 'cadena v1'])} a {pc(et5.loc['agarre', 'cadena v5'])} y los de desprendimiento de "
+        f"{pc(et5.loc['desprendimiento', 'cadena v1'])} a {pc(et5.loc['desprendimiento', 'cadena v5'])}, justamente "
+        "las etapas que el primer modelo señalaba como más frecuentes.")
+    t5 = V5["t"]
+    orden = [i for i in t5.index if i != "Trivial"] + ["Trivial"]
+    filas5 = [[i, f3(t5.loc[i, "AUC-ROC"]), t5.loc[i, "IC95 AUC"].replace(".", ",").replace(", ", "; "),
+               f3(t5.loc[i, "exactitud"]), f3(t5.loc[i, "exactitud balanceada"]), f3(t5.loc[i, "F1"]),
+               f3(t5.loc[i, "Brier"])] for i in orden]
+    tabla("Desempeño en el conjunto de prueba de la cadena v5 (salida binaria)", filas5,
+          ["Modelo", "AUC-ROC", "IC 95 % AUC", "Exactitud", "Exact. balanceada", "F1", "Brier"],
+          nota="Las dos filas de referencia no se entrenaron con los datos v5: la Q del mapa de apuntado es la "
+               "predicción de alcance que la cadena ya trae, y el bosque de la cadena v1 es el modelo de la "
+               "sección anterior aplicado tal cual.", anchos=[5.2, 1.7, 2.9, 1.8, 1.9, 1.4, 1.4], tam=9)
+    mejor5 = V5["mejor"]
+    c5 = V5["comp"].set_index("comparación")
+    cq = c5.loc[f"{mejor5} − Q del mapa de apuntado"]
+    cv1 = c5.loc[f"{mejor5} − Bosque de la cadena v1"]
+    tv, tq, tm = t5.loc["Bosque de la cadena v1, sin reentrenar"], t5.loc["Q del mapa de apuntado (referencia)"], t5.loc[mejor5]
+    ic = lambda x: x.replace(".", ",").replace(", ", "; ")
+    par(f"Todos los modelos reentrenados (Tabla {N_TABLA[0]}) quedaron entre AUC = {f3(t5.drop(['Trivial']).iloc[:6]['AUC-ROC'].min())} y "
+        f"{f3(t5.drop(['Trivial']).iloc[:6]['AUC-ROC'].max())}, con intervalos que se superponen; el mejor en validación "
+        f"cruzada fue el {mejor5.lower()} (AUC = {f3(tm['AUC-ROC'])}, exactitud {f3(tm['exactitud'])} frente a "
+        f"{f3(t5.loc['Trivial', 'exactitud'])} del trivial). Las dos referencias ordenan los intentos igual de bien: "
+        f"la Q del mapa de apuntado (AUC = {f3(tq['AUC-ROC'])}; diferencia {cq['diferencia AUC']:+.3f}".replace(".", ",") + f", "
+        f"IC 95 % {ic(cq['IC95'])}) y el bosque de la cadena anterior sin reentrenar (AUC = {f3(tv['AUC-ROC'])}; "
+        f"diferencia IC 95 % {ic(cv1['IC95'])}). Con las políticas v5 lo que se puede anticipar es, sobre todo, si "
+        "el brazo alcanza la manzana, y eso ya lo captan la geometría y el mapa.")
+    par(f"La diferencia está en la calibración (Figura {N_FIG[0] + 1}, panel derecho). El modelo reentrenado tiene la "
+        f"menor puntuación de Brier ({f3(tm['Brier'])}), significativamente menor que la de la Q del mapa "
+        f"({f3(tq['Brier'])}; diferencia IC 95 % {ic(cq['IC95 Brier'])}), que solo mide el alcance y sobreestima el "
+        f"éxito, y que la del bosque anterior ({f3(tv['Brier'])}; IC 95 % {ic(cv1['IC95 Brier'])}), que lo subestima "
+        "porque aprendió con una cadena que fallaba mucho más. Sus probabilidades, por lo tanto, se pueden leer "
+        "directamente como tasas de éxito esperadas, que es lo que hace falta para fijar un umbral de decisión o "
+        "estimar el rendimiento de una sesión de cosecha. Al cambiar las políticas cambia la relación entre las "
+        "entradas y el resultado: el orden se conserva, pero las probabilidades deben reentrenarse.")
+    rg = V5["regla"].set_index("umbral")
+    filas_r5 = [[f"{u:.1f}".replace(".", ","), pc(r["intentados"], 0), pc(r["éxito de los intentados"]),
+                 pc(r["cosechas perdidas (de las posibles)"])] for u, r in rg.iterrows()]
+    tabla(f"Regla de decisión con {mejor5.lower()} en la cadena v5 (conjunto de prueba)", filas_r5,
+          ["Umbral de P", "Manzanas intentadas", "Éxito de los intentos", "Cosechas posibles perdidas"],
+          nota="Umbral 0: se intentan todas las manzanas (situación actual).", anchos=[3, 4, 4, 4.5])
+    r5 = rg.loc[0.5]
+    par(f"Como regla de decisión (Tabla {N_TABLA[0]}), intentar solo las manzanas con P ≥ 0,5 sube el éxito de los "
+        f"intentos realizados de {pc(rg.loc[0.0, 'éxito de los intentados'])} a {pc(r5['éxito de los intentados'])}, "
+        f"intentando el {pc(r5['intentados'], 0)} de las manzanas y perdiendo solo el "
+        f"{pc(r5['cosechas perdidas (de las posibles)'])} de las cosechas posibles. Con la cadena v1 la misma regla "
+        "descartaba la mayoría de las manzanas; con la v5, al ser mucho más alto el éxito de base, el modelo sirve "
+        "sobre todo para descartar los casos claramente fuera de alcance y para estimar el rendimiento esperado.")
+    figura("cadena_v5.png", "Cadena v5: resultado de los intentos, curvas ROC y calibración del predictor reentrenado",
+           ancho=15.5)
+
 # ═════════════════════════ DISCUSIÓN Y CONCLUSIONES ═════════════════════════
 titulo("Discusión y conclusiones", 1)
 par("Es posible predecir, antes de intentar y con información disponible para el robot, si una cosecha "
@@ -644,6 +740,13 @@ if CINT and "modelo" in CINT and "mantener" in CINT:
         f"aumentó la tasa de éxito simulada en {sg(d)} puntos ({pc(CINT['mantener']['exito'])} → "
         f"{pc(CINT['modelo']['exito'])}), con probabilidades predichas que coincidieron con el éxito observado. "
         "Es una aplicación directa al robot, que ya puede girar la cintura, aunque falta validarla en el mundo real.")
+if V5:
+    par("El modelo también orientó el desarrollo: la cadena de políticas v5, diseñada después de identificar dónde "
+        f"fallaban los intentos, pasó de {pc(VIS.exito.mean())} a {pc(V5['exito'])} de éxito en simulación. Para esa cadena "
+        f"el predictor reentrenado alcanzó AUC = {f3(V5['t'].loc[V5['mejor'], 'AUC-ROC'])}, similar al del mapa de "
+        "apuntado y al del modelo anterior, pero con probabilidades bien calibradas, a diferencia de ambos. El "
+        "predictor está atado a las políticas con que se generaron los datos: el procedimiento (simular, "
+        "registrar, reentrenar) debe repetirse con cada versión.")
 par("La etapa del fallo solo es predecible cuando depende de la geometría (alcance y, en parte, agarre). Las "
     "caídas después de arrancar la manzana dependen de la calidad del agarre logrado y no pueden anticiparse "
     "con la información previa; para predecirlas haría falta información durante el intento (fuerzas en los "
@@ -735,7 +838,8 @@ lista([
     "intentos_reales.py — extracción de los intentos del robot real a partir de sus registros.",
     "exportar_bosque.py y bosque_np.py — exportación del bosque aleatorio para usarlo dentro de la simulación.",
     "cosecha_cintura.py — experimento de elección del giro de cintura con el modelo.",
-    "datos/, datos_reales/, datos_cintura/ — conjuntos de datos generados (CSV).",
+    "cosecha_v5.py y analisis_v5.py — conjunto de datos de la cadena v5 y predictor reentrenado.",
+    "datos/, datos_reales/, datos_cintura/, datos_v5/ — conjuntos de datos generados (CSV).",
 ])
 
 out = os.path.join(AQUI, "informe_proyecto_final.docx")
