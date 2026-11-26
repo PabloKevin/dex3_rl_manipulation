@@ -60,7 +60,7 @@ def preparar(df):
 
 
 def leer(carpeta, patron="*.csv"):
-    fs = [f for f in sorted(glob.glob(os.path.join(AQUI, carpeta, patron))) if "prueba" not in f]
+    fs = [f for f in sorted(glob.glob(os.path.join(AQUI, carpeta, patron))) if "prueba" not in os.path.basename(f)]
     return pd.concat([pd.read_csv(f) for f in fs], ignore_index=True)
 
 
