@@ -159,6 +159,25 @@ p.add_argument("--aim_waist", type=int, default=1, help="(--aim) 0: keep the tre
 p.add_argument("--skip_q", type=float, default=0.0,
                help="(--aim) skip an apple whose best predicted reach success (aim map Q, waist turn included) is "
                     "below this -- out of the arm's reach; counted as 'skipped: out of reach' (2026-11-14: 0.5)")
+p.add_argument("--roll_down", type=int, default=0,
+               help="1: after the grip the ARM-POSE POLICY turns the hand about the palm normal until the (closed) "
+                    "fingers point to the ground (goal: same pocket, same normal, finger direction = down; as far "
+                    "as it gets in its goal budget), then pulls back along the normal with the fingers still down "
+                    "(a policy goal too) -- instead of the joint-space detach (user, 2026-11-14: bend the stem off, "
+                    "the fruit cradled by the fingers)")
+p.add_argument("--twist_away_deg", type=float, default=0.0,
+               help="(--roll_down 1) first turn the hand this far about the palm normal the way the WRIST ROLL has "
+                    "room (2026-11-14: the roll towards 'down' ends on the wrist roll limit after ~35 deg), to break "
+                    "the stem by the twist; then ONE goal: back to fingers down while pulling back")
+p.add_argument("--twist_joint", type=int, default=0,
+               help="(--twist_away_deg) 1: the twist is a plain WRIST ROLL joint move of that many degrees (sim probe: "
+                    "the v5 arm-pose policy keeps the wrist roll on its limit and turned the hand only ~20 of the "
+                    "100 deg asked as a finger-direction goal), 1.5 rad/s; then the policy's return + pull goal")
+p.add_argument("--grip_kp", type=float, default=0.0,
+               help="> 0: once the grip is confirmed with the fruit in the pocket, the finger joints' stiffness (and "
+                    "damping, same factor) ramps from the soft reach / close value (1.0 N m/rad) to this in 0.3 s; "
+                    "back to soft at a miss and at the release (user, 2026-11-14: soft to touch the tree, rigid to "
+                    "hold the fruit through the detach)")
 p.add_argument("--csv", default=None, help="append one row per episode (outcome, geometry) to this CSV")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--diag", action="store_true", help="per-state motion stats (joint speed, lag, palm detour) at the end")
@@ -423,9 +442,9 @@ def basket_drop(i):
 
 # ── per-env state machine ──
 (S_START, S_TO_READY, S_APPROACH, S_PREGRASP, S_GRASP, S_TWIST, S_DETACH, S_RETURN, S_CHECK, S_TO_HOME,
- S_WAIST_DEP, S_TO_DEP, S_DEPOSIT, S_RELEASE, S_BACK, S_DEP_HOME, S_WAIST_BACK, S_FAILHOME, S_DONE) = range(19)
+ S_WAIST_DEP, S_TO_DEP, S_DEPOSIT, S_RELEASE, S_BACK, S_DEP_HOME, S_WAIST_BACK, S_FAILHOME, S_DONE, S_ROLL, S_JTWIST) = range(21)
 NAMES = ["start", "to_ready", "approach", "pregrasp", "grasp", "twist", "detach", "return", "check", "to_home",
-         "waist_dep", "to_dep", "deposit", "release", "back", "dep_home", "waist_back", "fail_home", "done"]
+         "waist_dep", "to_dep", "deposit", "release", "back", "dep_home", "waist_back", "fail_home", "done", "roll", "jtwist"]
 
 st = torch.full((N,), S_START, dtype=torch.long, device=dev)
 t_st = torch.zeros(N, device=dev)
@@ -468,6 +487,56 @@ sr_flag = torch.ones(N, dtype=torch.bool, device=dev)        # env._stem_release
 aim_n = [None] * N                                           # the approach normal chosen for this apple (torso frame)
 aim_w = [None] * N                                           # the waist move to the chosen yaw (w0, w1, T, t)
 ep_info = [dict() for _ in range(N)]
+KP_SOFT, KD_SOFT = 1.0, 0.05                                 # the hand actuator (apple_grasp_env_cfg)
+kp_goal = torch.full((N,), KP_SOFT, device=dev)
+kp_now = torch.full((N,), KP_SOFT, device=dev)
+roll = [None] * N                                            # --roll_down: this apple's roll / pull record
+
+
+def finger_from_down(i):
+    """(deg between the finger direction and 'down' in the plane across the palm normal, that down direction)."""
+    pk_, nrm_, fin_ = pocket_now()
+    dn = -UP - float((-UP * nrm_[i]).sum()) * nrm_[i]
+    dn = dn / dn.norm().clamp(min=1e-6)
+    c = float((fin_[i] * dn).sum())
+    return math.degrees(math.acos(max(-1.0, min(1.0, c)))), dn
+
+
+def start_roll(i):
+    pk_, nrm_, fin_ = pocket_now()
+    deg0, dn = finger_from_down(i)
+    n0 = nrm_[i].clone()
+    p0 = pk_[i].clone()
+    roll[i] = dict(deg0=deg0, t0=float(sim_t), broke=None)
+    ep_info[i].update(roll_deg0=round(deg0, 1))
+    if args.twist_away_deg > 0:
+        # which way about the normal the wrist roll has room: its joint axis (link x) against the palm normal
+        wl = robot.data.body_names.index("right_wrist_roll_link")
+        ax = quat_apply(robot.data.body_quat_w[i:i + 1, wl], torch.tensor([[1.0, 0.0, 0.0]], device=dev))[0]
+        al = float((ax * n0).sum())
+        k = list(arm_names).index("right_wrist_roll_joint")
+        wr = float(robot.data.joint_pos[i, arm_ids][k])
+        lo, hi = ARM_TARGET_CLIP["right_wrist_roll_joint"]
+        room_pos = (hi - wr) if al > 0 else (wr - lo)         # room for a + rotation about the normal
+        room_neg = (wr - lo) if al > 0 else (hi - wr)
+        sgn = 1.0 if room_pos >= room_neg else -1.0
+        th = sgn * math.radians(args.twist_away_deg)
+        f0 = fin_[i]
+        ft = f0 * math.cos(th) + torch.linalg.cross(n0, f0) * math.sin(th)
+        roll[i].update(sgn=sgn)
+        ep_info[i].update(roll_room_deg=round(math.degrees(max(room_pos, room_neg)), 0), roll_axis_dot=round(al, 2))
+        note(i, f"  twist {sgn * args.twist_away_deg:+.0f} deg about the normal (wrist roll {wr:+.2f}, axis.normal {al:+.2f}, "
+                f"room {math.degrees(room_pos):.0f} / {math.degrees(room_neg):.0f} deg)")
+        pull = ("roll pull", p0 - DETACH["pull_m"] * n0, n0, dn.clone(), True, False, False)
+        if args.twist_joint:
+            dq = (1.0 if (sgn > 0) == (al > 0) else -1.0) * min(math.radians(args.twist_away_deg),
+                                                                 max(room_pos, room_neg) - 0.05)
+            roll[i].update(k=k, q0=float(q_cmd[i, k]), dq=dq, T=max(0.6, 1.875 * abs(dq) / 1.5), pull=pull)
+            return
+        start_legs(i, [("twist", p0, n0, ft, True, False, False), pull])
+        return
+    start_legs(i, [("roll", p0, n0, dn.clone(), True, False, False),
+                   ("roll pull", p0 - DETACH["pull_m"] * n0, n0, dn.clone(), True, False, False)])
 
 
 def where(i):
@@ -777,6 +846,7 @@ def begin_apple(i, new_tree):
 def fail(i, why):
     """No apple in the hand: open, back to READY by the policy if needed, HOME, then the next try / tree."""
     note(i, f"MISS: {why}")
+    kp_goal[i] = KP_SOFT
     h_cmd[i] = H_OPEN
     use_policy_hand[i] = False
     learn_arm[i] = False
@@ -858,7 +928,7 @@ while app.is_running():
                 os._exit(0)
 
         # policy-leg arm targets for every env in a leg
-        in_leg = torch.tensor([s in (S_APPROACH, S_RETURN, S_DEPOSIT, S_BACK) for s in st.tolist()], device=dev)
+        in_leg = torch.tensor([s in (S_APPROACH, S_RETURN, S_DEPOSIT, S_BACK, S_ROLL) for s in st.tolist()], device=dev)
         if bool(in_leg.any()):
             ro = ga._reach_obs(env, arm._reach_arm_cfg, arm._palm_cfg, arm._apple_cfg, arm.cfg.palm_local_offset,
                                prev_raw, layout="arm_pose_v5" if args.arm_layout == "v5" else "arm_pose",
@@ -908,6 +978,13 @@ while app.is_running():
         if getattr(arm, "_waist_id", None) is not None:
             arm.waist_override[:] = w_cmd                  # else the arm term holds the waist where it was
         park_apples()
+        if args.grip_kp > 0 and bool((kp_now != kp_goal).any()):
+            rate = abs(args.grip_kp - KP_SOFT) / 0.3 * dt
+            kp_now = kp_now + torch.clamp(kp_goal - kp_now, -rate, rate)
+            hj = hand._joint_ids
+            nh = robot.data.joint_pos[:, hj].shape[1]
+            robot.write_joint_stiffness_to_sim(kp_now.view(N, 1).expand(N, nh).contiguous(), joint_ids=hj)
+            robot.write_joint_damping_to_sim((kp_now * KD_SOFT / KP_SOFT).view(N, 1).expand(N, nh).contiguous(), joint_ids=hj)
         if args.diag:
             st_prev = st.clone()
             palm_prev = robot.data.body_pos_w[:, palm_id].clone()
@@ -951,6 +1028,7 @@ while app.is_running():
             learn_arm[i] = False
             sr_flag[i] = True
             holding[i] = False
+            kp_goal[i] = KP_SOFT
             w_cmd[i] = env._fixed_waist_yaw[i]
             choose_apples(i)
 
@@ -1147,15 +1225,77 @@ while app.is_running():
                         go(i, S_RETURN)
                     else:
                         back = tw[i]["back"]
+                        if args.grip_kp > 0:
+                            kp_goal[i] = args.grip_kp
                         if TWIST["deg"] > 0:
                             start_twist(i)
                             tw[i]["back"] = back
                             note(i, f"TWIST {TWIST['deg']:.0f} deg about the palm normal")
                             go(i, S_TWIST)
+                        elif args.roll_down:
+                            start_roll(i)
+                            note(i, f"ROLL: fingers {roll[i]['deg0']:.0f} deg from down -> down (arm-pose policy) {where(i)}")
+                            go(i, S_JTWIST if "dq" in roll[i] else S_ROLL)
                         else:
                             start_detach(i)
                             note(i, f"DETACH {where(i)}")
                             go(i, S_DETACH)
+            elif s == S_JTWIST:
+                r = roll[i]
+                q_cmd[i, r["k"]] = r["q0"] + r["dq"] * float(hv.smoothstep(torch.tensor(min(t / r["T"], 1.0))))
+                if r["broke"] is None and bool(T().target_stem.broken[i]):
+                    r["broke"] = "twist"
+                    turned = math.degrees(abs(float(robot.data.joint_pos[i, arm_ids][r["k"]]) - r["q0"]))
+                    ep_info[i].update(roll_broke="twist", roll_broke_deg=round(turned, 1),
+                                      roll_broke_s=round(float(sim_t) - r["t0"], 2))
+                    note(i, f"  stem BROKE in the twist after {turned:.0f} deg of wrist roll {where(i)}")
+                if float(fruit_to_pocket()[i]) > LEAVE:
+                    fail(i, "the apple slipped out during the detach (twist)")
+                    start_legs(i, tw[i]["back"])
+                    go(i, S_RETURN)
+                elif t >= r["T"] + 0.2:
+                    ep_info[i].update(roll_deg1=round(finger_from_down(i)[0], 1), roll_s=round(float(sim_t) - r["t0"], 2))
+                    note(i, f"  twist over ({math.degrees(r['dq']):+.0f} deg of wrist roll): fingers {finger_from_down(i)[0]:.0f} deg "
+                            f"from down: back + PULL {where(i)}")
+                    start_legs(i, [r["pull"]])
+                    go(i, S_ROLL)
+            elif s == S_ROLL:
+                r = roll[i]
+                k0 = leg[i]
+                if r["broke"] is None and bool(T().target_stem.broken[i]):
+                    r["broke"] = legs[i][k0][0]
+                    ep_info[i].update(roll_broke=r["broke"], roll_broke_deg=round(finger_from_down(i)[0], 1),
+                                      roll_broke_s=round(float(sim_t) - r["t0"], 2))
+                    note(i, f"  stem BROKE in the {r['broke']}, fingers {finger_from_down(i)[0]:.0f} deg from down {where(i)}")
+                ev = legs_step(i, d, ang)
+                if ev is None and leg[i] != k0:
+                    ep_info[i].update(roll_deg1=round(finger_from_down(i)[0], 1), roll_s=round(float(sim_t) - r["t0"], 2))
+                    note(i, f"  roll over after {float(sim_t) - r['t0']:.1f} s: fingers {finger_from_down(i)[0]:.0f} deg from "
+                            f"down ({'arrived' if bool(r.get('arr')) else 'goal budget / moved on'}): PULL {where(i)}")
+                    jq = robot.data.joint_pos[i, arm_ids]
+                    note(i, f"    roll joints q {np.round(jq.cpu().numpy(), 2).tolist()} room to the clip lo "
+                            f"{np.round((q_cmd[i] - CLIP_LO.view(-1)[-AD:]).cpu().numpy(), 2).tolist()} hi "
+                            f"{np.round((CLIP_HI.view(-1)[-AD:] - q_cmd[i]).cpu().numpy(), 2).tolist()} d {float(d[i]) * 100:.1f} cm "
+                            f"ang {math.degrees(float(ang[i])):.0f} deg")
+                r["arr"] = bool(P.arrived[i])
+                held = float(fruit_to_pocket()[i]) < LEAVE
+                if not held and ev is None:
+                    fail(i, f"the apple slipped out during the detach ({legs[i][leg[i]][0]})")
+                    ev = "lost"
+                if ev is not None:
+                    note(i, f"  roll + pull end ({ev}), fingers {finger_from_down(i)[0]:.0f} deg from down {where(i)}")
+                    ep_info[i].update(roll_deg2=round(finger_from_down(i)[0], 1))
+                    broke = bool(T().target_stem.broken[i])
+                    held = float(fruit_to_pocket()[i]) < LEAVE
+                    if not outcome[i]:
+                        if not broke and held:
+                            fail(i, "the stem held: the hand lets go")
+                        elif not held:
+                            fail(i, "the apple slipped out during the detach (end)")
+                        else:
+                            note(i, "detached, in the hand: RETURN")
+                    start_legs(i, tw[i]["back"])
+                    go(i, S_RETURN)
             elif s == S_TWIST:
                 w = tw[i]
                 if t >= 2 * w["T"] + w["hold"] + 0.1:
@@ -1216,6 +1356,7 @@ while app.is_running():
                     ev = "within 3 cm"
                 if ev is not None:
                     note(i, f"over the basket ({ev}, {float(d[i]) * 100:.1f} cm): RELEASE")
+                    kp_goal[i] = KP_SOFT
                     holding[i] = False
                     if bool(use_policy_hand[i]):
                         h_cmd[i] = hand._processed_actions[i].clone()
@@ -1292,7 +1433,8 @@ if args.csv:
     new_file = not os.path.exists(args.csv)
     os.makedirs(os.path.dirname(os.path.abspath(args.csv)), exist_ok=True)
     keys = ["seed", "env", "yaw_deg", "x_sh", "y_sh", "z_sh", "dist_sh", "seen", "aim_yaw_deg", "aim_heading_deg",
-            "aim_tilt_deg", "aim_q", "deposited", "outcome"]
+            "aim_tilt_deg", "aim_q", "roll_deg0", "roll_deg1", "roll_s", "roll_broke", "roll_broke_deg",
+            "roll_broke_s", "roll_deg2", "roll_room_deg", "roll_axis_dot", "deposited", "outcome"]
     with open(args.csv, "a", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
         if new_file:

@@ -1,0 +1,7 @@
+modelo,AUC simulación (prueba),AUC robot real,IC95 real,AUC real (dentro del rango),Brier real,P media predicha
+Regresión logística,0.745,0.755,"[0.677, 0.827]",0.76,0.202,0.463
+k-NN,0.807,0.677,"[0.596, 0.751]",0.699,0.224,0.382
+SVM (RBF),0.806,0.562,"[0.474, 0.646]",0.624,0.265,0.294
+Bosque aleatorio,0.815,0.636,"[0.548, 0.713]",0.674,0.236,0.318
+Gradient boosting,0.804,0.638,"[0.546, 0.717]",0.689,0.233,0.325
+Red neuronal (MLP),0.774,0.683,"[0.598, 0.760]",0.73,0.215,0.34

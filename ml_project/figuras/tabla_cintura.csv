@@ -1,0 +1,4 @@
+modo,intentos,éxito,IC95,P predicha (giro usado),P predicha (giro inicial),giró (> 0.5°)
+aleatorio,600,0.342,"[0.305, 0.380]",0.342,0.333,0.945
+mantener,600,0.313,"[0.275, 0.348]",0.316,0.316,0.0
+modelo,600,0.425,"[0.385, 0.467]",0.447,0.336,0.945
